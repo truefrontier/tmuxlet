@@ -1537,7 +1537,7 @@ fn extract_final_assistant_text(transcript_path: &Path) -> Result<String, String
     loop {
         let content = fs::read_to_string(transcript_path)
             .map_err(|e| format!("failed to read transcript: {e}"))?;
-        match extract_final_assistant_text_from_str(&content) {
+        match extract_current_turn_assistant_text_from_str(&content) {
             Ok(text) => return Ok(text),
             Err(e) if Instant::now() >= deadline => return Err(e),
             Err(_) => thread::sleep(Duration::from_millis(100)),
@@ -1545,10 +1545,19 @@ fn extract_final_assistant_text(transcript_path: &Path) -> Result<String, String
     }
 }
 
-fn extract_final_assistant_text_from_str(content: &str) -> Result<String, String> {
+fn extract_current_turn_assistant_text_from_str(content: &str) -> Result<String, String> {
+    let mut seen_user = false;
     let mut best: Option<String> = None;
     for line in content.lines() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if is_main_thread_user_line(line) {
+            seen_user = true;
+            best = None;
+            continue;
+        }
+        if !seen_user {
             continue;
         }
         let texts = extract_assistant_texts_from_line(line);
@@ -1556,7 +1565,11 @@ fn extract_final_assistant_text_from_str(content: &str) -> Result<String, String
             best = Some(texts.join("\n"));
         }
     }
-    best.ok_or_else(|| "no assistant text in transcript".into())
+    best.ok_or_else(|| "no assistant text after last user message".into())
+}
+
+fn is_main_thread_user_line(line: &str) -> bool {
+    line.contains("\"type\":\"user\"") && !line.contains("\"isSidechain\":true")
 }
 
 fn extract_assistant_texts_from_line(line: &str) -> Vec<String> {
@@ -2136,38 +2149,46 @@ mod tests {
             "\n",
             r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"the final answer"}]}}"#,
         );
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "the final answer");
     }
 
     #[test]
     fn extract_final_assistant_text_walks_past_tool_use() {
         let content = concat!(
-            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"the real answer"}]}}"#,
-            "\n",
-            r#"{"type":"user","message":{"role":"user","content":[]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
             "\n",
             r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/x"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"abc"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"the real answer"}]}}"#,
         );
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "the real answer");
     }
 
     #[test]
     fn extract_final_assistant_text_ignores_sidechain() {
         let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
             r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"main thread answer"}]}}"#,
             "\n",
             r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"subagent answer"}]}}"#,
         );
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "main thread answer");
     }
 
     #[test]
     fn extract_final_assistant_text_skips_thinking() {
-        let content = r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"my answer"}]}}"#;
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"my answer"}]}}"#,
+        );
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "my answer");
     }
 
@@ -2175,26 +2196,85 @@ mod tests {
     fn extract_final_assistant_text_errors_when_no_text() {
         let content =
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
-        assert!(extract_final_assistant_text_from_str(content).is_err());
+        assert!(extract_current_turn_assistant_text_from_str(content).is_err());
     }
 
     #[test]
     fn extract_final_assistant_text_skips_malformed_lines() {
         let content = concat!(
             "not json at all\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
             r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"survived"}]}}"#,
             "\n",
             "{broken json"
         );
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "survived");
     }
 
     #[test]
     fn extract_final_assistant_text_handles_unicode_text() {
-        let content = r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"café — naïve résumé 你好"}]}}"#;
-        let out = extract_final_assistant_text_from_str(content).unwrap();
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"café — naïve résumé 你好"}]}}"#,
+        );
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
         assert_eq!(out, "café — naïve résumé 你好");
+    }
+
+    #[test]
+    fn extract_current_turn_skips_prior_turn_assistant() {
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"old"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"new"}]}}"#,
+        );
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
+        assert_eq!(out, "new");
+    }
+
+    #[test]
+    fn extract_current_turn_rejects_when_new_turn_assistant_missing() {
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"old"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}"#,
+        );
+        assert!(extract_current_turn_assistant_text_from_str(content).is_err());
+    }
+
+    #[test]
+    fn extract_current_turn_handles_tool_use_within_turn() {
+        let content = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"do the thing"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"abc","content":"file.txt"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+        );
+        let out = extract_current_turn_assistant_text_from_str(content).unwrap();
+        assert_eq!(out, "answer");
+    }
+
+    #[test]
+    fn is_main_thread_user_line_filters_sidechain() {
+        let main_user = r#"{"type":"user","message":{"role":"user","content":[]}}"#;
+        let sidechain_user =
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":[]}}"#;
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#;
+        assert!(is_main_thread_user_line(main_user));
+        assert!(!is_main_thread_user_line(sidechain_user));
+        assert!(!is_main_thread_user_line(assistant));
     }
 
     #[test]
