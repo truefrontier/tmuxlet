@@ -187,8 +187,20 @@ come from Cargo.
 
 ## How Print Mode Works
 
-For Claude and Codex, tmuxlet passes one full prompt in the launch command. The
-target-visible prompt is ordered as:
+For the Claude target, tmuxlet generates a per-run `settings.json` and passes
+it via `claude --settings <path>`. The file registers two hooks:
+
+- A `Stop` hook calls `tmuxlet bridge stop-hook`, which reads Claude's
+  transcript and writes the final assistant text to `complete.txt`.
+- A `PostToolUse` hook calls `tmuxlet bridge tool-hook`, which touches
+  `heartbeat` so `tmuxlet status` can show in-flight activity.
+
+The user's prompt is passed in as-is — no completion contract is appended.
+User hooks from `~/.claude/settings.json` continue to fire alongside tmuxlet's.
+Passing `--settings` to tmuxlet while targeting Claude is rejected; use
+`--target-arg --settings <path>` to bypass and manage hooks yourself.
+
+For Codex, tmuxlet still appends a completion-contract suffix to the prompt:
 
 ```text
 <user prompt>
@@ -197,9 +209,9 @@ TMUXLET COMPLETION CONTRACT:
 ...
 ```
 
-The completion contract tells the target CLI to write its final response to
-`answer.txt` and then run `tmuxlet bridge complete`. Other targets currently use
-a paste fallback when tmuxlet cannot safely assume positional prompt support.
+The contract tells Codex to write its final response to `answer.txt` and call
+`tmuxlet bridge complete`. Other targets (Gemini, opencode, pi, Cursor) use a
+paste fallback when tmuxlet cannot safely assume positional prompt support.
 
 ## Runtime State
 
@@ -209,21 +221,24 @@ Runtime files live in:
 ~/.tmuxlet/runs/<run-id>/
   meta.json
   prompt.txt
-  answer.txt
+  answer.txt        # written by the target on non-Claude runs
   complete.txt
   pane.log
   error.txt
+  settings.json     # generated for Claude runs (hook config)
+  heartbeat         # touched by the Claude PostToolUse hook
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
 
 ## Confirmation Handling
 
-For Claude and Codex, tmuxlet passes the full prompt in the launch command with
-the user's prompt first and tmuxlet's completion contract after it. During the
-startup window, tmuxlet watches for common confirmation gates and sends `Enter`
-up to three times. This startup check runs during normal print-mode polling, so
-successful runs can return as soon as the completion file appears.
+For Claude and Codex, tmuxlet passes the full prompt in the launch command
+(Claude gets the raw prompt; Codex gets the prompt with the completion contract
+appended). During the startup window, tmuxlet watches for common confirmation
+gates and sends `Enter` up to three times. This startup check runs during
+normal print-mode polling, so successful runs can return as soon as
+`complete.txt` appears.
 
 If a run stalls later on a permission or confirmation prompt, tmuxlet returns a
 nonzero `blocked` status with the captured pane output. Rerun with
