@@ -1532,17 +1532,47 @@ fn extract_top_level_string(json: &str, target_key: &str) -> Option<String> {
 
 fn extract_final_assistant_text(transcript_path: &Path) -> Result<String, String> {
     // Claude can fire the Stop hook before flushing the final assistant message
-    // to the transcript file, so poll briefly until the assistant text appears.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // to the transcript file. Poll until the current-turn assistant text lands,
+    // the transcript stops growing for a grace window, or the safety cap hits.
+    let hard_deadline = Instant::now() + max_retry_secs();
+    let idle_grace = Duration::from_secs(2);
+    let mut last_size: usize = 0;
+    let mut idle_since = Instant::now();
     loop {
         let content = fs::read_to_string(transcript_path)
             .map_err(|e| format!("failed to read transcript: {e}"))?;
-        match extract_current_turn_assistant_text_from_str(&content) {
-            Ok(text) => return Ok(text),
-            Err(e) if Instant::now() >= deadline => return Err(e),
-            Err(_) => thread::sleep(Duration::from_millis(100)),
+        if let Ok(text) = extract_current_turn_assistant_text_from_str(&content) {
+            return Ok(text);
         }
+        let current_size = content.len();
+        if current_size != last_size {
+            last_size = current_size;
+            idle_since = Instant::now();
+        }
+        let now = Instant::now();
+        if now.duration_since(idle_since) > idle_grace {
+            return Err("transcript idle, no current-turn assistant text".into());
+        }
+        if now >= hard_deadline {
+            return Err("retry deadline exceeded".into());
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn max_retry_secs() -> Duration {
+    parse_max_retry_secs(env::var("TMUXLET_HOOK_RETRY_SECS").ok().as_deref())
+}
+
+fn parse_max_retry_secs(raw: Option<&str>) -> Duration {
+    const DEFAULT_SECS: u64 = 30;
+    const MIN_SECS: u64 = 1;
+    const MAX_SECS: u64 = 600;
+    let secs = raw
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.clamp(MIN_SECS, MAX_SECS))
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn extract_current_turn_assistant_text_from_str(content: &str) -> Result<String, String> {
@@ -2275,6 +2305,31 @@ mod tests {
         assert!(is_main_thread_user_line(main_user));
         assert!(!is_main_thread_user_line(sidechain_user));
         assert!(!is_main_thread_user_line(assistant));
+    }
+
+    #[test]
+    fn max_retry_secs_default_when_unset() {
+        assert_eq!(parse_max_retry_secs(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn max_retry_secs_env_override() {
+        assert_eq!(parse_max_retry_secs(Some("10")), Duration::from_secs(10));
+        assert_eq!(parse_max_retry_secs(Some("120")), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn max_retry_secs_clamps_invalid_input() {
+        assert_eq!(
+            parse_max_retry_secs(Some("garbage")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(parse_max_retry_secs(Some("")), Duration::from_secs(30));
+        assert_eq!(parse_max_retry_secs(Some("0")), Duration::from_secs(1));
+        assert_eq!(
+            parse_max_retry_secs(Some("99999")),
+            Duration::from_secs(600)
+        );
     }
 
     #[test]
