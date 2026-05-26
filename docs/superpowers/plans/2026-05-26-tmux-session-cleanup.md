@@ -143,9 +143,9 @@ Note: `&tmux_session` is borrowed BEFORE the move into `RunResult { ..., tmux_se
 
 #### Automated Verification:
 
-- [ ] `cargo build` succeeds
-- [ ] `cargo fmt -- --check` clean
-- [ ] `cargo test` all 44 existing tests still pass (no new tests added in this phase — the change is too tmux-coupled for a pure unit test)
+- [x] `cargo build` succeeds
+- [x] `cargo fmt -- --check` clean
+- [x] `cargo test` all 44 existing tests still pass (no new tests added in this phase — the change is too tmux-coupled for a pure unit test)
 
 #### Manual Verification:
 

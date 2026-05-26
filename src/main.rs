@@ -328,6 +328,11 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
             capture_pane_to_file(&tmux_session, &paths.pane_log).ok();
+            let _ = run_tmux([
+                OsStr::new("kill-session"),
+                OsStr::new("-t"),
+                OsStr::new(&tmux_session),
+            ]);
             return Ok(RunResult {
                 id: run_id,
                 target: opts.target,
