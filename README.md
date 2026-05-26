@@ -115,7 +115,13 @@ tmuxlet read <id> [--lines N]
 tmuxlet send <id> <message>
 tmuxlet attach <id>
 tmuxlet stop <id>
+tmuxlet prune [<id>...] [-y] [--dry-run]
 ```
+
+`tmuxlet prune` deletes terminal runs (`completed`, `timeout`, `blocked`,
+`exited`) and any leftover tmux sessions they own. With no ids it sweeps every
+terminal run; with explicit ids it refuses non-terminal ones. Use `--dry-run`
+to preview and `-y` / `--yes` to skip the confirmation prompt.
 
 Important options:
 
@@ -231,6 +237,12 @@ Runtime files live in:
 
 Set `TMUXLET_HOME` to override the state directory.
 
+A successful print-mode run auto-kills its tmux session before returning, but
+the run directory itself is left on disk so callers can inspect `complete.txt`,
+`pane.log`, and the rest. Runs that end in `timeout` or `blocked` leave the
+tmux session alive too, so you can `attach` and investigate. `tmuxlet prune` is
+how those run directories and any leftover sessions get cleaned up.
+
 ## Confirmation Handling
 
 For Claude and Codex, tmuxlet passes the full prompt in the launch command
@@ -261,6 +273,15 @@ Nonzero statuses:
 
 On `blocked` and `timeout`, tmuxlet writes `pane.log` and `error.txt` under the
 run directory for debugging.
+
+A typical cleanup flow:
+
+```bash
+tmuxlet -p "say ready"          # auto-kills tmux session on success
+tmuxlet --timeout 5 -p "..."    # times out — tmux session stays alive
+tmuxlet attach <id>             # investigate
+tmuxlet prune                   # remove terminal runs + leftover sessions
+```
 
 ## Development
 

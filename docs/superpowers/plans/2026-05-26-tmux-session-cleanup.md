@@ -1013,12 +1013,12 @@ Keep the addition under ~15 lines. The implementer chooses the exact wording.
 
 #### Automated Verification:
 
-- [ ] `cargo fmt -- --check` clean
-- [ ] `cargo build` succeeds with no warnings
-- [ ] `cargo test` all tests pass
-- [ ] `cargo run -- --version` matches `Cargo.toml`'s version
-- [ ] `cargo run -- --help` shows `prune` in usage line
-- [ ] `grep -c "prune" README.md` returns ≥ 3 (CLI listing + Runtime State + flow example)
+- [x] `cargo fmt -- --check` clean
+- [x] `cargo build` succeeds with no warnings
+- [x] `cargo test` all tests pass
+- [x] `cargo run -- --version` matches `Cargo.toml`'s version
+- [x] `cargo run -- --help` shows `prune` in usage line
+- [x] `grep -c "prune" README.md` returns ≥ 3 (CLI listing + Runtime State + flow example)
 
 #### Manual Verification:
 
