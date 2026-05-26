@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::thread;
@@ -113,6 +113,39 @@ struct RunResult {
     elapsed_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunClassification {
+    Completed,
+    Timeout,
+    Blocked,
+    Exited,
+    InProgress,
+}
+
+impl RunClassification {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Timeout => "timeout",
+            Self::Blocked => "blocked",
+            Self::Exited => "exited",
+            Self::InProgress => "in-progress",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::InProgress)
+    }
+}
+
+#[derive(Debug)]
+struct RunRecord {
+    id: String,
+    classification: RunClassification,
+    age_secs: Option<u64>,
+    session_alive: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TargetCommand {
     program: String,
@@ -151,6 +184,7 @@ fn run() -> Result<(), String> {
         "send" => handle_send(&args[1..]),
         "attach" => handle_attach(&args[1..]),
         "stop" => handle_stop(&args[1..]),
+        "prune" => handle_prune(&args[1..]),
         _ => {
             let opts = parse_options(&mut args)?;
             if opts.print {
@@ -232,6 +266,118 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
     Ok(opts)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PruneArgs {
+    ids: Vec<String>,
+    yes: bool,
+    dry_run: bool,
+}
+
+fn parse_prune_args(args: &[String]) -> Result<PruneArgs, String> {
+    let mut out = PruneArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "-y" | "--yes" => out.yes = true,
+            "--dry-run" => out.dry_run = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for prune: {other}"));
+            }
+            other => out.ids.push(other.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+fn prune_selection(
+    records: Vec<RunRecord>,
+    explicit_ids: &[String],
+) -> Result<Vec<RunRecord>, String> {
+    if explicit_ids.is_empty() {
+        return Ok(records
+            .into_iter()
+            .filter(|r| r.classification.is_terminal())
+            .collect());
+    }
+
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, RunRecord> = HashMap::new();
+    for r in records {
+        by_id.insert(r.id.clone(), r);
+    }
+
+    let mut found: Vec<RunRecord> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut non_terminal: Vec<String> = Vec::new();
+    for id in explicit_ids {
+        match by_id.remove(id) {
+            None => unknown.push(id.clone()),
+            Some(r) if !r.classification.is_terminal() => non_terminal.push(r.id.clone()),
+            Some(r) => found.push(r),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!("unknown run(s): {}", unknown.join(", ")));
+    }
+    if !non_terminal.is_empty() {
+        return Err(format!(
+            "run(s) still in progress; use `tmuxlet stop <id>` first: {}",
+            non_terminal.join(", ")
+        ));
+    }
+    Ok(found)
+}
+
+struct PruneOutcome {
+    deleted: usize,
+    failures: Vec<String>,
+}
+
+fn execute_prune(selected: &[RunRecord], runs_root: &Path, dry_run: bool) -> PruneOutcome {
+    if dry_run {
+        return PruneOutcome {
+            deleted: 0,
+            failures: Vec::new(),
+        };
+    }
+    let mut deleted = 0usize;
+    let mut failures = Vec::new();
+    for rec in selected {
+        if rec.session_alive {
+            let session_name = format!("tmuxlet-{}", rec.id);
+            let _ = run_tmux([
+                OsStr::new("kill-session"),
+                OsStr::new("-t"),
+                OsStr::new(&session_name),
+            ]);
+        }
+        let dir = runs_root.join(&rec.id);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                eprintln!("tmuxlet: failed to remove {}: {e}", dir.display());
+                failures.push(rec.id.clone());
+            }
+        }
+    }
+    PruneOutcome { deleted, failures }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn format_age_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
@@ -306,6 +452,11 @@ fn run_print(opts: Options) -> Result<RunResult, String> {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
             capture_pane_to_file(&tmux_session, &paths.pane_log).ok();
+            let _ = run_tmux([
+                OsStr::new("kill-session"),
+                OsStr::new("-t"),
+                OsStr::new(&tmux_session),
+            ]);
             return Ok(RunResult {
                 id: run_id,
                 target: opts.target,
@@ -874,6 +1025,89 @@ hint: rerun with --dangerously-skip-permissions if supported by this target, or 
     )
 }
 
+fn classify_from_markers(
+    complete_exists: bool,
+    error_first_line: Option<&str>,
+    session_alive: bool,
+) -> RunClassification {
+    if complete_exists {
+        return RunClassification::Completed;
+    }
+    if let Some(line) = error_first_line {
+        if line.starts_with("timeout ") {
+            return RunClassification::Timeout;
+        }
+        if line.starts_with("blocked ") {
+            return RunClassification::Blocked;
+        }
+        // Unknown error.txt content — treat as Blocked (still terminal).
+        return RunClassification::Blocked;
+    }
+    if !session_alive {
+        return RunClassification::Exited;
+    }
+    RunClassification::InProgress
+}
+
+fn classify_run(run_dir: &Path, session_alive: bool) -> Option<RunClassification> {
+    if !run_dir.join("meta.json").exists() {
+        return None;
+    }
+    let complete = run_dir.join("complete.txt").exists();
+    let error_path = run_dir.join("error.txt");
+    let error_first_line = if error_path.exists() {
+        fs::read_to_string(&error_path)
+            .ok()
+            .and_then(|s| s.lines().next().map(str::to_string))
+    } else {
+        None
+    };
+    Some(classify_from_markers(
+        complete,
+        error_first_line.as_deref(),
+        session_alive,
+    ))
+}
+
+fn discover_runs() -> Vec<RunRecord> {
+    discover_runs_in(&state_dir().join("runs"))
+}
+
+fn discover_runs_in(runs_root: &Path) -> Vec<RunRecord> {
+    let entries = match fs::read_dir(runs_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let session_alive = tmux_session_exists(&format!("tmuxlet-{id}"));
+        let Some(classification) = classify_run(&path, session_alive) else {
+            continue;
+        };
+        // heartbeat-based age is only available when the Claude hook
+        // integration is present; on this branch it's always None.
+        let age_secs: Option<u64> = None;
+        records.push(RunRecord {
+            id,
+            classification,
+            age_secs,
+            session_alive,
+        });
+    }
+
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    records
+}
+
 fn tmux_session_exists(name: &str) -> bool {
     Command::new("tmux")
         .args(["has-session", "-t", name])
@@ -1041,6 +1275,69 @@ fn handle_stop(args: &[String]) -> Result<(), String> {
         }
     }
     println!("Stopped {id}");
+    Ok(())
+}
+
+fn handle_prune(args: &[String]) -> Result<(), String> {
+    let parsed = parse_prune_args(args)?;
+    let runs = discover_runs();
+    let selected = prune_selection(runs, &parsed.ids)?;
+
+    if selected.is_empty() {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+
+    // List proposed prunes.
+    let verb = if parsed.dry_run {
+        "Would prune"
+    } else {
+        "Found"
+    };
+    println!("{verb} {} run(s):", selected.len());
+    for rec in &selected {
+        let age = rec
+            .age_secs
+            .map(format_age_secs)
+            .unwrap_or_else(|| "-".to_string());
+        let session = if rec.session_alive { "alive" } else { "gone" };
+        println!(
+            "  {:<10} {:<11} {:<10} (session: {})",
+            short_id(&rec.id),
+            rec.classification.label(),
+            age,
+            session
+        );
+    }
+
+    if parsed.dry_run {
+        return Ok(());
+    }
+
+    if !parsed.yes {
+        print!("Proceed? [y/N] ");
+        io::stdout().flush().ok();
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|e| format!("failed to read confirmation: {e}"))?;
+        let trimmed = response.trim().to_lowercase();
+        if !matches!(trimmed.as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let runs_root = state_dir().join("runs");
+    let outcome = execute_prune(&selected, &runs_root, false);
+
+    println!("Pruned {} run(s).", outcome.deleted);
+    if !outcome.failures.is_empty() {
+        return Err(format!(
+            "failed to remove {} run(s)",
+            outcome.failures.len()
+        ));
+    }
     Ok(())
 }
 
@@ -1218,7 +1515,7 @@ fn shell_quote(value: &str) -> String {
 fn print_help() {
     println!(
         "tmuxlet {VERSION}\n\n\
-Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|attach|stop>\n\n\
+Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|attach|stop|prune>\n\n\
 Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
 Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -"
     );
@@ -1479,5 +1776,394 @@ mod tests {
     #[test]
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+    // ---------- Classification ----------
+
+    #[test]
+    fn classification_label_returns_expected_strings() {
+        assert_eq!(RunClassification::Completed.label(), "completed");
+        assert_eq!(RunClassification::Timeout.label(), "timeout");
+        assert_eq!(RunClassification::Blocked.label(), "blocked");
+        assert_eq!(RunClassification::Exited.label(), "exited");
+        assert_eq!(RunClassification::InProgress.label(), "in-progress");
+    }
+
+    #[test]
+    fn classification_is_terminal_for_all_except_in_progress() {
+        assert!(RunClassification::Completed.is_terminal());
+        assert!(RunClassification::Timeout.is_terminal());
+        assert!(RunClassification::Blocked.is_terminal());
+        assert!(RunClassification::Exited.is_terminal());
+        assert!(!RunClassification::InProgress.is_terminal());
+    }
+
+    #[test]
+    fn run_record_can_be_constructed_and_inspected() {
+        let r = RunRecord {
+            id: "abc".to_string(),
+            classification: RunClassification::Completed,
+            age_secs: Some(7),
+            session_alive: false,
+        };
+        assert_eq!(r.id, "abc");
+        assert_eq!(r.classification, RunClassification::Completed);
+        assert_eq!(r.age_secs, Some(7));
+        assert!(!r.session_alive);
+    }
+
+    #[test]
+    fn classify_completed_when_complete_txt_present() {
+        assert_eq!(
+            classify_from_markers(true, None, true),
+            RunClassification::Completed
+        );
+        assert_eq!(
+            classify_from_markers(true, Some("timeout ..."), false),
+            RunClassification::Completed
+        );
+    }
+
+    #[test]
+    fn classify_timeout_when_error_starts_with_timeout() {
+        assert_eq!(
+            classify_from_markers(false, Some("timeout waiting for explicit completion"), true,),
+            RunClassification::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_blocked_when_error_starts_with_blocked() {
+        assert_eq!(
+            classify_from_markers(
+                false,
+                Some("blocked waiting for a confirmation or permission prompt"),
+                true,
+            ),
+            RunClassification::Blocked
+        );
+    }
+
+    #[test]
+    fn classify_blocked_for_unknown_error_content() {
+        assert_eq!(
+            classify_from_markers(false, Some("some other error"), true),
+            RunClassification::Blocked
+        );
+    }
+
+    #[test]
+    fn classify_exited_when_session_dead_no_markers() {
+        assert_eq!(
+            classify_from_markers(false, None, false),
+            RunClassification::Exited
+        );
+    }
+
+    #[test]
+    fn classify_in_progress_when_session_alive_no_markers() {
+        assert_eq!(
+            classify_from_markers(false, None, true),
+            RunClassification::InProgress
+        );
+    }
+
+    #[test]
+    fn classify_run_returns_none_without_meta_json() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        let result = classify_run(&dir, true);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn classify_run_reads_error_first_line() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), "{}").unwrap();
+        fs::write(
+            dir.join("error.txt"),
+            "timeout waiting for explicit completion\nextra context line\n",
+        )
+        .unwrap();
+        let result = classify_run(&dir, false);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, Some(RunClassification::Timeout));
+    }
+
+    #[test]
+    fn classify_run_completed_takes_priority_over_session_state() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), "{}").unwrap();
+        fs::write(dir.join("complete.txt"), "done").unwrap();
+        let result = classify_run(&dir, false);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, Some(RunClassification::Completed));
+    }
+
+    // ---------- discover_runs_in (spec test #8) ----------
+
+    #[test]
+    fn discover_runs_filters_terminal() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        // Completed
+        let c = root.join("completed-aaa");
+        fs::create_dir_all(&c).unwrap();
+        fs::write(c.join("meta.json"), "{}").unwrap();
+        fs::write(c.join("complete.txt"), "done").unwrap();
+
+        // Timeout
+        let t = root.join("timeout-bbb");
+        fs::create_dir_all(&t).unwrap();
+        fs::write(t.join("meta.json"), "{}").unwrap();
+        fs::write(
+            t.join("error.txt"),
+            "timeout waiting for explicit completion\n",
+        )
+        .unwrap();
+
+        // No meta.json → skipped silently
+        let skipped = root.join("no-meta-ccc");
+        fs::create_dir_all(&skipped).unwrap();
+
+        let records = discover_runs_in(&root);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(records.len(), 2, "got: {records:?}");
+        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"completed-aaa"));
+        assert!(ids.contains(&"timeout-bbb"));
+        assert!(records.iter().all(|r| r.classification.is_terminal()));
+        // No heartbeat file written → age_secs is None for all records.
+        assert!(records.iter().all(|r| r.age_secs.is_none()));
+        // No tmux sessions exist for these fixture ids → session_alive is false.
+        assert!(records.iter().all(|r| !r.session_alive));
+    }
+
+    #[test]
+    fn discover_runs_in_returns_empty_for_missing_root() {
+        let root = env::temp_dir().join(make_run_id());
+        // Don't create it
+        let records = discover_runs_in(&root);
+        assert!(records.is_empty());
+    }
+
+    // ---------- parse_prune_args ----------
+
+    fn prune_argv(args: &[&str]) -> PruneArgs {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_prune_args(&owned).unwrap()
+    }
+
+    #[test]
+    fn parses_prune_no_args() {
+        let parsed = prune_argv(&[]);
+        assert!(parsed.ids.is_empty());
+        assert!(!parsed.yes);
+        assert!(!parsed.dry_run);
+    }
+
+    #[test]
+    fn parses_prune_with_ids() {
+        let parsed = prune_argv(&["abc123", "def456"]);
+        assert_eq!(parsed.ids, vec!["abc123", "def456"]);
+    }
+
+    #[test]
+    fn parses_prune_dry_run() {
+        let parsed = prune_argv(&["--dry-run"]);
+        assert!(parsed.dry_run);
+        assert!(!parsed.yes);
+    }
+
+    #[test]
+    fn parses_prune_yes_short_and_long() {
+        assert!(prune_argv(&["-y"]).yes);
+        assert!(prune_argv(&["--yes"]).yes);
+    }
+
+    #[test]
+    fn parses_prune_dry_run_and_yes_together() {
+        let parsed = prune_argv(&["-y", "--dry-run"]);
+        assert!(parsed.yes);
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
+    fn parses_prune_rejects_unknown_flag() {
+        let owned = vec!["--no-such-flag".to_string()];
+        let result = parse_prune_args(&owned);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("--no-such-flag"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_prune_mixed_ids_and_flags() {
+        let parsed = prune_argv(&["abc", "--dry-run", "def"]);
+        assert_eq!(parsed.ids, vec!["abc", "def"]);
+        assert!(parsed.dry_run);
+    }
+
+    // ---------- prune_selection (spec test #9) ----------
+
+    fn record(id: &str, c: RunClassification, alive: bool) -> RunRecord {
+        RunRecord {
+            id: id.to_string(),
+            classification: c,
+            age_secs: None,
+            session_alive: alive,
+        }
+    }
+
+    #[test]
+    fn prune_selection_no_ids_keeps_only_terminal() {
+        let records = vec![
+            record("a-completed", RunClassification::Completed, false),
+            record("b-in-progress", RunClassification::InProgress, true),
+            record("c-timeout", RunClassification::Timeout, true),
+            record("d-blocked", RunClassification::Blocked, true),
+            record("e-exited", RunClassification::Exited, false),
+        ];
+        let result = prune_selection(records, &[]).unwrap();
+        let ids: Vec<&str> = result.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(result.len(), 4);
+        assert!(ids.contains(&"a-completed"));
+        assert!(ids.contains(&"c-timeout"));
+        assert!(ids.contains(&"d-blocked"));
+        assert!(ids.contains(&"e-exited"));
+        assert!(!ids.contains(&"b-in-progress"));
+    }
+
+    #[test]
+    fn prune_rejects_non_terminal_id() {
+        let records = vec![
+            record("aaa", RunClassification::InProgress, true),
+            record("bbb", RunClassification::Completed, false),
+        ];
+        let result = prune_selection(records, &["aaa".to_string()]);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("still in progress"), "got: {msg}");
+        assert!(msg.contains("aaa"), "got: {msg}");
+    }
+
+    #[test]
+    fn prune_rejects_unknown_id() {
+        let records = vec![record("bbb", RunClassification::Completed, false)];
+        let result = prune_selection(records, &["does-not-exist".to_string()]);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("unknown"), "got: {msg}");
+        assert!(msg.contains("does-not-exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn prune_selection_picks_explicit_terminal_ids() {
+        let records = vec![
+            record("a-completed", RunClassification::Completed, false),
+            record("b-in-progress", RunClassification::InProgress, true),
+            record("c-timeout", RunClassification::Timeout, true),
+        ];
+        let result = prune_selection(
+            records,
+            &["a-completed".to_string(), "c-timeout".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    // ---------- execute_prune (spec test #10) ----------
+
+    #[test]
+    fn dry_run_does_not_delete() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+        let run_a = root.join("aaa");
+        fs::create_dir_all(&run_a).unwrap();
+        fs::write(run_a.join("meta.json"), "{}").unwrap();
+        fs::write(run_a.join("complete.txt"), "done").unwrap();
+
+        let outcome = execute_prune(
+            &[record("aaa", RunClassification::Completed, false)],
+            &root,
+            true, // dry_run
+        );
+
+        assert_eq!(outcome.deleted, 0);
+        assert!(outcome.failures.is_empty());
+        assert!(run_a.exists(), "dry-run must not delete the run dir");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn execute_prune_deletes_when_not_dry_run() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        let a = root.join("aaa");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("meta.json"), "{}").unwrap();
+        fs::write(a.join("complete.txt"), "done").unwrap();
+
+        let b = root.join("bbb");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("meta.json"), "{}").unwrap();
+        fs::write(
+            b.join("error.txt"),
+            "timeout waiting for explicit completion\n",
+        )
+        .unwrap();
+
+        let outcome = execute_prune(
+            &[
+                record("aaa", RunClassification::Completed, false),
+                record("bbb", RunClassification::Timeout, false),
+            ],
+            &root,
+            false,
+        );
+
+        assert_eq!(outcome.deleted, 2);
+        assert!(outcome.failures.is_empty());
+        assert!(!a.exists());
+        assert!(!b.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn execute_prune_reports_failures_for_missing_dirs() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        // ghost directory: record points to id that doesn't exist on disk
+        let outcome = execute_prune(
+            &[record("missing", RunClassification::Completed, false)],
+            &root,
+            false,
+        );
+
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.failures, vec!["missing"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------- Formatting helpers ----------
+
+    #[test]
+    fn format_age_handles_seconds_minutes_hours_days() {
+        assert_eq!(format_age_secs(5), "5s ago");
+        assert_eq!(format_age_secs(120), "2m ago");
+        assert_eq!(format_age_secs(7200), "2h ago");
+        assert_eq!(format_age_secs(172800), "2d ago");
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids() {
+        assert_eq!(short_id("abcdef0123456789"), "abcdef01");
+        assert_eq!(short_id("short"), "short");
     }
 }
