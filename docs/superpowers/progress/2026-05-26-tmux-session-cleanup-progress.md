@@ -1,7 +1,8 @@
 ---
 plan: docs/superpowers/plans/2026-05-26-tmux-session-cleanup.md
 started: 2026-05-26
-status: in_progress
+completed: 2026-05-26
+status: complete
 ---
 
 # Implementation Progress: tmux session cleanup
@@ -67,3 +68,47 @@ Added the full `prune` command and all supporting infrastructure: `RunClassifica
 Set up `TMUXLET_HOME=/tmp/tmuxlet-test-prune` and create three fixture run-dirs, then exercise `prune --dry-run`, `prune -y`, `prune <id>` with `n` and `y` responses, and `prune nonexistent`. Full steps in the agent's report.
 
 ---
+
+## Phase 3: README + final verification
+
+**Completed**: 2026-05-26
+**Status**: COMPLETE
+**Commits**: `bc52f11`
+**Tests**: PASS (74/74)
+
+### Summary
+
+Documented `prune` in `README.md` in three places: (1) the CLI fenced block at lines 111-118 with the new `tmuxlet prune [<id>...] [-y] [--dry-run]` line plus a short prose explanation of behavior, default sweep, refusal of non-terminal ids, and the `-y` / `--dry-run` flags; (2) the "Runtime State" section noting that `completed` runs auto-kill the tmux session but leave the run-dir, while `timeout` / `blocked` runs preserve both, and `tmuxlet prune` is the cleanup tool; (3) the "Output And Failures" section with a 4-line typical cleanup flow showing `say ready` → `--timeout` → `attach` → `prune`. Plan's Phase 3 automated checkboxes ticked.
+
+### Verification
+
+- `cargo fmt -- --check` clean
+- `cargo build` warning-free
+- `cargo test` — 74/74 pass
+- `cargo run -- --version` reports `tmuxlet 0.3.0` matching `Cargo.toml`
+- `cargo run -- --help | grep prune` shows the prune token in the usage line
+- `grep -c "prune" README.md` returns 4 (CLI listing + prose under it + Runtime State note + flow example)
+
+---
+
+## Final state
+
+**Total commits in implementation**: 13 (`d685df5` through `bc52f11`)
+- Phase 1: 1 commit
+- Phase 2: 9 commits (8 logical units + 1 checkbox update)
+- Phase 3: 1 commit
+- Plus 2 progress-file updates: `70e8cd5`, `313e49a`
+
+**Total tests**: 74 (44 existing + 30 new, all passing)
+- All three spec-required tests automated:
+  - `discover_runs_filters_terminal` (spec #8)
+  - `prune_rejects_non_terminal_id` (spec #9)
+  - `dry_run_does_not_delete` (spec #10)
+
+**Working tree**: clean
+
+**Remaining (manual, deferred to human)**:
+1. Phase 1 smoke: `cargo run -- -p "say ready"`, then `tmux ls` (expect no leftover session)
+2. Phase 1 timeout sanity: `cargo run -- --timeout 5 -p "sleep 60"`, then `tmux ls` (expect session still alive)
+3. Phase 2 fixture tests: build tempdir fixtures and exercise `prune --dry-run`, `prune -y`, `prune <id>` with `n`/`y` responses, `prune nonexistent`
+4. Phase 2 end-to-end: real `tmuxlet -p "say ready"` followed by `tmuxlet prune -y`
