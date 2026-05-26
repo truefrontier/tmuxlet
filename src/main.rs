@@ -968,6 +968,50 @@ hint: rerun with --dangerously-skip-permissions if supported by this target, or 
     )
 }
 
+fn classify_from_markers(
+    complete_exists: bool,
+    error_first_line: Option<&str>,
+    session_alive: bool,
+) -> RunClassification {
+    if complete_exists {
+        return RunClassification::Completed;
+    }
+    if let Some(line) = error_first_line {
+        if line.starts_with("timeout ") {
+            return RunClassification::Timeout;
+        }
+        if line.starts_with("blocked ") {
+            return RunClassification::Blocked;
+        }
+        // Unknown error.txt content — treat as Blocked (still terminal).
+        return RunClassification::Blocked;
+    }
+    if !session_alive {
+        return RunClassification::Exited;
+    }
+    RunClassification::InProgress
+}
+
+fn classify_run(run_dir: &Path, session_alive: bool) -> Option<RunClassification> {
+    if !run_dir.join("meta.json").exists() {
+        return None;
+    }
+    let complete = run_dir.join("complete.txt").exists();
+    let error_path = run_dir.join("error.txt");
+    let error_first_line = if error_path.exists() {
+        fs::read_to_string(&error_path)
+            .ok()
+            .and_then(|s| s.lines().next().map(str::to_string))
+    } else {
+        None
+    };
+    Some(classify_from_markers(
+        complete,
+        error_first_line.as_deref(),
+        session_alive,
+    ))
+}
+
 fn tmux_session_exists(name: &str) -> bool {
     Command::new("tmux")
         .args(["has-session", "-t", name])
@@ -2417,5 +2461,100 @@ mod tests {
         assert_eq!(r.classification, RunClassification::Completed);
         assert_eq!(r.age_secs, Some(7));
         assert!(!r.session_alive);
+    }
+
+    #[test]
+    fn classify_completed_when_complete_txt_present() {
+        assert_eq!(
+            classify_from_markers(true, None, true),
+            RunClassification::Completed
+        );
+        assert_eq!(
+            classify_from_markers(true, Some("timeout ..."), false),
+            RunClassification::Completed
+        );
+    }
+
+    #[test]
+    fn classify_timeout_when_error_starts_with_timeout() {
+        assert_eq!(
+            classify_from_markers(
+                false,
+                Some("timeout waiting for explicit completion"),
+                true,
+            ),
+            RunClassification::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_blocked_when_error_starts_with_blocked() {
+        assert_eq!(
+            classify_from_markers(
+                false,
+                Some("blocked waiting for a confirmation or permission prompt"),
+                true,
+            ),
+            RunClassification::Blocked
+        );
+    }
+
+    #[test]
+    fn classify_blocked_for_unknown_error_content() {
+        assert_eq!(
+            classify_from_markers(false, Some("some other error"), true),
+            RunClassification::Blocked
+        );
+    }
+
+    #[test]
+    fn classify_exited_when_session_dead_no_markers() {
+        assert_eq!(
+            classify_from_markers(false, None, false),
+            RunClassification::Exited
+        );
+    }
+
+    #[test]
+    fn classify_in_progress_when_session_alive_no_markers() {
+        assert_eq!(
+            classify_from_markers(false, None, true),
+            RunClassification::InProgress
+        );
+    }
+
+    #[test]
+    fn classify_run_returns_none_without_meta_json() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        let result = classify_run(&dir, true);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn classify_run_reads_error_first_line() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), "{}").unwrap();
+        fs::write(
+            dir.join("error.txt"),
+            "timeout waiting for explicit completion\nextra context line\n",
+        )
+        .unwrap();
+        let result = classify_run(&dir, false);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, Some(RunClassification::Timeout));
+    }
+
+    #[test]
+    fn classify_run_completed_takes_priority_over_session_state() {
+        let dir = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), "{}").unwrap();
+        fs::write(dir.join("complete.txt"), "done").unwrap();
+        let result = classify_run(&dir, false);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, Some(RunClassification::Completed));
     }
 }
