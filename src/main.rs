@@ -188,6 +188,7 @@ fn run() -> Result<(), String> {
         "send" => handle_send(&args[1..]),
         "attach" => handle_attach(&args[1..]),
         "stop" => handle_stop(&args[1..]),
+        "prune" => handle_prune(&args[1..]),
         _ => {
             let opts = parse_options(&mut args)?;
             if opts.print {
@@ -1424,6 +1425,69 @@ fn handle_stop(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_prune(args: &[String]) -> Result<(), String> {
+    let parsed = parse_prune_args(args)?;
+    let runs = discover_runs();
+    let selected = prune_selection(runs, &parsed.ids)?;
+
+    if selected.is_empty() {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+
+    // List proposed prunes.
+    let verb = if parsed.dry_run {
+        "Would prune"
+    } else {
+        "Found"
+    };
+    println!("{verb} {} run(s):", selected.len());
+    for rec in &selected {
+        let age = rec
+            .age_secs
+            .map(format_age_secs)
+            .unwrap_or_else(|| "-".to_string());
+        let session = if rec.session_alive { "alive" } else { "gone" };
+        println!(
+            "  {:<10} {:<11} {:<10} (session: {})",
+            short_id(&rec.id),
+            rec.classification.label(),
+            age,
+            session
+        );
+    }
+
+    if parsed.dry_run {
+        return Ok(());
+    }
+
+    if !parsed.yes {
+        print!("Proceed? [y/N] ");
+        io::stdout().flush().ok();
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|e| format!("failed to read confirmation: {e}"))?;
+        let trimmed = response.trim().to_lowercase();
+        if !matches!(trimmed.as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let runs_root = state_dir().join("runs");
+    let outcome = execute_prune(&selected, &runs_root, false);
+
+    println!("Pruned {} run(s).", outcome.deleted);
+    if !outcome.failures.is_empty() {
+        return Err(format!(
+            "failed to remove {} run(s)",
+            outcome.failures.len()
+        ));
+    }
+    Ok(())
+}
+
 fn tmux_name_from_id(id: &str) -> String {
     if id.starts_with("tmuxlet-") {
         id.to_string()
@@ -2063,7 +2127,7 @@ fn shell_quote(value: &str) -> String {
 fn print_help() {
     println!(
         "tmuxlet {VERSION}\n\n\
-Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|attach|stop>\n  tmuxlet bridge <complete|stop-hook|tool-hook> --run <id> [...]\n\n\
+Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|attach|stop|prune>\n  tmuxlet bridge <complete|stop-hook|tool-hook> --run <id> [...]\n\n\
 Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
 Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -"
     );
@@ -2627,11 +2691,7 @@ mod tests {
     #[test]
     fn classify_timeout_when_error_starts_with_timeout() {
         assert_eq!(
-            classify_from_markers(
-                false,
-                Some("timeout waiting for explicit completion"),
-                true,
-            ),
+            classify_from_markers(false, Some("timeout waiting for explicit completion"), true,),
             RunClassification::Timeout
         );
     }
@@ -2870,8 +2930,11 @@ mod tests {
             record("b-in-progress", RunClassification::InProgress, true),
             record("c-timeout", RunClassification::Timeout, true),
         ];
-        let result = prune_selection(records, &["a-completed".to_string(), "c-timeout".to_string()])
-            .unwrap();
+        let result = prune_selection(
+            records,
+            &["a-completed".to_string(), "c-timeout".to_string()],
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -2912,7 +2975,11 @@ mod tests {
         let b = root.join("bbb");
         fs::create_dir_all(&b).unwrap();
         fs::write(b.join("meta.json"), "{}").unwrap();
-        fs::write(b.join("error.txt"), "timeout waiting for explicit completion\n").unwrap();
+        fs::write(
+            b.join("error.txt"),
+            "timeout waiting for explicit completion\n",
+        )
+        .unwrap();
 
         let outcome = execute_prune(
             &[
