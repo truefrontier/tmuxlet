@@ -117,6 +117,39 @@ struct RunResult {
     elapsed_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunClassification {
+    Completed,
+    Timeout,
+    Blocked,
+    Exited,
+    InProgress,
+}
+
+impl RunClassification {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Timeout => "timeout",
+            Self::Blocked => "blocked",
+            Self::Exited => "exited",
+            Self::InProgress => "in-progress",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::InProgress)
+    }
+}
+
+#[derive(Debug)]
+struct RunRecord {
+    id: String,
+    classification: RunClassification,
+    age_secs: Option<u64>,
+    session_alive: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TargetCommand {
     program: String,
@@ -2350,5 +2383,39 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "first write");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------- Classification ----------
+
+    #[test]
+    fn classification_label_returns_expected_strings() {
+        assert_eq!(RunClassification::Completed.label(), "completed");
+        assert_eq!(RunClassification::Timeout.label(), "timeout");
+        assert_eq!(RunClassification::Blocked.label(), "blocked");
+        assert_eq!(RunClassification::Exited.label(), "exited");
+        assert_eq!(RunClassification::InProgress.label(), "in-progress");
+    }
+
+    #[test]
+    fn classification_is_terminal_for_all_except_in_progress() {
+        assert!(RunClassification::Completed.is_terminal());
+        assert!(RunClassification::Timeout.is_terminal());
+        assert!(RunClassification::Blocked.is_terminal());
+        assert!(RunClassification::Exited.is_terminal());
+        assert!(!RunClassification::InProgress.is_terminal());
+    }
+
+    #[test]
+    fn run_record_can_be_constructed_and_inspected() {
+        let r = RunRecord {
+            id: "abc".to_string(),
+            classification: RunClassification::Completed,
+            age_secs: Some(7),
+            session_alive: false,
+        };
+        assert_eq!(r.id, "abc");
+        assert_eq!(r.classification, RunClassification::Completed);
+        assert_eq!(r.age_secs, Some(7));
+        assert!(!r.session_alive);
     }
 }
