@@ -940,17 +940,17 @@ This produces ~8 small, reviewable commits with each one passing `cargo test` on
 
 #### Automated Verification:
 
-- [ ] `cargo build` succeeds with **no warnings** (no `dead_code`, no `unused`)
-- [ ] `cargo fmt -- --check` clean
-- [ ] `cargo test` all tests pass (44 existing + ~22 new)
-- [ ] `cargo test classify_` runs the classification tests
-- [ ] `cargo test prune_selection_` runs the selection tests
-- [ ] `cargo test execute_prune` runs the deletion tests
-- [ ] `cargo test parses_prune_` runs the parser tests
-- [ ] `cargo run -- --help | grep -F prune` shows `prune` in the usage line
-- [ ] `TMUXLET_HOME=$(mktemp -d) cargo run -- prune` exits 0 with `Nothing to prune.`
-- [ ] `TMUXLET_HOME=$(mktemp -d) cargo run -- prune --dry-run` exits 0 with `Nothing to prune.`
-- [ ] `cargo run -- prune --no-such-flag` exits 1 with `tmuxlet: unknown option for prune: --no-such-flag`
+- [x] `cargo build` succeeds with **no warnings** (no `dead_code`, no `unused`)
+- [x] `cargo fmt -- --check` clean
+- [x] `cargo test` all tests pass (44 existing + ~22 new)
+- [x] `cargo test classify_` runs the classification tests
+- [x] `cargo test prune_selection_` runs the selection tests
+- [x] `cargo test execute_prune` runs the deletion tests
+- [x] `cargo test parses_prune_` runs the parser tests
+- [x] `cargo run -- --help | grep -F prune` shows `prune` in the usage line
+- [x] `TMUXLET_HOME=$(mktemp -d) cargo run -- prune` exits 0 with `Nothing to prune.`
+- [x] `TMUXLET_HOME=$(mktemp -d) cargo run -- prune --dry-run` exits 0 with `Nothing to prune.`
+- [x] `cargo run -- prune --no-such-flag` exits 1 with `tmuxlet: unknown option for prune: --no-such-flag`
 
 #### Manual Verification:
 
