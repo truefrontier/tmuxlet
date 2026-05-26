@@ -330,6 +330,41 @@ fn prune_selection(
     Ok(found)
 }
 
+struct PruneOutcome {
+    deleted: usize,
+    failures: Vec<String>,
+}
+
+fn execute_prune(selected: &[RunRecord], runs_root: &Path, dry_run: bool) -> PruneOutcome {
+    if dry_run {
+        return PruneOutcome {
+            deleted: 0,
+            failures: Vec::new(),
+        };
+    }
+    let mut deleted = 0usize;
+    let mut failures = Vec::new();
+    for rec in selected {
+        if rec.session_alive {
+            let session_name = format!("tmuxlet-{}", rec.id);
+            let _ = run_tmux([
+                OsStr::new("kill-session"),
+                OsStr::new("-t"),
+                OsStr::new(&session_name),
+            ]);
+        }
+        let dir = runs_root.join(&rec.id);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                eprintln!("tmuxlet: failed to remove {}: {e}", dir.display());
+                failures.push(rec.id.clone());
+            }
+        }
+    }
+    PruneOutcome { deleted, failures }
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
@@ -2822,5 +2857,79 @@ mod tests {
         let result = prune_selection(records, &["a-completed".to_string(), "c-timeout".to_string()])
             .unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    // ---------- execute_prune (spec test #10) ----------
+
+    #[test]
+    fn dry_run_does_not_delete() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+        let run_a = root.join("aaa");
+        fs::create_dir_all(&run_a).unwrap();
+        fs::write(run_a.join("meta.json"), "{}").unwrap();
+        fs::write(run_a.join("complete.txt"), "done").unwrap();
+
+        let outcome = execute_prune(
+            &[record("aaa", RunClassification::Completed, false)],
+            &root,
+            true, // dry_run
+        );
+
+        assert_eq!(outcome.deleted, 0);
+        assert!(outcome.failures.is_empty());
+        assert!(run_a.exists(), "dry-run must not delete the run dir");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn execute_prune_deletes_when_not_dry_run() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        let a = root.join("aaa");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("meta.json"), "{}").unwrap();
+        fs::write(a.join("complete.txt"), "done").unwrap();
+
+        let b = root.join("bbb");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("meta.json"), "{}").unwrap();
+        fs::write(b.join("error.txt"), "timeout waiting for explicit completion\n").unwrap();
+
+        let outcome = execute_prune(
+            &[
+                record("aaa", RunClassification::Completed, false),
+                record("bbb", RunClassification::Timeout, false),
+            ],
+            &root,
+            false,
+        );
+
+        assert_eq!(outcome.deleted, 2);
+        assert!(outcome.failures.is_empty());
+        assert!(!a.exists());
+        assert!(!b.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn execute_prune_reports_failures_for_missing_dirs() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        // ghost directory: record points to id that doesn't exist on disk
+        let outcome = execute_prune(
+            &[record("missing", RunClassification::Completed, false)],
+            &root,
+            false,
+        );
+
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.failures, vec!["missing"]);
+
+        fs::remove_dir_all(&root).ok();
     }
 }
