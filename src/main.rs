@@ -291,6 +291,45 @@ fn parse_prune_args(args: &[String]) -> Result<PruneArgs, String> {
     Ok(out)
 }
 
+fn prune_selection(
+    records: Vec<RunRecord>,
+    explicit_ids: &[String],
+) -> Result<Vec<RunRecord>, String> {
+    if explicit_ids.is_empty() {
+        return Ok(records
+            .into_iter()
+            .filter(|r| r.classification.is_terminal())
+            .collect());
+    }
+
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, RunRecord> = HashMap::new();
+    for r in records {
+        by_id.insert(r.id.clone(), r);
+    }
+
+    let mut found: Vec<RunRecord> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut non_terminal: Vec<String> = Vec::new();
+    for id in explicit_ids {
+        match by_id.remove(id) {
+            None => unknown.push(id.clone()),
+            Some(r) if !r.classification.is_terminal() => non_terminal.push(r.id.clone()),
+            Some(r) => found.push(r),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!("unknown run(s): {}", unknown.join(", ")));
+    }
+    if !non_terminal.is_empty() {
+        return Err(format!(
+            "run(s) still in progress; use `tmuxlet stop <id>` first: {}",
+            non_terminal.join(", ")
+        ));
+    }
+    Ok(found)
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
@@ -2720,5 +2759,68 @@ mod tests {
         let parsed = prune_argv(&["abc", "--dry-run", "def"]);
         assert_eq!(parsed.ids, vec!["abc", "def"]);
         assert!(parsed.dry_run);
+    }
+
+    // ---------- prune_selection (spec test #9) ----------
+
+    fn record(id: &str, c: RunClassification, alive: bool) -> RunRecord {
+        RunRecord {
+            id: id.to_string(),
+            classification: c,
+            age_secs: None,
+            session_alive: alive,
+        }
+    }
+
+    #[test]
+    fn prune_selection_no_ids_keeps_only_terminal() {
+        let records = vec![
+            record("a-completed", RunClassification::Completed, false),
+            record("b-in-progress", RunClassification::InProgress, true),
+            record("c-timeout", RunClassification::Timeout, true),
+            record("d-blocked", RunClassification::Blocked, true),
+            record("e-exited", RunClassification::Exited, false),
+        ];
+        let result = prune_selection(records, &[]).unwrap();
+        let ids: Vec<&str> = result.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(result.len(), 4);
+        assert!(ids.contains(&"a-completed"));
+        assert!(ids.contains(&"c-timeout"));
+        assert!(ids.contains(&"d-blocked"));
+        assert!(ids.contains(&"e-exited"));
+        assert!(!ids.contains(&"b-in-progress"));
+    }
+
+    #[test]
+    fn prune_rejects_non_terminal_id() {
+        let records = vec![
+            record("aaa", RunClassification::InProgress, true),
+            record("bbb", RunClassification::Completed, false),
+        ];
+        let result = prune_selection(records, &["aaa".to_string()]);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("still in progress"), "got: {msg}");
+        assert!(msg.contains("aaa"), "got: {msg}");
+    }
+
+    #[test]
+    fn prune_rejects_unknown_id() {
+        let records = vec![record("bbb", RunClassification::Completed, false)];
+        let result = prune_selection(records, &["does-not-exist".to_string()]);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("unknown"), "got: {msg}");
+        assert!(msg.contains("does-not-exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn prune_selection_picks_explicit_terminal_ids() {
+        let records = vec![
+            record("a-completed", RunClassification::Completed, false),
+            record("b-in-progress", RunClassification::InProgress, true),
+            record("c-timeout", RunClassification::Timeout, true),
+        ];
+        let result = prune_selection(records, &["a-completed".to_string(), "c-timeout".to_string()])
+            .unwrap();
+        assert_eq!(result.len(), 2);
     }
 }
