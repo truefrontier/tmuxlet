@@ -365,6 +365,22 @@ fn execute_prune(selected: &[RunRecord], runs_root: &Path, dry_run: bool) -> Pru
     PruneOutcome { deleted, failures }
 }
 
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn format_age_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
@@ -2931,5 +2947,21 @@ mod tests {
         assert_eq!(outcome.failures, vec!["missing"]);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------- Formatting helpers ----------
+
+    #[test]
+    fn format_age_handles_seconds_minutes_hours_days() {
+        assert_eq!(format_age_secs(5), "5s ago");
+        assert_eq!(format_age_secs(120), "2m ago");
+        assert_eq!(format_age_secs(7200), "2h ago");
+        assert_eq!(format_age_secs(172800), "2d ago");
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids() {
+        assert_eq!(short_id("abcdef0123456789"), "abcdef01");
+        assert_eq!(short_id("short"), "short");
     }
 }
