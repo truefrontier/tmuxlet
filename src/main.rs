@@ -1012,6 +1012,43 @@ fn classify_run(run_dir: &Path, session_alive: bool) -> Option<RunClassification
     ))
 }
 
+fn discover_runs() -> Vec<RunRecord> {
+    discover_runs_in(&state_dir().join("runs"))
+}
+
+fn discover_runs_in(runs_root: &Path) -> Vec<RunRecord> {
+    let entries = match fs::read_dir(runs_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let session_alive = tmux_session_exists(&format!("tmuxlet-{id}"));
+        let Some(classification) = classify_run(&path, session_alive) else {
+            continue;
+        };
+        let age_secs = heartbeat_age_secs(&path.join(HEARTBEAT_FILENAME));
+        records.push(RunRecord {
+            id,
+            classification,
+            age_secs,
+            session_alive,
+        });
+    }
+
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    records
+}
+
 fn tmux_session_exists(name: &str) -> bool {
     Command::new("tmux")
         .args(["has-session", "-t", name])
@@ -2556,5 +2593,54 @@ mod tests {
         let result = classify_run(&dir, false);
         fs::remove_dir_all(&dir).ok();
         assert_eq!(result, Some(RunClassification::Completed));
+    }
+
+    // ---------- discover_runs_in (spec test #8) ----------
+
+    #[test]
+    fn discover_runs_filters_terminal() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+
+        // Completed
+        let c = root.join("completed-aaa");
+        fs::create_dir_all(&c).unwrap();
+        fs::write(c.join("meta.json"), "{}").unwrap();
+        fs::write(c.join("complete.txt"), "done").unwrap();
+
+        // Timeout
+        let t = root.join("timeout-bbb");
+        fs::create_dir_all(&t).unwrap();
+        fs::write(t.join("meta.json"), "{}").unwrap();
+        fs::write(
+            t.join("error.txt"),
+            "timeout waiting for explicit completion\n",
+        )
+        .unwrap();
+
+        // No meta.json → skipped silently
+        let skipped = root.join("no-meta-ccc");
+        fs::create_dir_all(&skipped).unwrap();
+
+        let records = discover_runs_in(&root);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(records.len(), 2, "got: {records:?}");
+        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"completed-aaa"));
+        assert!(ids.contains(&"timeout-bbb"));
+        assert!(records.iter().all(|r| r.classification.is_terminal()));
+        // No heartbeat file written → age_secs is None for all records.
+        assert!(records.iter().all(|r| r.age_secs.is_none()));
+        // No tmux sessions exist for these fixture ids → session_alive is false.
+        assert!(records.iter().all(|r| !r.session_alive));
+    }
+
+    #[test]
+    fn discover_runs_in_returns_empty_for_missing_root() {
+        let root = env::temp_dir().join(make_run_id());
+        // Don't create it
+        let records = discover_runs_in(&root);
+        assert!(records.is_empty());
     }
 }
