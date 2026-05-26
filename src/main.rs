@@ -269,6 +269,28 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
     Ok(opts)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PruneArgs {
+    ids: Vec<String>,
+    yes: bool,
+    dry_run: bool,
+}
+
+fn parse_prune_args(args: &[String]) -> Result<PruneArgs, String> {
+    let mut out = PruneArgs::default();
+    for arg in args {
+        match arg.as_str() {
+            "-y" | "--yes" => out.yes = true,
+            "--dry-run" => out.dry_run = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for prune: {other}"));
+            }
+            other => out.ids.push(other.to_string()),
+        }
+    }
+    Ok(out)
+}
+
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
@@ -2642,5 +2664,61 @@ mod tests {
         // Don't create it
         let records = discover_runs_in(&root);
         assert!(records.is_empty());
+    }
+
+    // ---------- parse_prune_args ----------
+
+    fn prune_argv(args: &[&str]) -> PruneArgs {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_prune_args(&owned).unwrap()
+    }
+
+    #[test]
+    fn parses_prune_no_args() {
+        let parsed = prune_argv(&[]);
+        assert!(parsed.ids.is_empty());
+        assert!(!parsed.yes);
+        assert!(!parsed.dry_run);
+    }
+
+    #[test]
+    fn parses_prune_with_ids() {
+        let parsed = prune_argv(&["abc123", "def456"]);
+        assert_eq!(parsed.ids, vec!["abc123", "def456"]);
+    }
+
+    #[test]
+    fn parses_prune_dry_run() {
+        let parsed = prune_argv(&["--dry-run"]);
+        assert!(parsed.dry_run);
+        assert!(!parsed.yes);
+    }
+
+    #[test]
+    fn parses_prune_yes_short_and_long() {
+        assert!(prune_argv(&["-y"]).yes);
+        assert!(prune_argv(&["--yes"]).yes);
+    }
+
+    #[test]
+    fn parses_prune_dry_run_and_yes_together() {
+        let parsed = prune_argv(&["-y", "--dry-run"]);
+        assert!(parsed.yes);
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
+    fn parses_prune_rejects_unknown_flag() {
+        let owned = vec!["--no-such-flag".to_string()];
+        let result = parse_prune_args(&owned);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("--no-such-flag"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_prune_mixed_ids_and_flags() {
+        let parsed = prune_argv(&["abc", "--dry-run", "def"]);
+        assert_eq!(parsed.ids, vec!["abc", "def"]);
+        assert!(parsed.dry_run);
     }
 }
