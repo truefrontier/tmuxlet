@@ -57,6 +57,7 @@ struct Options {
     mcp_configs: Vec<String>,
     settings: Option<String>,
     target_args: Vec<String>,
+    contract_grant: Option<ContractGrant>,
     timeout: Duration,
 }
 
@@ -84,6 +85,7 @@ impl Default for Options {
             mcp_configs: Vec::new(),
             settings: None,
             target_args: Vec::new(),
+            contract_grant: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         }
     }
@@ -98,6 +100,16 @@ struct RunPaths {
     complete: PathBuf,
     pane_log: PathBuf,
     error: PathBuf,
+}
+
+/// Per-run authorization context for the completion contract. tmuxlet knows the
+/// run dir (which holds answer.txt/complete.txt, outside the target's cwd) and
+/// its own absolute exe path at launch, so it can grant exactly the two contract
+/// operations to each target without a blanket permission bypass.
+#[derive(Debug, Clone)]
+struct ContractGrant {
+    run_root: PathBuf,
+    exe: String,
 }
 
 #[derive(Debug)]
@@ -418,13 +430,22 @@ fn prompt_from(opts: &Options) -> Result<String, String> {
     }
 }
 
-fn run_print(opts: Options) -> Result<RunResult, String> {
+fn run_print(mut opts: Options) -> Result<RunResult, String> {
     ensure_tmux()?;
     let started = Instant::now();
     let run_id = make_run_id();
     let tmux_session = format!("tmuxlet-{run_id}");
     let paths = run_paths(&run_id)?;
     fs::create_dir_all(&paths.root).map_err(|e| format!("failed to create run dir: {e}"))?;
+
+    // Authorize the completion-contract operations for this run. The per-target
+    // builders translate this into the narrowest grant available (claude/codex
+    // get true scoping; gemini/opencode/cursor fall back to their auto-approve
+    // mode because their CLIs offer no graded tier).
+    opts.contract_grant = Some(ContractGrant {
+        run_root: paths.root.clone(),
+        exe: tmuxlet_exe(),
+    });
 
     let prompt = prompt_from(&opts)?;
     fs::write(&paths.prompt, &prompt).map_err(|e| format!("failed to write prompt: {e}"))?;
@@ -609,7 +630,27 @@ fn validate_session_controls(opts: &Options) -> Result<(), String> {
 fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     let mut args = Vec::new();
     push_opt(&mut args, "--model", &opts.model);
-    push_opt(&mut args, "--permission-mode", &opts.permission_mode);
+    // Default autonomous (tmux-driven, non-interactive) claude runs to the
+    // `auto` permission mode: it auto-approves safe operations (in-cwd edits,
+    // safe bash) and only escalates genuinely dangerous ones, so headless runs
+    // don't hang on permission prompts the way bare interactive claude does.
+    // An explicit --permission-mode overrides this; --dangerously-skip-permissions
+    // (full bypass) takes precedence and suppresses --permission-mode entirely.
+    // Override the default per-invocation with `--permission-mode default`, or
+    // globally via the TMUXLET_CLAUDE_PERMISSION_MODE env var.
+    let permission_mode = if opts.dangerously_skip_permissions {
+        None
+    } else if opts.permission_mode.is_some() {
+        opts.permission_mode.clone()
+    } else {
+        Some(
+            env::var("TMUXLET_CLAUDE_PERMISSION_MODE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "auto".to_string()),
+        )
+    };
+    push_opt(&mut args, "--permission-mode", &permission_mode);
     if opts.dangerously_skip_permissions {
         args.push("--dangerously-skip-permissions".into());
     }
@@ -646,6 +687,20 @@ fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.session.is_some() {
         unsupported("claude", "--session", "use --session-id or --resume")?;
     }
+    // Explicitly grant the two completion-contract operations so headless runs
+    // never hang on a permission prompt for them. The answer file lives under the
+    // tmuxlet run dir (outside cwd), so --add-dir folds it into the auto-approved
+    // workspace; the bridge call is allow-listed by command prefix. Skipped under
+    // full bypass, which already permits everything.
+    if !opts.dangerously_skip_permissions {
+        if let Some(grant) = &opts.contract_grant {
+            args.extend(["--add-dir".into(), grant.run_root.display().to_string()]);
+            args.extend([
+                "--allowed-tools".into(),
+                format!("Bash({} bridge complete:*)", grant.exe),
+            ]);
+        }
+    }
     Ok(TargetCommand {
         program: "claude".into(),
         args,
@@ -670,7 +725,9 @@ fn gemini_command(opts: &Options) -> Result<TargetCommand, String> {
 
     let mut args = Vec::new();
     push_opt(&mut args, "--model", &opts.model);
-    if opts.dangerously_skip_permissions {
+    // Gemini has no graded auto mode and `auto_edit` does not cover shell tools,
+    // so the completion-contract shell call requires full auto-approve (--yolo).
+    if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
         args.push("--yolo".into());
     }
     for value in &opts.add_dirs {
@@ -724,6 +781,19 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     if opts.dangerously_skip_permissions {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    } else if let Some(grant) = &opts.contract_grant {
+        // Codex sandboxes by filesystem, not per-tool prompts. The run dir lives
+        // outside the workspace-write sandbox, so carve it in as a writable root
+        // and disable approval prompts while keeping the sandbox otherwise intact.
+        args.extend(["--ask-for-approval".into(), "never".into()]);
+        args.extend(["--sandbox".into(), "workspace-write".into()]);
+        args.extend([
+            "-c".into(),
+            format!(
+                "sandbox_workspace_write.writable_roots=[\"{}\"]",
+                grant.run_root.display()
+            ),
+        ]);
     }
     Ok(TargetCommand {
         program: "codex".into(),
@@ -764,7 +834,9 @@ fn opencode_command(opts: &Options) -> Result<TargetCommand, String> {
         }
     }
     args.extend(["--dir".into(), opts.cwd.display().to_string()]);
-    if opts.dangerously_skip_permissions {
+    // opencode has no graded auto mode and no confirmed headless allow-list flag,
+    // so its bypass flag is the only reliable non-interactive auto-approve path.
+    if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
         args.push("--dangerously-skip-permissions".into());
     }
     Ok(TargetCommand {
@@ -806,6 +878,8 @@ fn pi_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.dangerously_skip_permissions {
         return Err("pi has no direct --dangerously-skip-permissions/--yolo equivalent; use --target-arg for explicit pi flags".into());
     }
+    // pi auto-approves tool use by default, so the completion contract needs no
+    // extra grant — opts.contract_grant requires no injection here.
     Ok(TargetCommand {
         program: "pi".into(),
         args,
@@ -840,7 +914,10 @@ fn cursor_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.continue_latest {
         args.push("resume".into());
     }
-    if opts.dangerously_skip_permissions {
+    // --force lets cursor-agent print mode perform writes (incl. the answer file).
+    // The bridge shell call may additionally need a .cursor/cli.json allow entry
+    // depending on version; --force is the best single-flag auto-approve available.
+    if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
         args.push("--force".into());
     }
     Ok(TargetCommand {
@@ -882,11 +959,15 @@ fn unsupported(target: &str, flag: &str, hint: &str) -> Result<(), String> {
     ))
 }
 
-fn completion_prompt(prompt: &str, run_id: &str, answer_path: &Path) -> String {
-    let exe = env::current_exe()
+fn tmuxlet_exe() -> String {
+    env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "tmuxlet".into());
+        .unwrap_or_else(|| "tmuxlet".into())
+}
+
+fn completion_prompt(prompt: &str, run_id: &str, answer_path: &Path) -> String {
+    let exe = tmuxlet_exe();
     format!(
         "{prompt}\n\n\
 TMUXLET COMPLETION CONTRACT:\n\
@@ -1535,6 +1616,14 @@ mod tests {
             .any(|window| window[0] == flag && window[1] == value)
     }
 
+    fn with_grant(mut opts: Options) -> Options {
+        opts.contract_grant = Some(ContractGrant {
+            run_root: PathBuf::from("/home/u/.tmuxlet/runs/abc"),
+            exe: "/usr/local/bin/tmuxlet".into(),
+        });
+        opts
+    }
+
     #[test]
     fn parses_print_target_and_prompt() {
         let opts = parse(&["--target", "codex", "-p", "hello"]);
@@ -1593,6 +1682,117 @@ mod tests {
         let opts = parse(&["--session-id", "abc", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
         assert!(has_pair(&cmd.args, "--session-id", "abc"));
+    }
+
+    #[test]
+    fn claude_defaults_to_a_permission_mode() {
+        // No explicit mode -> a --permission-mode flag is injected (auto by
+        // default; tunable via TMUXLET_CLAUDE_PERMISSION_MODE).
+        let opts = parse(&["--target", "claude", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--permission-mode".to_string()));
+
+        // An explicit mode is respected verbatim.
+        let opts = parse(&["--target", "claude", "--permission-mode", "default", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--permission-mode", "default"));
+
+        // Full bypass takes precedence and suppresses --permission-mode.
+        let opts = parse(&["--target", "claude", "--dangerously-skip-permissions", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(!cmd.args.contains(&"--permission-mode".to_string()));
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_grant_injects_scoped_contract_permissions() {
+        let opts = with_grant(parse(&["--target", "claude", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--add-dir", "/home/u/.tmuxlet/runs/abc"));
+        assert!(has_pair(
+            &cmd.args,
+            "--allowed-tools",
+            "Bash(/usr/local/bin/tmuxlet bridge complete:*)"
+        ));
+        // The auto permission-mode default still applies underneath the grant.
+        assert!(cmd.args.contains(&"--permission-mode".to_string()));
+    }
+
+    #[test]
+    fn full_bypass_suppresses_scoped_grant() {
+        let opts = with_grant(parse(&[
+            "--target",
+            "claude",
+            "--dangerously-skip-permissions",
+            "-p",
+            "x",
+        ]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(!cmd.args.contains(&"--add-dir".to_string()));
+        assert!(!cmd.args.contains(&"--permission-mode".to_string()));
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_grant_carves_writable_root() {
+        let opts = with_grant(parse(&["--target", "codex", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--ask-for-approval", "never"));
+        assert!(has_pair(&cmd.args, "--sandbox", "workspace-write"));
+        assert!(cmd.args.iter().any(|a| a
+            == "sandbox_workspace_write.writable_roots=[\"/home/u/.tmuxlet/runs/abc\"]"));
+        assert!(
+            !cmd.args
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_full_bypass_wins_over_grant() {
+        let opts = with_grant(parse(&["--target", "codex", "--yolo", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+        );
+        assert!(!cmd.args.contains(&"--ask-for-approval".to_string()));
+    }
+
+    #[test]
+    fn gemini_grant_enables_yolo() {
+        let opts = with_grant(parse(&["--target", "gemini", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--yolo".to_string()));
+    }
+
+    #[test]
+    fn opencode_grant_uses_bypass_floor() {
+        let opts = with_grant(parse(&["--target", "opencode", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn cursor_grant_forces_writes() {
+        let opts = with_grant(parse(&["--target", "cursor", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--force".to_string()));
+    }
+
+    #[test]
+    fn pi_grant_needs_no_injection() {
+        let opts = with_grant(parse(&["--target", "pi", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "pi");
     }
 
     #[test]
