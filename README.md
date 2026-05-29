@@ -66,7 +66,7 @@ Five reasons, in roughly the order most people care:
 
 **4. Full terminal context.** tmux gives the target a real TTY, real environment, real MCP server config, real allowed-tools settings, and real auth state. Some CLIs behave differently when they detect they're not interactive — running them in tmux removes the ambiguity.
 
-**5. Confirmation handling.** During the startup window, `tmuxlet` watches the pane for known confirmation gates and sends Enter up to three times. If a run stalls later on a permission prompt, you get a `blocked` status with the captured pane content instead of an indefinite hang.
+**5. Permission + confirmation handling.** By default `tmuxlet` grants the target scoped auto-approval for the completion-contract operations, so headless runs don't hang on their own write/bridge step (see [Permissions](#permissions)). It also watches the pane for startup confirmation gates during the startup window and sends Enter up to three times. If a run still stalls on a permission prompt outside the grant, you get a `blocked` status with the captured pane content instead of an indefinite hang.
 
 **Caveat:** reason #1 depends on Anthropic continuing to price interactive Claude Code and `claude -p` from separate pools. If they unify those buckets, that argument goes away — but the other four still hold, and the multi-CLI piece becomes the main reason.
 
@@ -133,8 +133,11 @@ Important options:
 - `-c, --continue`: continue the latest session where supported
 - `-r, --resume [id]`: resume a session by id, or latest/picker where supported
 - `--session-id <id>`: explicit normalized session id selector
-- `--dangerously-skip-permissions`: normalized bypass flag; aliases `--yolo`,
-  `--force`, `--dangerously-bypass-approvals-and-sandbox`
+- `--permission-mode <mode>`: Claude permission mode (`default`, `acceptEdits`,
+  `plan`, `auto`, `dontAsk`, `bypassPermissions`); defaults to `auto`. Claude
+  only — see [Permissions](#permissions)
+- `--dangerously-skip-permissions`: normalized full-bypass flag; aliases
+  `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox`
 - `--timeout <seconds>`: print-mode timeout, default 1800
 
 Non-print prompt launches are intentionally unsupported; pass `-p` for runs.
@@ -207,6 +210,41 @@ The completion contract tells the target CLI to write its final response to
 `answer.txt` and then run `tmuxlet bridge complete`. Other targets currently use
 a paste fallback when tmuxlet cannot safely assume positional prompt support.
 
+## Permissions
+
+Print-mode runs auto-approve safe operations and explicitly grant the two
+completion-contract operations — writing `answer.txt` and calling `tmuxlet bridge
+complete` — so a headless run does not hang on a permission prompt for its own
+completion step. Those files live under `~/.tmuxlet/runs/<run-id>/`, outside the
+target's working directory, so the grant is what lets the target write there
+without prompting. `--permission-mode auto` (and the other targets' equivalents)
+alone is not enough, because auto only auto-approves in-cwd edits.
+
+Each target gets the narrowest grant it supports:
+
+| Target | Default grant |
+| --- | --- |
+| `claude` | `--permission-mode auto` + `--add-dir <run-dir>` + allow `Bash(<tmuxlet> bridge complete:*)` — scoped |
+| `codex` | `--ask-for-approval never --sandbox workspace-write` with the run dir carved in as a `writable_root` — scoped |
+| `gemini` | `--yolo` (no graded mode; `auto_edit` does not cover shell) |
+| `opencode` | `--dangerously-skip-permissions` (no confirmed headless allow-list flag) |
+| `cursor` | `--force` (enables print-mode writes) |
+| `pi` | none — auto-approves tool use by default |
+
+For `claude` and `codex` the grant is genuinely scoped to the contract
+operations. `gemini`, `opencode`, and `cursor` fall back to their broad
+auto-approve mode because those CLIs offer no graded permission tier.
+
+Overrides:
+
+- `--permission-mode <mode>` (Claude only): set the mode explicitly to override
+  the `auto` default.
+- `TMUXLET_CLAUDE_PERMISSION_MODE`: change the Claude default mode globally
+  without passing the flag each time.
+- `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
+  `--dangerously-bypass-approvals-and-sandbox`): full bypass. Takes precedence
+  over and replaces the scoped grant.
+
 ## Runtime State
 
 Runtime files live in:
@@ -232,15 +270,17 @@ how those run directories and any leftover sessions get cleaned up.
 ## Confirmation Handling
 
 For Claude and Codex, tmuxlet passes the full prompt in the launch command with
-the user's prompt first and tmuxlet's completion contract after it. During the
-startup window, tmuxlet watches for common confirmation gates and sends `Enter`
-up to three times. This startup check runs during normal print-mode polling, so
-successful runs can return as soon as the completion file appears.
+the user's prompt first and tmuxlet's completion contract after it. By default
+tmuxlet grants scoped permissions for the contract operations (see
+[Permissions](#permissions)), so the completion step itself does not prompt.
+During the startup window, tmuxlet also watches for common confirmation gates and
+sends `Enter` up to three times. This startup check runs during normal print-mode
+polling, so successful runs can return as soon as the completion file appears.
 
-If a run stalls later on a permission or confirmation prompt, tmuxlet returns a
-nonzero `blocked` status with the captured pane output. Rerun with
-`--dangerously-skip-permissions` where supported, or inspect the run with
-`tmuxlet attach <id>`.
+If a run stalls later on a permission or confirmation prompt outside the default
+grant, tmuxlet returns a nonzero `blocked` status with the captured pane output.
+Rerun with `--dangerously-skip-permissions` for a full bypass where supported, or
+inspect the run with `tmuxlet attach <id>`.
 
 ## Output And Failures
 
