@@ -571,6 +571,12 @@ fn command_with_prompt(
     final_prompt: &str,
 ) -> (TargetCommand, bool) {
     if target_accepts_prompt_argument(target) {
+        // Terminate option parsing before the positional prompt. claude's
+        // --allowed-tools/--add-dir (and codex's --add-dir/--image) are variadic
+        // `<...>` flags; without `--`, the parser swallows the prompt as another
+        // flag value and the CLI launches idle with no prompt. `--` is a no-op
+        // when no variadic flag precedes it, so it is always safe to emit here.
+        command.args.push("--".to_string());
         command.args.push(final_prompt.to_string());
         (command, true)
     } else {
@@ -1044,8 +1050,25 @@ fn send_enter(tmux_session: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// Lowercased pane text with tmuxlet's own launch-flag tokens removed. The shell
+/// echoes the command tmuxlet typed into the pane, and flags such as
+/// `--permission-mode`, `--allowed-tools`, and `--dangerously-skip-permissions`
+/// contain the very words ("permission", "allow") the confirmation heuristics
+/// scan for. Stripping them keeps detection focused on the target CLI's own
+/// prompts instead of tmuxlet's own launch command echo.
+fn confirmation_scan_text(pane: &str) -> String {
+    let mut text = pane.to_ascii_lowercase();
+    for token in [
+        "--permission-mode",
+        "--allowed-tools",
+        "--dangerously-skip-permissions",
+    ] {
+        text = text.replace(token, " ");
+    }
+    text
+}
 fn is_startup_auto_enter_prompt(pane: &str) -> bool {
-    let text = pane.to_ascii_lowercase();
+    let text = confirmation_scan_text(pane);
     contains_any(
         &text,
         &[
@@ -1070,7 +1093,7 @@ fn is_startup_auto_enter_prompt(pane: &str) -> bool {
 }
 
 fn is_execution_confirmation_blocker(pane: &str) -> bool {
-    let text = pane.to_ascii_lowercase();
+    let text = confirmation_scan_text(pane);
     contains_any(
         &text,
         &[
@@ -1693,12 +1716,25 @@ mod tests {
         assert!(cmd.args.contains(&"--permission-mode".to_string()));
 
         // An explicit mode is respected verbatim.
-        let opts = parse(&["--target", "claude", "--permission-mode", "default", "-p", "x"]);
+        let opts = parse(&[
+            "--target",
+            "claude",
+            "--permission-mode",
+            "default",
+            "-p",
+            "x",
+        ]);
         let cmd = target_command(&opts).unwrap();
         assert!(has_pair(&cmd.args, "--permission-mode", "default"));
 
         // Full bypass takes precedence and suppresses --permission-mode.
-        let opts = parse(&["--target", "claude", "--dangerously-skip-permissions", "-p", "x"]);
+        let opts = parse(&[
+            "--target",
+            "claude",
+            "--dangerously-skip-permissions",
+            "-p",
+            "x",
+        ]);
         let cmd = target_command(&opts).unwrap();
         assert!(!cmd.args.contains(&"--permission-mode".to_string()));
         assert!(
@@ -1711,7 +1747,11 @@ mod tests {
     fn claude_grant_injects_scoped_contract_permissions() {
         let opts = with_grant(parse(&["--target", "claude", "-p", "x"]));
         let cmd = target_command(&opts).unwrap();
-        assert!(has_pair(&cmd.args, "--add-dir", "/home/u/.tmuxlet/runs/abc"));
+        assert!(has_pair(
+            &cmd.args,
+            "--add-dir",
+            "/home/u/.tmuxlet/runs/abc"
+        ));
         assert!(has_pair(
             &cmd.args,
             "--allowed-tools",
@@ -1745,8 +1785,12 @@ mod tests {
         let cmd = target_command(&opts).unwrap();
         assert!(has_pair(&cmd.args, "--ask-for-approval", "never"));
         assert!(has_pair(&cmd.args, "--sandbox", "workspace-write"));
-        assert!(cmd.args.iter().any(|a| a
-            == "sandbox_workspace_write.writable_roots=[\"/home/u/.tmuxlet/runs/abc\"]"));
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a
+                    == "sandbox_workspace_write.writable_roots=[\"/home/u/.tmuxlet/runs/abc\"]")
+        );
         assert!(
             !cmd.args
                 .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
@@ -1881,6 +1925,9 @@ mod tests {
             command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
         assert!(prompt_in_launch);
         assert_eq!(cmd.args.last().map(String::as_str), Some("final prompt"));
+        // `--` terminates option parsing right before the prompt so variadic
+        // flags (e.g. --allowed-tools) cannot swallow it.
+        assert_eq!(cmd.args.iter().rev().nth(1).map(String::as_str), Some("--"));
         assert!(has_pair(&cmd.args, "--model", "sonnet"));
     }
 
@@ -1891,6 +1938,7 @@ mod tests {
             command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
         assert!(prompt_in_launch);
         assert_eq!(cmd.args.last().map(String::as_str), Some("final prompt"));
+        assert_eq!(cmd.args.iter().rev().nth(1).map(String::as_str), Some("--"));
         assert!(
             cmd.args
                 .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
@@ -1926,6 +1974,20 @@ mod tests {
         assert!(!is_execution_confirmation_blocker(
             "The requested files were updated successfully."
         ));
+    }
+
+    #[test]
+    fn launch_flag_echo_is_not_mistaken_for_a_prompt() {
+        // The pane echoes the command tmuxlet typed; its scoped-grant flags
+        // contain "permission"/"allow" but are not a confirmation prompt.
+        let pane = "claude --permission-mode auto --add-dir /home/u/.tmuxlet/runs/abc \
+             --allowed-tools 'Bash(/usr/local/bin/tmuxlet bridge complete:*)' \
+             --dangerously-skip-permissions -- 'do the thing'\n❯ ";
+        assert!(!is_startup_auto_enter_prompt(pane));
+        assert!(!is_execution_confirmation_blocker(pane));
+        // A genuine prompt below the flag echo is still detected.
+        let with_real_prompt = format!("{pane}\nAllow this command? (y/n)");
+        assert!(is_execution_confirmation_blocker(&with_real_prompt));
     }
 
     #[test]
