@@ -113,8 +113,10 @@ tmuxlet -p [options] [prompt]
 tmuxlet status
 tmuxlet read <id> [--lines N]
 tmuxlet send <id> <message>
+tmuxlet send-all [message] [--interval <secs>] [--enter]
 tmuxlet attach <id>
 tmuxlet stop <id>
+tmuxlet reap [--blocked] [--older-than <secs>] [--dry-run] [-y]
 tmuxlet prune [<id>...] [-y] [--dry-run]
 ```
 
@@ -122,6 +124,19 @@ tmuxlet prune [<id>...] [-y] [--dry-run]
 `exited`) and any leftover tmux sessions they own. With no ids it sweeps every
 terminal run; with explicit ids it refuses non-terminal ones. Use `--dry-run`
 to preview and `-y` / `--yes` to skip the confirmation prompt.
+
+`tmuxlet reap` kills stuck/leaked live sessions so their concurrency slot frees
+up (see [Concurrency & Throttling](#concurrency--throttling)). With no flags it
+is conservative — only sessions sitting at a confirmation/permission prompt
+**and** older than the 60s grace window. `--blocked` reaps any session at such a
+prompt regardless of age; `--older-than <secs>` reaps by run-dir age. Like
+`prune`, it lists candidates and asks before killing; pass `-y` for cron,
+`--dry-run` to preview. It only kills sessions — `prune` cleans the dirs.
+
+`tmuxlet send-all` walks every live tmuxlet session and delivers a message (or
+just Enter, with `--enter` or an empty message) with a pause between sessions
+(`--interval`, default 1s) — the safe way to nudge many sessions at once instead
+of a tight loop firing keystrokes at every session simultaneously.
 
 Important options:
 
@@ -139,6 +154,11 @@ Important options:
 - `--dangerously-skip-permissions`: normalized full-bypass flag; aliases
   `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox`
 - `--timeout <seconds>`: print-mode timeout, default 1800
+- `--max-concurrency <n>`: machine-wide live-session cap; `0` disables. Env
+  `TMUXLET_MAX_CONCURRENCY`. Default 24 (a runaway guardrail) — see
+  [Concurrency & Throttling](#concurrency--throttling)
+- `--memory-pressure-guard`: queue launches while the host is low on free
+  memory (opt-in; env `TMUXLET_MEMORY_GUARD`)
 
 Non-print prompt launches are intentionally unsupported; pass `-p` for runs.
 
@@ -217,23 +237,28 @@ completion-contract operations — writing `answer.txt` and calling `tmuxlet bri
 complete` — so a headless run does not hang on a permission prompt for its own
 completion step. Those files live under `~/.tmuxlet/runs/<run-id>/`, outside the
 target's working directory, so the grant is what lets the target write there
-without prompting. `--permission-mode auto` (and the other targets' equivalents)
-alone is not enough, because auto only auto-approves in-cwd edits.
+without prompting. The classifier mode (`--permission-mode auto`, or the other
+targets' equivalents) alone is not enough: `auto` is a background safety
+classifier, not a blanket approval, and it only auto-approves in-cwd edits.
 
 Each target gets the narrowest grant it supports:
 
 | Target | Default grant |
 | --- | --- |
-| `claude` | `--permission-mode auto` + `--add-dir <run-dir>` + allow `Bash(<tmuxlet> bridge complete:*)` — scoped |
+| `claude` | `--permission-mode auto` (classifier) **plus** explicit allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` + `--add-dir <run-dir>` — scoped |
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with the run dir carved in as a `writable_root` — scoped |
 | `gemini` | `--yolo` (no graded mode; `auto_edit` does not cover shell) |
 | `opencode` | `--dangerously-skip-permissions` (no confirmed headless allow-list flag) |
 | `cursor` | `--force` (enables print-mode writes) |
 | `pi` | none — auto-approves tool use by default |
 
-For `claude` and `codex` the grant is genuinely scoped to the contract
-operations. `gemini`, `opencode`, and `cursor` fall back to their broad
-auto-approve mode because those CLIs offer no graded permission tier.
+Policy: if a target has an auto-classifier (only `claude`'s `auto`), use it **and**
+still pin the exact contract operations with explicit allow-rules rather than
+trusting the classifier; otherwise use that target's yolo/bypass. `claude` and
+`codex` end up genuinely scoped to the contract; `gemini`, `opencode`, and
+`cursor` fall back to their broad auto-approve because those CLIs offer no graded
+permission tier. If pinning the contract ops under a classifier is ever not
+possible or stops working, the bypass flag is the documented fallback.
 
 Overrides:
 
@@ -244,6 +269,51 @@ Overrides:
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass. Takes precedence
   over and replaces the scoped grant.
+
+## Concurrency & Throttling
+
+Each `tmuxlet -p` run launches a full interactive coding-CLI TUI inside its own
+tmux session, and those are heavy (hundreds of MB each). To stop an unthrottled
+fan-out from exhausting the machine, tmuxlet enforces a **live-session cap** that
+counts what is actually alive, not how many launches a caller has fired.
+
+- **Live-session semaphore.** Before creating its tmux session, a run counts the
+  live tmuxlet run sessions (`tmux list-sessions`, matched against the run-id
+  grammar so a `tmuxlet-server` or a human's `tmuxlet-*` session never consumes a
+  slot). At or above the cap it **queues** — polling, printing a one-line
+  `waiting for a free slot (N/M live)` notice — until a slot frees or the acquire
+  timeout elapses. The count is derived from tmux itself, so it is crash-safe:
+  dead sessions vanish and the count self-clears with no persisted counter to
+  reconcile. It is a *soft* cap (no machine-wide lock) — two truly simultaneous
+  launches may briefly reach N+1, which self-corrects on the next acquire.
+- **Default is a guardrail, not a throttle.** The default cap is **24** — high
+  enough that normal interactive or modest parallel use never blocks, low enough
+  to stop a runaway loop. A consumer that intentionally fans out should set a
+  tighter value (e.g. `TMUXLET_MAX_CONCURRENCY=4`). Set `0` to disable entirely
+  and restore the original unbounded behavior. A single run pays at most one
+  cheap `tmux list-sessions` call; with the cap disabled there is zero overhead.
+- **Self-healing.** If a run waits past the grace window while saturated, it runs
+  one conservative reap pass (kills only sessions stuck at a confirmation prompt)
+  so a fully-leaked machine recovers without manual intervention. At the acquire
+  timeout it exits non-zero with `at capacity …; run \`tmuxlet reap\`` rather than
+  hanging forever.
+- **Memory backpressure (opt-in).** `--memory-pressure-guard` /
+  `TMUXLET_MEMORY_GUARD` queues launches while host free memory is below
+  `TMUXLET_MEMORY_MIN_FREE` percent (default 15). Off by default; on platforms
+  whose memory probe is unavailable it degrades to "allow".
+- **No keystroke herds.** Use `tmuxlet send-all` to drive many sessions at once;
+  it paces between sessions instead of firing at all of them simultaneously.
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `--max-concurrency <n>` / `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap; `0` = unlimited |
+| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a slot; `0` = wait forever |
+| `--memory-pressure-guard` / `TMUXLET_MEMORY_GUARD` | off | Queue under host memory pressure |
+| `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory % threshold for the guard |
+
+These live in tmuxlet itself so the cap holds regardless of how many callers or
+loops fan out. Lowering a consumer's own concurrency and adding an external
+circuit breaker are complementary, not substitutes.
 
 ## Runtime State
 

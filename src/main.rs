@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,17 @@ const STARTUP_AUTO_ENTER_WINDOW_SECS: u64 = 8;
 const STARTUP_AUTO_ENTER_MAX_ATTEMPTS: usize = 3;
 const EXECUTION_STALL_SECS: u64 = 60;
 const PANE_POLL_SECS: u64 = 1;
+// Concurrency / throttling. The live-session semaphore is a soft cap: the count
+// is derived from live `tmuxlet-*` tmux sessions (crash-safe, self-clearing),
+// so a rare simultaneous-launch race may transiently reach cap+1 and self-corrects
+// on the next acquire. The default is a high runaway guardrail, not a throttle —
+// consumers that want tighter pacing set TMUXLET_MAX_CONCURRENCY.
+const DEFAULT_MAX_CONCURRENCY: usize = 24;
+const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 300;
+const ACQUIRE_POLL_MS: u64 = 250;
+const REAP_GRACE_SECS: u64 = EXECUTION_STALL_SECS;
+const SEND_ALL_DEFAULT_INTERVAL_SECS: u64 = 1;
+const DEFAULT_MEMORY_MIN_FREE_PCT: u8 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputFormat {
@@ -59,6 +71,11 @@ struct Options {
     target_args: Vec<String>,
     contract_grant: Option<ContractGrant>,
     timeout: Duration,
+    // None => resolve from TMUXLET_MAX_CONCURRENCY env, else DEFAULT_MAX_CONCURRENCY.
+    // 0 == unlimited (semaphore disabled).
+    max_concurrency: Option<usize>,
+    // Opt-in host-memory backpressure (also enabled by TMUXLET_MEMORY_GUARD).
+    memory_guard: bool,
 }
 
 impl Default for Options {
@@ -87,6 +104,8 @@ impl Default for Options {
             target_args: Vec::new(),
             contract_grant: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            max_concurrency: None,
+            memory_guard: false,
         }
     }
 }
@@ -197,6 +216,8 @@ fn run() -> Result<(), String> {
         "attach" => handle_attach(&args[1..]),
         "stop" => handle_stop(&args[1..]),
         "prune" => handle_prune(&args[1..]),
+        "reap" => handle_reap(&args[1..]),
+        "send-all" => handle_send_all(&args[1..]),
         _ => {
             let opts = parse_options(&mut args)?;
             if opts.print {
@@ -265,6 +286,16 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
                     .map_err(|_| "--timeout must be an integer number of seconds".to_string())?;
                 opts.timeout = Duration::from_secs(seconds);
             }
+            "--max-concurrency" => {
+                let n = take_value(args, &mut i, arg)?
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        "--max-concurrency must be a non-negative integer (0 = unlimited)"
+                            .to_string()
+                    })?;
+                opts.max_concurrency = Some(n);
+            }
+            "--memory-pressure-guard" | "--memory-guard" => opts.memory_guard = true,
             "--" => {
                 opts.prompt_parts.extend(args[i + 1..].iter().cloned());
                 break;
@@ -359,7 +390,7 @@ fn execute_prune(selected: &[RunRecord], runs_root: &Path, dry_run: bool) -> Pru
             let _ = run_tmux([
                 OsStr::new("kill-session"),
                 OsStr::new("-t"),
-                OsStr::new(&session_name),
+                OsStr::new(&tmux_target(&session_name)),
             ]);
         }
         let dir = runs_root.join(&rec.id);
@@ -455,6 +486,13 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         command_with_prompt(base_command.clone(), &opts.target, &instruction);
 
     write_meta(&paths, &run_id, &tmux_session, &opts, &base_command)?;
+    // Acquire a concurrency slot before the heavy TUI session exists. Blocks/queues
+    // when at cap or (opt-in) under memory pressure; on a clean acquire-timeout we
+    // drop the staged run dir so it doesn't linger as a phantom "exited" run.
+    if let Err(e) = acquire_run_slot(&opts) {
+        fs::remove_dir_all(&paths.root).ok();
+        return Err(e);
+    }
     start_tmux_session(&tmux_session, &opts.cwd)?;
     send_launch_command(&tmux_session, &launch_command)?;
     if !prompt_in_launch {
@@ -476,7 +514,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             let _ = run_tmux([
                 OsStr::new("kill-session"),
                 OsStr::new("-t"),
-                OsStr::new(&tmux_session),
+                OsStr::new(&tmux_target(&tmux_session)),
             ]);
             return Ok(RunResult {
                 id: run_id,
@@ -693,19 +731,27 @@ fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.session.is_some() {
         unsupported("claude", "--session", "use --session-id or --resume")?;
     }
-    // Explicitly grant the two completion-contract operations so headless runs
-    // never hang on a permission prompt for them. The answer file lives under the
-    // tmuxlet run dir (outside cwd), so --add-dir folds it into the auto-approved
-    // workspace; the bridge call is allow-listed by command prefix. Skipped under
-    // full bypass, which already permits everything.
-    if !opts.dangerously_skip_permissions {
-        if let Some(grant) = &opts.contract_grant {
-            args.extend(["--add-dir".into(), grant.run_root.display().to_string()]);
-            args.extend([
-                "--allowed-tools".into(),
-                format!("Bash({} bridge complete:*)", grant.exe),
-            ]);
-        }
+    // Explicitly whitelist the completion-contract operations so headless runs
+    // never hang on a permission prompt for them. claude has an auto-classifier
+    // (`auto`, the default mode); per policy we keep it AND pin the exact
+    // contract ops with allow-rules rather than trusting the classifier. The
+    // model writes its answer (and any complete/error notes) into the run dir,
+    // which lives outside cwd: --add-dir clears the directory-access gate while
+    // the Write/Edit rules clear the tool-permission gate, and the bridge call
+    // is allow-listed by command prefix. File-rule paths use the gitignore
+    // `//abs` form. Skipped under full bypass, which already permits everything.
+    if !opts.dangerously_skip_permissions
+        && let Some(grant) = &opts.contract_grant
+    {
+        let root = grant.run_root.display().to_string();
+        let abs = format!("//{}", root.trim_start_matches('/'));
+        args.extend(["--add-dir".into(), root]);
+        args.extend(["--allowed-tools".into(), format!("Write({abs}/**)")]);
+        args.extend(["--allowed-tools".into(), format!("Edit({abs}/**)")]);
+        args.extend([
+            "--allowed-tools".into(),
+            format!("Bash({} bridge complete:*)", grant.exe),
+        ]);
     }
     Ok(TargetCommand {
         program: "claude".into(),
@@ -1002,6 +1048,23 @@ fn start_tmux_session(name: &str, cwd: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// tmux target for an exact *session* name (has-session, kill-session,
+/// attach-session). A leading `=` forces exact matching instead of tmux's
+/// unique-prefix resolution, so `=tmuxlet-1a2b` never resolves to a different
+/// run whose id merely starts with `1a2b`.
+fn tmux_target(name: &str) -> String {
+    format!("={name}")
+}
+
+/// tmux target for an exact *pane* (send-keys, capture-pane, paste-buffer).
+/// Pane targets prefix-match too, but the exact form needs a trailing `:` to
+/// delimit the session component: bare `=name` is parsed as a pane spec and
+/// errors `can't find pane`, while `=name:` selects exactly that session's
+/// active pane (verified on tmux 3.6a).
+fn tmux_pane_target(name: &str) -> String {
+    format!("={name}:")
+}
+
 fn send_launch_command(tmux_session: &str, command: &TargetCommand) -> Result<(), String> {
     let mut parts = Vec::with_capacity(command.args.len() + 1);
     parts.push(shell_quote(&command.program));
@@ -1009,10 +1072,11 @@ fn send_launch_command(tmux_session: &str, command: &TargetCommand) -> Result<()
         parts.push(shell_quote(arg));
     }
     let line = parts.join(" ");
+    let target = tmux_pane_target(tmux_session);
     run_tmux([
         OsStr::new("send-keys"),
         OsStr::new("-t"),
-        OsStr::new(tmux_session),
+        OsStr::new(&target),
         OsStr::new(&line),
         OsStr::new("Enter"),
     ])
@@ -1020,6 +1084,7 @@ fn send_launch_command(tmux_session: &str, command: &TargetCommand) -> Result<()
 }
 
 fn paste_text(tmux_session: &str, text: &str) -> Result<(), String> {
+    let target = tmux_pane_target(tmux_session);
     let tmp = env::temp_dir().join(format!("tmuxlet-paste-{}.txt", make_run_id()));
     fs::write(&tmp, text).map_err(|e| format!("failed to stage prompt: {e}"))?;
     let load = run_tmux([OsStr::new("load-buffer"), tmp.as_os_str()]);
@@ -1028,23 +1093,24 @@ fn paste_text(tmux_session: &str, text: &str) -> Result<(), String> {
     run_tmux([
         OsStr::new("paste-buffer"),
         OsStr::new("-t"),
-        OsStr::new(tmux_session),
+        OsStr::new(&target),
     ])?;
     thread::sleep(Duration::from_millis(200));
     run_tmux([
         OsStr::new("send-keys"),
         OsStr::new("-t"),
-        OsStr::new(tmux_session),
+        OsStr::new(&target),
         OsStr::new("Enter"),
     ])
     .map(|_| ())
 }
 
 fn send_enter(tmux_session: &str) -> Result<(), String> {
+    let target = tmux_pane_target(tmux_session);
     run_tmux([
         OsStr::new("send-keys"),
         OsStr::new("-t"),
-        OsStr::new(tmux_session),
+        OsStr::new(&target),
         OsStr::new("Enter"),
     ])
     .map(|_| ())
@@ -1214,7 +1280,7 @@ fn discover_runs_in(runs_root: &Path) -> Vec<RunRecord> {
 
 fn tmux_session_exists(name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", name])
+        .args(["has-session", "-t", &tmux_target(name)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1222,10 +1288,11 @@ fn tmux_session_exists(name: &str) -> bool {
 
 fn capture_pane(tmux_session: &str, lines: usize) -> Result<String, String> {
     let start = format!("-{lines}");
+    let target = tmux_pane_target(tmux_session);
     run_tmux([
         OsStr::new("capture-pane"),
         OsStr::new("-t"),
-        OsStr::new(tmux_session),
+        OsStr::new(&target),
         OsStr::new("-p"),
         OsStr::new("-S"),
         OsStr::new(&start),
@@ -1267,6 +1334,471 @@ fn ensure_tmux() -> Result<(), String> {
         })
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency / throttling
+//
+// The live-session count is derived from live tmux sessions whose name matches
+// the run-id grammar (`tmuxlet-<hex>-<hex>[-<hex>]`). This is crash-safe: dead
+// sessions vanish from tmux, so the count self-clears with no persisted integer
+// to reconcile. It is a *soft* cap (no machine-wide lock): two truly-simultaneous
+// launches may briefly reach cap+1, which self-corrects on the next acquire and
+// is harmless relative to the unbounded pileup it prevents.
+// ---------------------------------------------------------------------------
+
+/// A tmux session name is a tmuxlet *run* session iff it is `tmuxlet-` followed
+/// by >= 2 dash-separated lowercase-hex segments (the make_run_id grammar). This
+/// excludes siblings like `tmuxlet-server` or a human's `tmuxlet-foo` so they
+/// never consume a concurrency slot.
+fn is_run_session_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("tmuxlet-") else {
+        return false;
+    };
+    let mut segments = 0usize;
+    for seg in rest.split('-') {
+        if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
+/// Raw `tmux list-sessions` names. Uses Command directly (not run_tmux) so the
+/// "no server running" case (nonzero exit, empty stdout) maps to an empty string
+/// instead of an error — the zero-overhead single-run path must not fail here.
+fn raw_tmux_session_list() -> String {
+    match Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Count run sessions in `tmux list-sessions -F '#{session_name}'` output.
+fn count_run_sessions(list_output: &str) -> usize {
+    list_output
+        .lines()
+        .map(str::trim)
+        .filter(|name| is_run_session_name(name))
+        .count()
+}
+
+fn live_run_session_count() -> usize {
+    count_run_sessions(&raw_tmux_session_list())
+}
+
+fn list_run_sessions() -> Vec<String> {
+    raw_tmux_session_list()
+        .lines()
+        .map(str::trim)
+        .filter(|name| is_run_session_name(name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pure resolution: explicit --max-concurrency wins, else parse the env value,
+/// else the default guardrail. 0 == unlimited.
+fn pick_max_concurrency(cli: Option<usize>, env_val: Option<&str>) -> usize {
+    if let Some(n) = cli {
+        return n;
+    }
+    env_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+}
+
+fn resolve_max_concurrency(cli: Option<usize>) -> usize {
+    pick_max_concurrency(cli, env::var("TMUXLET_MAX_CONCURRENCY").ok().as_deref())
+}
+
+/// Pure resolution of the acquire-wait budget; 0 == wait forever.
+fn pick_acquire_timeout(env_val: Option<&str>) -> Duration {
+    let secs = env_val
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ACQUIRE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn resolve_acquire_timeout() -> Duration {
+    pick_acquire_timeout(env::var("TMUXLET_ACQUIRE_TIMEOUT").ok().as_deref())
+}
+
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn memory_guard_enabled(opts: &Options) -> bool {
+    opts.memory_guard || env_flag("TMUXLET_MEMORY_GUARD")
+}
+
+fn memory_min_free_pct() -> u8 {
+    env::var("TMUXLET_MEMORY_MIN_FREE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .unwrap_or(DEFAULT_MEMORY_MIN_FREE_PCT)
+}
+
+/// Free-memory percentage from `memory_pressure` ("System-wide memory free
+/// percentage: N%"). None when not found.
+fn parse_macos_free_pct(out: &str) -> Option<u8> {
+    for line in out.lines().rev() {
+        if let Some(rest) = line
+            .trim()
+            .strip_prefix("System-wide memory free percentage:")
+        {
+            let pct = rest.trim().trim_end_matches('%').trim();
+            if let Ok(v) = pct.parse::<f64>() {
+                return Some(v.round().clamp(0.0, 100.0) as u8);
+            }
+        }
+    }
+    None
+}
+
+/// Free-memory percentage from /proc/meminfo (MemAvailable / MemTotal). None
+/// when MemAvailable is absent (very old kernels).
+fn parse_linux_free_pct(meminfo: &str) -> Option<u8> {
+    let mut total: Option<u64> = None;
+    let mut avail: Option<u64> = None;
+    for line in meminfo.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("MemTotal:") => total = it.next().and_then(|v| v.parse().ok()),
+            Some("MemAvailable:") => avail = it.next().and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+    }
+    match (total, avail) {
+        (Some(t), Some(a)) if t > 0 => {
+            Some(((a as f64 / t as f64) * 100.0).round().clamp(0.0, 100.0) as u8)
+        }
+        _ => None,
+    }
+}
+
+/// `true` only with a reading below the threshold. Unknown (None) degrades to
+/// "not under pressure" so the opt-in guard can never wedge a launch.
+fn under_memory_pressure(free_pct: Option<u8>, min_free: u8) -> bool {
+    matches!(free_pct, Some(p) if p < min_free)
+}
+
+/// Sample host free-memory percentage, dependency-free, per platform. Any
+/// failure / unknown platform => None (allow).
+fn sample_free_pct() -> Option<u8> {
+    if cfg!(target_os = "macos") {
+        let out = Command::new("memory_pressure").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_macos_free_pct(&String::from_utf8_lossy(&out.stdout))
+    } else if cfg!(target_os = "linux") {
+        parse_linux_free_pct(&fs::read_to_string("/proc/meminfo").ok()?)
+    } else {
+        None
+    }
+}
+
+/// Block until a concurrency slot is free (and, with the opt-in guard, until the
+/// host is not under memory pressure), or error at the acquire-timeout. Zero
+/// overhead when no throttling is configured.
+fn acquire_run_slot(opts: &Options) -> Result<(), String> {
+    let cap = resolve_max_concurrency(opts.max_concurrency);
+    let guard = memory_guard_enabled(opts);
+    if cap == 0 && !guard {
+        return Ok(()); // fast path: nothing to enforce
+    }
+    let min_free = memory_min_free_pct();
+    let timeout = resolve_acquire_timeout(); // ZERO == wait forever
+    let start = Instant::now();
+    let mut announced = false;
+    let mut self_reaped = false;
+
+    loop {
+        let mem_block = guard && under_memory_pressure(sample_free_pct(), min_free);
+        let live = if cap == 0 {
+            0
+        } else {
+            live_run_session_count()
+        };
+        let cap_block = cap != 0 && live >= cap;
+        if !mem_block && !cap_block {
+            return Ok(());
+        }
+
+        if !announced {
+            let why = if cap_block {
+                format!("{live}/{cap} live sessions")
+            } else {
+                "host under memory pressure".to_string()
+            };
+            eprintln!("tmuxlet: waiting for a free slot ({why})");
+            announced = true;
+        }
+
+        // Self-heal: one reap pass after the grace window so a fully-leaked
+        // machine recovers without a manual `tmuxlet reap`. Only blocked, aged
+        // sessions are killed (same safety as the standalone reaper).
+        if cap_block && !self_reaped && start.elapsed() >= Duration::from_secs(REAP_GRACE_SECS) {
+            self_reaped = true;
+            let killed = reap_run_sessions(&ReapCriteria::default());
+            if killed > 0 {
+                eprintln!("tmuxlet: reaped {killed} stuck session(s)");
+                continue;
+            }
+        }
+
+        if !timeout.is_zero() && start.elapsed() >= timeout {
+            let why = if cap_block {
+                format!("{live}/{cap} live sessions")
+            } else {
+                "host memory pressure".to_string()
+            };
+            return Err(format!(
+                "at capacity after {}s ({why}); run `tmuxlet reap` or raise TMUXLET_MAX_CONCURRENCY",
+                start.elapsed().as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(ACQUIRE_POLL_MS));
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ReapCriteria {
+    older_than: Option<u64>,
+    blocked: bool,
+}
+
+struct ReapTarget {
+    id: String,
+    session: String,
+    reason: &'static str,
+    age_secs: Option<u64>,
+}
+
+/// Decide whether a session qualifies for reaping. Pure: blocked-state + age in,
+/// reason out. Default (no flags) is conservative — blocked AND aged past the
+/// grace window. --older-than reaps by age; --blocked reaps any blocked; both
+/// together are OR'd.
+fn reap_decision(
+    blocked: bool,
+    age_secs: Option<u64>,
+    criteria: &ReapCriteria,
+    grace_secs: u64,
+) -> Option<&'static str> {
+    if let Some(limit) = criteria.older_than
+        && age_secs.map(|a| a >= limit).unwrap_or(false)
+    {
+        return Some("old");
+    }
+    if criteria.blocked {
+        return if blocked { Some("blocked") } else { None };
+    }
+    if criteria.older_than.is_some() {
+        return None; // explicit age filter only
+    }
+    if blocked && age_secs.map(|a| a >= grace_secs).unwrap_or(false) {
+        Some("blocked")
+    } else {
+        None
+    }
+}
+
+/// Age of a run from its run-dir mtime (proxy for last activity). None if absent.
+fn run_age_secs(id: &str) -> Option<u64> {
+    let dir = state_dir().join("runs").join(id);
+    let modified = fs::metadata(&dir).ok()?.modified().ok()?;
+    SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Inspect every live run session and select reap targets per criteria.
+fn select_reap_targets(criteria: &ReapCriteria) -> Vec<ReapTarget> {
+    let mut targets = Vec::new();
+    for session in list_run_sessions() {
+        let id = session
+            .strip_prefix("tmuxlet-")
+            .unwrap_or(&session)
+            .to_string();
+        let age = run_age_secs(&id);
+        // Only inspect the pane when blocked-state can change the outcome.
+        let blocked = if criteria.blocked || criteria.older_than.is_none() {
+            let pane = capture_pane(&session, 200).unwrap_or_default();
+            is_execution_confirmation_blocker(&pane)
+        } else {
+            false
+        };
+        if let Some(reason) = reap_decision(blocked, age, criteria, REAP_GRACE_SECS) {
+            targets.push(ReapTarget {
+                id,
+                session,
+                reason,
+                age_secs: age,
+            });
+        }
+    }
+    targets.sort_by(|a, b| a.id.cmp(&b.id));
+    targets
+}
+
+fn kill_session_exact(session: &str) -> bool {
+    run_tmux([
+        OsStr::new("kill-session"),
+        OsStr::new("-t"),
+        OsStr::new(&tmux_target(session)),
+    ])
+    .is_ok()
+}
+
+/// Reap (kill) all sessions matching criteria; returns the count killed. Used by
+/// the acquire self-heal — the standalone `reap` command lists/confirms first.
+fn reap_run_sessions(criteria: &ReapCriteria) -> usize {
+    select_reap_targets(criteria)
+        .iter()
+        .filter(|t| kill_session_exact(&t.session))
+        .count()
+}
+
+fn parse_reap_args(args: &[String]) -> Result<(ReapCriteria, bool, bool), String> {
+    let mut criteria = ReapCriteria::default();
+    let mut yes = false;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-y" | "--yes" => yes = true,
+            "--dry-run" => dry_run = true,
+            "--blocked" => criteria.blocked = true,
+            "--older-than" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--older-than requires a value (seconds)")?;
+                criteria.older_than = Some(v.parse::<u64>().map_err(|_| {
+                    "--older-than must be an integer number of seconds".to_string()
+                })?);
+            }
+            other => return Err(format!("unknown option for reap: {other}")),
+        }
+        i += 1;
+    }
+    Ok((criteria, yes, dry_run))
+}
+
+fn handle_reap(args: &[String]) -> Result<(), String> {
+    let (criteria, yes, dry_run) = parse_reap_args(args)?;
+    let targets = select_reap_targets(&criteria);
+    if targets.is_empty() {
+        println!("Nothing to reap.");
+        return Ok(());
+    }
+    let verb = if dry_run { "Would reap" } else { "Found" };
+    println!("{verb} {} session(s):", targets.len());
+    for t in &targets {
+        let age = t
+            .age_secs
+            .map(format_age_secs)
+            .unwrap_or_else(|| "-".to_string());
+        println!("  {:<10} {:<8} {}", short_id(&t.id), t.reason, age);
+    }
+    if dry_run {
+        return Ok(());
+    }
+    if !yes {
+        print!("Kill these session(s)? [y/N] ");
+        io::stdout().flush().ok();
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|e| format!("failed to read confirmation: {e}"))?;
+        if !matches!(response.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    let killed = targets
+        .iter()
+        .filter(|t| kill_session_exact(&t.session))
+        .count();
+    println!("Reaped {killed} session(s).");
+    if killed < targets.len() {
+        return Err(format!(
+            "failed to kill {} session(s)",
+            targets.len() - killed
+        ));
+    }
+    Ok(())
+}
+
+fn handle_send_all(args: &[String]) -> Result<(), String> {
+    let mut interval = Duration::from_secs(SEND_ALL_DEFAULT_INTERVAL_SECS);
+    let mut enter = false;
+    let mut message_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => {
+                i += 1;
+                let v = args.get(i).ok_or("--interval requires a value (seconds)")?;
+                let secs = v
+                    .parse::<f64>()
+                    .map_err(|_| "--interval must be a number of seconds".to_string())?;
+                if secs < 0.0 {
+                    return Err("--interval must be >= 0".into());
+                }
+                interval = Duration::from_secs_f64(secs);
+            }
+            "--enter" => enter = true,
+            "--" => {
+                message_parts.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for send-all: {other}"));
+            }
+            other => message_parts.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let message = message_parts.join(" ");
+    if message.is_empty() {
+        enter = true; // empty message => just resume (Enter) each session
+    }
+
+    let sessions = list_run_sessions();
+    if sessions.is_empty() {
+        println!("No live sessions.");
+        return Ok(());
+    }
+    let total = sessions.len();
+    for (idx, session) in sessions.iter().enumerate() {
+        // Pace between sessions — never fire send-keys at every session at once.
+        if idx > 0 && !interval.is_zero() {
+            thread::sleep(interval);
+        }
+        let id = session.strip_prefix("tmuxlet-").unwrap_or(session);
+        let result = if enter {
+            send_enter(session)
+        } else {
+            paste_text(session, &message)
+        };
+        match result {
+            Ok(()) => println!("  -> {} ({}/{})", short_id(id), idx + 1, total),
+            // A session that vanished mid-sweep (a run completing) is a benign no-op.
+            Err(e) => eprintln!("  -- {} skipped: {e}", short_id(id)),
+        }
+    }
+    Ok(())
+}
 fn handle_bridge(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) != Some("complete") {
         return Err("usage: tmuxlet bridge complete --run <id> --file <path>".into());
@@ -1347,7 +1879,7 @@ fn handle_send(args: &[String]) -> Result<(), String> {
 fn handle_attach(args: &[String]) -> Result<(), String> {
     let id = args.first().ok_or("usage: tmuxlet attach <id>")?;
     let status = Command::new("tmux")
-        .args(["attach-session", "-t", &tmux_name_from_id(id)])
+        .args(["attach-session", "-t", &tmux_target(&tmux_name_from_id(id))])
         .status()
         .map_err(|e| format!("failed to attach tmux: {e}"))?;
     if status.success() {
@@ -1364,7 +1896,7 @@ fn handle_stop(args: &[String]) -> Result<(), String> {
         run_tmux([
             OsStr::new("send-keys"),
             OsStr::new("-t"),
-            OsStr::new(&name),
+            OsStr::new(&tmux_pane_target(&name)),
             OsStr::new("/exit"),
             OsStr::new("Enter"),
         ])
@@ -1374,7 +1906,7 @@ fn handle_stop(args: &[String]) -> Result<(), String> {
             run_tmux([
                 OsStr::new("kill-session"),
                 OsStr::new("-t"),
-                OsStr::new(&name),
+                OsStr::new(&tmux_target(&name)),
             ])?;
         }
     }
@@ -1582,11 +2114,17 @@ fn run_paths(run_id: &str) -> Result<RunPaths, String> {
 }
 
 fn make_run_id() -> String {
+    // Process-local monotonic counter guarantees uniqueness even when two ids
+    // are minted in the same clock tick: the OS clock can be coarser than
+    // nanoseconds, so nanos+pid alone can collide for rapid in-process calls
+    // (e.g. parallel tests, which all share one pid).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{:x}-{:x}", nanos, std::process::id())
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}-{:x}", nanos, std::process::id(), seq)
 }
 
 fn expand_home(value: &str) -> PathBuf {
@@ -1619,9 +2157,11 @@ fn shell_quote(value: &str) -> String {
 fn print_help() {
     println!(
         "tmuxlet {VERSION}\n\n\
-Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|attach|stop|prune>\n\n\
-Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
-Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -"
+Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|send-all|attach|stop|reap|prune>\n\n\
+Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --max-concurrency <n>            Cap live sessions machine-wide (0=unlimited; env TMUXLET_MAX_CONCURRENCY; default 24)\n      --memory-pressure-guard          Queue launches under host memory pressure (env TMUXLET_MEMORY_GUARD)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
+Throttling env:\n  TMUXLET_MAX_CONCURRENCY=<n>          Live-session cap (0=unlimited). Consumers that fan out should set this low (e.g. 4).\n  TMUXLET_ACQUIRE_TIMEOUT=<seconds>   Max wait for a free slot (0=forever; default 300)\n  TMUXLET_MEMORY_MIN_FREE=<percent>   Memory-guard threshold; queue when free% drops below it (default 15)\n\n\
+Maintenance:\n  tmuxlet reap [--blocked] [--older-than <s>] [--dry-run] [-y]   Kill stuck/leaked sessions, freeing slots\n  tmuxlet send-all [message] [--interval <s>] [--enter]          Paced keystrokes to every live session (no herd)\n\n\
+Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -\n  TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\""
     );
 }
 
@@ -1751,6 +2291,18 @@ mod tests {
             &cmd.args,
             "--add-dir",
             "/home/u/.tmuxlet/runs/abc"
+        ));
+        // The contract writes are pinned with explicit allow-rules (gitignore
+        // `//abs` form), not left to the auto-classifier.
+        assert!(has_pair(
+            &cmd.args,
+            "--allowed-tools",
+            "Write(//home/u/.tmuxlet/runs/abc/**)"
+        ));
+        assert!(has_pair(
+            &cmd.args,
+            "--allowed-tools",
+            "Edit(//home/u/.tmuxlet/runs/abc/**)"
         ));
         assert!(has_pair(
             &cmd.args,
@@ -2427,5 +2979,177 @@ mod tests {
     fn short_id_truncates_long_ids() {
         assert_eq!(short_id("abcdef0123456789"), "abcdef01");
         assert_eq!(short_id("short"), "short");
+    }
+
+    // ---------- Concurrency / throttling ----------
+
+    #[test]
+    fn tmux_target_forces_exact_match() {
+        assert_eq!(tmux_target("tmuxlet-1a2b-3c4d"), "=tmuxlet-1a2b-3c4d");
+        // Pane targets need the trailing `:` to delimit the session component.
+        assert_eq!(tmux_pane_target("tmuxlet-1a2b-3c4d"), "=tmuxlet-1a2b-3c4d:");
+    }
+
+    #[test]
+    fn make_run_id_is_unique_within_process_and_matches_grammar() {
+        let a = make_run_id();
+        let b = make_run_id();
+        assert_ne!(a, b);
+        assert!(is_run_session_name(&format!("tmuxlet-{a}")));
+    }
+
+    #[test]
+    fn is_run_session_name_accepts_run_grammar() {
+        assert!(is_run_session_name("tmuxlet-1a2b-3c4d")); // 2-seg (legacy ids)
+        assert!(is_run_session_name("tmuxlet-1a2b3c-d4e5-6f")); // 3-seg (current)
+        assert!(is_run_session_name("tmuxlet-0-0-0"));
+    }
+
+    #[test]
+    fn is_run_session_name_rejects_non_run_sessions() {
+        assert!(!is_run_session_name("tmuxlet-server")); // sibling daemon
+        assert!(!is_run_session_name("tmuxlet-foo")); // human session
+        assert!(!is_run_session_name("tmuxlet-1a2b")); // single segment
+        assert!(!is_run_session_name("tmuxlet-1a2b-zz")); // non-hex segment
+        assert!(!is_run_session_name("tmuxlet-1a2b-")); // trailing empty segment
+        assert!(!is_run_session_name("work")); // no prefix
+        assert!(!is_run_session_name("tmuxlet-")); // empty remainder
+    }
+
+    #[test]
+    fn count_run_sessions_counts_only_run_sessions() {
+        let out = "tmuxlet-1a2b-3c4d\ntmuxlet-server\nwork\ntmuxlet-aa-bb-cc\n";
+        assert_eq!(count_run_sessions(out), 2);
+        assert_eq!(count_run_sessions(""), 0); // no server => empty output
+        assert_eq!(count_run_sessions("tmuxlet-1a-2b\n"), 1); // trailing newline
+    }
+
+    #[test]
+    fn pick_max_concurrency_prefers_cli_then_env_then_default() {
+        assert_eq!(pick_max_concurrency(Some(7), Some("3")), 7); // cli wins
+        assert_eq!(pick_max_concurrency(Some(0), None), 0); // explicit unlimited
+        assert_eq!(pick_max_concurrency(None, Some("3")), 3); // env
+        assert_eq!(pick_max_concurrency(None, Some("0")), 0); // env unlimited
+        assert_eq!(pick_max_concurrency(None, None), DEFAULT_MAX_CONCURRENCY);
+        assert_eq!(
+            pick_max_concurrency(None, Some("garbage")),
+            DEFAULT_MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn pick_acquire_timeout_parses_env_or_default() {
+        assert_eq!(pick_acquire_timeout(Some("45")), Duration::from_secs(45));
+        assert_eq!(pick_acquire_timeout(Some("0")), Duration::from_secs(0)); // forever
+        assert_eq!(
+            pick_acquire_timeout(None),
+            Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            pick_acquire_timeout(Some("x")),
+            Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn parses_max_concurrency_and_memory_guard_flags() {
+        let opts = parse(&["--max-concurrency", "4", "-p", "x"]);
+        assert_eq!(opts.max_concurrency, Some(4));
+        let opts = parse(&["--max-concurrency", "0", "-p", "x"]);
+        assert_eq!(opts.max_concurrency, Some(0));
+        let opts = parse(&["--memory-pressure-guard", "-p", "x"]);
+        assert!(opts.memory_guard);
+        let opts = parse(&["-p", "x"]);
+        assert_eq!(opts.max_concurrency, None);
+        assert!(!opts.memory_guard);
+    }
+
+    #[test]
+    fn max_concurrency_rejects_non_integer() {
+        let mut args: Vec<String> = ["--max-concurrency", "lots", "-p", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_options(&mut args).is_err());
+    }
+
+    #[test]
+    fn macos_free_pct_parses_memory_pressure_output() {
+        let sample = "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 80%";
+        assert_eq!(parse_macos_free_pct(sample), Some(80));
+        assert_eq!(parse_macos_free_pct("no match here"), None);
+        assert_eq!(
+            parse_macos_free_pct("System-wide memory free percentage: 12 %"),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn linux_free_pct_parses_meminfo() {
+        let sample = "MemTotal:       16000000 kB\nMemFree:         100000 kB\nMemAvailable:    8000000 kB\n";
+        assert_eq!(parse_linux_free_pct(sample), Some(50));
+        // MemAvailable absent => None (unknown => allow)
+        assert_eq!(parse_linux_free_pct("MemTotal: 16000000 kB\n"), None);
+    }
+
+    #[test]
+    fn under_memory_pressure_only_when_below_threshold() {
+        assert!(under_memory_pressure(Some(10), 15));
+        assert!(!under_memory_pressure(Some(15), 15)); // at threshold = ok
+        assert!(!under_memory_pressure(Some(80), 15));
+        assert!(!under_memory_pressure(None, 15)); // unknown => allow
+    }
+
+    #[test]
+    fn reap_decision_default_requires_blocked_and_aged() {
+        let c = ReapCriteria::default();
+        assert_eq!(reap_decision(true, Some(120), &c, 60), Some("blocked"));
+        assert_eq!(reap_decision(true, Some(10), &c, 60), None); // blocked but young
+        assert_eq!(reap_decision(false, Some(9999), &c, 60), None); // healthy, even if old
+        assert_eq!(reap_decision(true, None, &c, 60), None); // unknown age => spared
+    }
+
+    #[test]
+    fn reap_decision_blocked_flag_ignores_age() {
+        let c = ReapCriteria {
+            older_than: None,
+            blocked: true,
+        };
+        assert_eq!(reap_decision(true, Some(1), &c, 60), Some("blocked"));
+        assert_eq!(reap_decision(false, Some(9999), &c, 60), None);
+    }
+
+    #[test]
+    fn reap_decision_older_than_ignores_blocked() {
+        let c = ReapCriteria {
+            older_than: Some(300),
+            blocked: false,
+        };
+        assert_eq!(reap_decision(false, Some(301), &c, 60), Some("old"));
+        assert_eq!(reap_decision(true, Some(10), &c, 60), None); // young, age filter only
+        assert_eq!(reap_decision(false, None, &c, 60), None);
+    }
+
+    #[test]
+    fn reap_decision_both_filters_are_ored() {
+        let c = ReapCriteria {
+            older_than: Some(300),
+            blocked: true,
+        };
+        assert_eq!(reap_decision(false, Some(301), &c, 60), Some("old"));
+        assert_eq!(reap_decision(true, Some(10), &c, 60), Some("blocked"));
+        assert_eq!(reap_decision(false, Some(10), &c, 60), None);
+    }
+
+    #[test]
+    fn parses_reap_args() {
+        let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (c, yes, dry) = parse_reap_args(&to_vec(&["--blocked", "-y"])).unwrap();
+        assert!(c.blocked && yes && !dry);
+        let (c, _, dry) = parse_reap_args(&to_vec(&["--older-than", "120", "--dry-run"])).unwrap();
+        assert_eq!(c.older_than, Some(120));
+        assert!(dry);
+        assert!(parse_reap_args(&to_vec(&["--older-than", "soon"])).is_err());
+        assert!(parse_reap_args(&to_vec(&["--bogus"])).is_err());
     }
 }
