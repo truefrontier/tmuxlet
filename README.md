@@ -117,9 +117,77 @@ tmuxlet send <id> <message>
 tmuxlet send-all [message] [--interval <secs>] [--enter]
 tmuxlet attach <id>
 tmuxlet stop <id>
-tmuxlet reap [--blocked] [--older-than <secs>] [--dry-run] [-y]
-tmuxlet prune [<id>...] [-y] [--dry-run]
+tmuxlet reap [--blocked] [--older-than <secs>] [--dry-run] [-y|--yes]
+tmuxlet prune [<id>...] [-y|--yes] [--dry-run]
+tmuxlet bridge complete --run <id> --file <path>
+tmuxlet -h | --help
+tmuxlet -v | --version
 ```
+
+Non-print prompt launches are intentionally unsupported; pass `-p` / `--print`
+for runs. Prompt text may be positional args, `-` (read stdin), or empty stdin
+when no prompt args are given. `--` ends option parsing so the rest is prompt.
+
+### Print-mode options
+
+Every flag accepted by `parse_options` (print mode). Unsupported combinations
+for a given `--target` fail fast instead of being silently dropped. See
+[Resuming Target Sessions](#resuming-target-sessions) and
+[Permissions](#permissions) for target-specific mapping.
+
+| Flag / aliases | Value | Default | Purpose |
+| --- | --- | --- | --- |
+| `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`. |
+| `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
+| `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
+| `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
+| `-c`, `--continue` | flag | off | Continue the latest target session where supported. Mutually exclusive with `--resume` / `--session` / `--session-id`. |
+| `-r`, `--resume` | optional `[id]` | unset | Resume latest/picker (value-less) or a specific session id where supported. |
+| `--session` | `<id>` | unset | Target-native session selector where supported (e.g. opencode, pi). |
+| `--session-id` | `<id>` | unset | Explicit normalized session id; mapping is target-specific (on `grok`, create-new UUID only — not resume). |
+| `--system-prompt` | `<text>` | unset | System prompt pass-through where supported. |
+| `--append-system-prompt` | `<text>` (repeatable) | unset | Append system-prompt text where supported. |
+| `--add-dir`, `--include-directories` | `<path>` or CSV (repeatable) | unset | Extra directories the target may access where supported. |
+| `--dangerously-skip-permissions`, `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox` | flag | off | Full permission bypass; replaces the scoped completion-contract grant. Mapping is target-specific. |
+| `--permission-mode` | `<mode>` | unset (Claude builder defaults to `auto`) | Permission mode pass-through where supported (`default`, `acceptEdits`, `plan`, `auto`, `dontAsk`, `bypassPermissions` on Claude/Grok). |
+| `--allowed-tools`, `--allowedTools` | `<rule>` (repeatable) | unset | Allow-list / allow-rule pass-through where supported. |
+| `--disallowed-tools`, `--disallowedTools` | `<rule>` (repeatable) | unset | Deny-list / deny-rule pass-through where supported. |
+| `--tools` | `<tools>` (repeatable) | unset | Tools allow-list pass-through where supported. |
+| `--mcp-config` | `<path>` (repeatable) | unset | MCP config path pass-through where supported. |
+| `--settings` | `<path>` | unset | Settings file pass-through where supported. |
+| `--target-arg` | `<arg>` (repeatable) | unset | Raw escape hatch appended to the target launch command. |
+| `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. |
+| `--max-concurrency` | `<n>` | `24` (or `TMUXLET_MAX_CONCURRENCY`) | Machine-wide live-session cap; `0` = unlimited. |
+| `--memory-pressure-guard`, `--memory-guard` | flag | off | Queue launches under host memory pressure (also `TMUXLET_MEMORY_GUARD`). |
+
+Session controls are mutually exclusive. Use only one of `--continue`,
+`--resume`, `--session`, or `--session-id` per launch (and do not combine
+`--continue` with any of the others).
+
+Examples:
+
+```bash
+tmuxlet -p --target claude --continue "summarize the last task"
+tmuxlet -p --target codex --session-id 01984d2f-... "continue the fix"
+tmuxlet -p --target opencode --resume ses_abc123 "check status"
+tmuxlet -p --system-prompt "be terse" --model sonnet "say ready"
+printf "say ready" | tmuxlet -p -
+```
+
+### Subcommands
+
+| Command | Parameters | Purpose |
+| --- | --- | --- |
+| `status` | (none) | Print `meta.json` for each run under the state dir (one JSON object per line when present). |
+| `read <id>` | `--lines <N>` (default **80**) | Capture and print the live tmux pane for that run. |
+| `send <id> <message>` | message required | Paste a message into the run’s pane (as if typed). |
+| `send-all [message]` | `--interval <secs>` (default **1**), `--enter` | Deliver a message (or just Enter) to every live tmuxlet session, paced so sessions are not herded. Empty message implies Enter. |
+| `attach <id>` | (none) | Attach to the run’s tmux session interactively. |
+| `stop <id>` | (none) | Try a graceful `/exit`, then kill the session if it remains; prints `Stopped <id>`. |
+| `reap` | `--blocked`, `--older-than <secs>`, `--dry-run`, `-y` / `--yes` | Kill stuck/leaked live sessions so concurrency slots free (see below). |
+| `prune [<id>...]` | `--dry-run`, `-y` / `--yes` | Delete terminal run dirs and leftover sessions they own (see below). |
+| `bridge complete` | `--run <id>`, `--file <path>` (both required) | Completion-contract surface: copy the answer file into the run’s `complete.txt` so a waiting `-p` call finishes. Invoked by the target CLI, not typically by hand. |
 
 `tmuxlet prune` deletes terminal runs (`completed`, `timeout`, `blocked`,
 `exited`) and any leftover tmux sessions they own. With no ids it sweeps every
@@ -131,48 +199,24 @@ up (see [Concurrency & Throttling](#concurrency--throttling)). With no flags it
 is conservative — only sessions sitting at a confirmation/permission prompt
 **and** older than the 60s grace window. `--blocked` reaps any session at such a
 prompt regardless of age; `--older-than <secs>` reaps by run-dir age. Like
-`prune`, it lists candidates and asks before killing; pass `-y` for cron,
-`--dry-run` to preview. It only kills sessions — `prune` cleans the dirs.
+`prune`, it lists candidates and asks before killing; pass `-y` / `--yes` for
+cron, `--dry-run` to preview. It only kills sessions — `prune` cleans the dirs.
 
 `tmuxlet send-all` walks every live tmuxlet session and delivers a message (or
 just Enter, with `--enter` or an empty message) with a pause between sessions
 (`--interval`, default 1s) — the safe way to nudge many sessions at once instead
 of a tight loop firing keystrokes at every session simultaneously.
 
-Important options:
+### Environment variables
 
-- `-p, --print`: blocking programmatic mode
-- `--target <name>`: target CLI, default `claude`
-- `--output-format text|json`: output format
-- `-C, --cwd <dir>`: working directory; aliases `--cd`, `--dir`
-- `--model <model>`: target model where supported
-- `-c, --continue`: continue the latest session where supported
-- `-r, --resume [id]`: resume a session by id, or latest/picker where supported
-- `--session-id <id>`: explicit normalized session id selector
-- `--permission-mode <mode>`: Claude permission mode (`default`, `acceptEdits`,
-  `plan`, `auto`, `dontAsk`, `bypassPermissions`); defaults to `auto`. Claude
-  only — see [Permissions](#permissions)
-- `--dangerously-skip-permissions`: normalized full-bypass flag; aliases
-  `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox`
-- `--timeout <seconds>`: print-mode timeout, default 1800
-- `--max-concurrency <n>`: machine-wide live-session cap; `0` disables. Env
-  `TMUXLET_MAX_CONCURRENCY`. Default 24 (a runaway guardrail) — see
-  [Concurrency & Throttling](#concurrency--throttling)
-- `--memory-pressure-guard`: queue launches while the host is low on free
-  memory (opt-in; env `TMUXLET_MEMORY_GUARD`)
-
-Non-print prompt launches are intentionally unsupported; pass `-p` for runs.
-
-Session controls are mutually exclusive. Use one of `--continue`, `--resume`,
-`--session`, or `--session-id` per launch.
-
-Examples:
-
-```bash
-tmuxlet -p --target claude --continue "summarize the last task"
-tmuxlet -p --target codex --session-id 01984d2f-... "continue the fix"
-tmuxlet -p --target opencode --resume ses_abc123 "check status"
-```
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TMUXLET_HOME` | `~/.tmuxlet` | Root directory for runtime state (`runs/`, etc.). |
+| `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap when `--max-concurrency` is omitted; `0` = unlimited. |
+| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free concurrency slot; `0` = wait forever. |
+| `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
+| `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
+| `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
 
 ## Resuming Target Sessions
 
@@ -312,8 +356,11 @@ counts what is actually alive, not how many launches a caller has fired.
 | --- | --- | --- |
 | `--max-concurrency <n>` / `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap; `0` = unlimited |
 | `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a slot; `0` = wait forever |
-| `--memory-pressure-guard` / `TMUXLET_MEMORY_GUARD` | off | Queue under host memory pressure |
+| `--memory-pressure-guard` / `--memory-guard` / `TMUXLET_MEMORY_GUARD` | off | Queue under host memory pressure |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory % threshold for the guard |
+
+See [Environment variables](#environment-variables) for the full list including
+`TMUXLET_HOME` and `TMUXLET_CLAUDE_PERMISSION_MODE`.
 
 These live in tmuxlet itself so the cap holds regardless of how many callers or
 loops fan out. Lowering a consumer's own concurrency and adding an external

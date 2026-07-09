@@ -2231,15 +2231,86 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+fn help_text() -> String {
+    // Indentation is significant for readability; avoid `\` line-continuations
+    // (they strip leading whitespace on the next line).
+    format!(
+        "\
+tmuxlet {VERSION}
+
+Usage:
+  tmuxlet -p [options] [prompt]
+  tmuxlet status
+  tmuxlet read <id> [--lines N]
+  tmuxlet send <id> <message>
+  tmuxlet send-all [message] [--interval <secs>] [--enter]
+  tmuxlet attach <id>
+  tmuxlet stop <id>
+  tmuxlet reap [--blocked] [--older-than <secs>] [--dry-run] [-y|--yes]
+  tmuxlet prune [<id>...] [-y|--yes] [--dry-run]
+  tmuxlet bridge complete --run <id> --file <path>
+  tmuxlet -h | --help
+  tmuxlet -v | --version
+
+Print-mode options:
+  -p, --print                              Blocking programmatic mode (required for runs)
+      --target <name>                      Target CLI: claude, gemini, codex, opencode, pi, cursor, grok (default: claude)
+      --output-format <text|json>          Result format (default: text; stream-json unsupported)
+  -C, --cwd, --cd, --dir <dir>             Working directory
+  -m, --model <model>                      Model pass-through where supported
+  -c, --continue                           Continue latest target session where supported
+  -r, --resume [id]                        Resume session (optional id) where supported
+      --session <id>                       Target-native session selector where supported
+      --session-id <id>                    Explicit normalized session id (target-specific)
+      --system-prompt <text>               System prompt where supported
+      --append-system-prompt <text>        Append system prompt (repeatable) where supported
+      --add-dir, --include-directories <p> Extra dirs (CSV ok; repeatable) where supported
+      --dangerously-skip-permissions       Full bypass (aliases: --yolo, --force, --dangerously-bypass-approvals-and-sandbox)
+      --permission-mode <mode>             Permission mode where supported (Claude/Grok)
+      --allowed-tools, --allowedTools <r>  Allow rule/tool (repeatable) where supported
+      --disallowed-tools, --disallowedTools <r> Deny rule/tool (repeatable) where supported
+      --tools <tools>                      Tools list (repeatable) where supported
+      --mcp-config <path>                  MCP config path (repeatable) where supported
+      --settings <path>                    Settings file where supported
+      --target-arg <arg>                   Raw target CLI escape hatch (repeatable)
+      --timeout <seconds>                  Print-mode timeout (default: 1800)
+      --max-concurrency <n>                Live-session cap (0=unlimited; default 24; env TMUXLET_MAX_CONCURRENCY)
+      --memory-pressure-guard, --memory-guard  Queue under host memory pressure (env TMUXLET_MEMORY_GUARD)
+  --                                       End options; remaining args are the prompt
+
+Unsupported target combinations fail fast. See README for per-target mapping.
+
+Subcommands:
+  status                                   List run meta.json lines
+  read <id> [--lines N]                    Capture pane (default lines: 80)
+  send <id> <message>                      Paste into a run's pane
+  send-all [message] [--interval s] [--enter]  Paced message/Enter to every live session (default interval: 1s)
+  attach <id>                              Attach to the run's tmux session
+  stop <id>                                Graceful /exit then kill session
+  reap [--blocked] [--older-than s] [--dry-run] [-y|--yes]
+                                           Kill stuck/leaked sessions (frees concurrency slots)
+  prune [<id>...] [-y|--yes] [--dry-run]   Delete terminal runs + leftover sessions
+  bridge complete --run <id> --file <path> Completion contract (used by target CLI)
+
+Environment:
+  TMUXLET_HOME=<dir>                       State root (default: ~/.tmuxlet)
+  TMUXLET_MAX_CONCURRENCY=<n>              Live-session cap (0=unlimited; default 24)
+  TMUXLET_ACQUIRE_TIMEOUT=<seconds>        Max wait for a free slot (0=forever; default 300)
+  TMUXLET_MEMORY_GUARD=<truthy>            Enable memory-pressure guard
+  TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
+  TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
+
+Examples:
+  tmuxlet -p \"say ready\"
+  tmuxlet --target codex -p --cwd /tmp \"say ready\"
+  printf 'say ready' | tmuxlet -p -
+  TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\"
+  tmuxlet bridge complete --run <id> --file answer.txt"
+    )
+}
+
 fn print_help() {
-    println!(
-        "tmuxlet {VERSION}\n\n\
-Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|send-all|attach|stop|reap|prune>\n\n\
-Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor, grok\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --max-concurrency <n>            Cap live sessions machine-wide (0=unlimited; env TMUXLET_MAX_CONCURRENCY; default 24)\n      --memory-pressure-guard          Queue launches under host memory pressure (env TMUXLET_MEMORY_GUARD)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
-Throttling env:\n  TMUXLET_MAX_CONCURRENCY=<n>          Live-session cap (0=unlimited). Consumers that fan out should set this low (e.g. 4).\n  TMUXLET_ACQUIRE_TIMEOUT=<seconds>   Max wait for a free slot (0=forever; default 300)\n  TMUXLET_MEMORY_MIN_FREE=<percent>   Memory-guard threshold; queue when free% drops below it (default 15)\n\n\
-Maintenance:\n  tmuxlet reap [--blocked] [--older-than <s>] [--dry-run] [-y]   Kill stuck/leaked sessions, freeing slots\n  tmuxlet send-all [message] [--interval <s>] [--enter]          Paced keystrokes to every live session (no herd)\n\n\
-Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -\n  TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\""
-    );
+    println!("{}", help_text());
 }
 
 #[cfg(test)]
@@ -2262,6 +2333,82 @@ mod tests {
             exe: "/usr/local/bin/tmuxlet".into(),
         });
         opts
+    }
+
+    #[test]
+    fn help_text_lists_every_print_mode_flag_and_surface() {
+        let help = help_text();
+        // Every user-facing print-mode option / alias accepted by parse_options.
+        let required = [
+            "-p",
+            "--print",
+            "--target",
+            "--output-format",
+            "-C",
+            "--cwd",
+            "--cd",
+            "--dir",
+            "-m",
+            "--model",
+            "-c",
+            "--continue",
+            "-r",
+            "--resume",
+            "--session",
+            "--session-id",
+            "--system-prompt",
+            "--append-system-prompt",
+            "--add-dir",
+            "--include-directories",
+            "--dangerously-skip-permissions",
+            "--yolo",
+            "--force",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--permission-mode",
+            "--allowed-tools",
+            "--allowedTools",
+            "--disallowed-tools",
+            "--disallowedTools",
+            "--tools",
+            "--mcp-config",
+            "--settings",
+            "--target-arg",
+            "--timeout",
+            "--max-concurrency",
+            "--memory-pressure-guard",
+            "--memory-guard",
+            // Subcommands / bridge / env
+            "status",
+            "read",
+            "--lines",
+            "send",
+            "send-all",
+            "--interval",
+            "--enter",
+            "attach",
+            "stop",
+            "reap",
+            "--blocked",
+            "--older-than",
+            "--dry-run",
+            "prune",
+            "--yes",
+            "bridge complete",
+            "--run",
+            "--file",
+            "TMUXLET_HOME",
+            "TMUXLET_MAX_CONCURRENCY",
+            "TMUXLET_ACQUIRE_TIMEOUT",
+            "TMUXLET_MEMORY_GUARD",
+            "TMUXLET_MEMORY_MIN_FREE",
+            "TMUXLET_CLAUDE_PERMISSION_MODE",
+        ];
+        for needle in required {
+            assert!(
+                help.contains(needle),
+                "help_text missing expected surface: {needle}"
+            );
+        }
     }
 
     #[test]
