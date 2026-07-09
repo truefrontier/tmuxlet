@@ -470,7 +470,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     fs::create_dir_all(&paths.root).map_err(|e| format!("failed to create run dir: {e}"))?;
 
     // Authorize the completion-contract operations for this run. The per-target
-    // builders translate this into the narrowest grant available (claude/codex
+    // builders translate this into the narrowest grant available (claude/codex/grok
     // get true scoping; gemini/opencode/cursor fall back to their auto-approve
     // mode because their CLIs offer no graded tier).
     opts.contract_grant = Some(ContractGrant {
@@ -623,7 +623,7 @@ fn command_with_prompt(
 }
 
 fn target_accepts_prompt_argument(target: &str) -> bool {
-    matches!(target, "claude" | "codex")
+    matches!(target, "claude" | "codex" | "grok")
 }
 
 fn target_command(opts: &Options) -> Result<TargetCommand, String> {
@@ -637,6 +637,7 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "opencode" => opencode_command(opts)?,
         "pi" => pi_command(opts)?,
         "cursor" | "cursor-agent" => cursor_command(opts)?,
+        "grok" => grok_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
     cmd.args.extend(opts.target_args.iter().cloned());
@@ -974,6 +975,82 @@ fn cursor_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     Ok(TargetCommand {
         program: "cursor-agent".into(),
+        args,
+    })
+}
+
+// Grok Build (xAI) flag mapping — official `grok` binary only.
+// Interactive positional prompt (not headless `-p`/`--single`).
+// Sessions: `--continue` / `--resume [id]` resume; `--session-id` names a *new*
+// session UUID only (does not resume — reject mapping as resume).
+// Permissions: Claude-compatible `--allow`/`--deny` + `--permission-mode`;
+// full bypass is `--always-approve`. Sandbox is off by default so no add-dir.
+fn grok_command(opts: &Options) -> Result<TargetCommand, String> {
+    reject_nonempty("grok", "--add-dir", &opts.add_dirs)?;
+    reject_nonempty("grok", "--mcp-config", &opts.mcp_configs)?;
+    reject_any("grok", "--settings", &opts.settings)?;
+    if opts.session.is_some() {
+        unsupported(
+            "grok",
+            "--session",
+            "use --session-id, --resume, or --continue",
+        )?;
+    }
+
+    let mut args = Vec::new();
+    args.extend(["--cwd".into(), opts.cwd.display().to_string()]);
+    push_opt(&mut args, "--model", &opts.model);
+    // Explicit mode is passed through; full bypass takes precedence and maps to
+    // --always-approve (grok's YOLO) rather than Claude's --dangerously-skip-permissions.
+    if !opts.dangerously_skip_permissions {
+        push_opt(&mut args, "--permission-mode", &opts.permission_mode);
+    }
+    if opts.dangerously_skip_permissions {
+        args.push("--always-approve".into());
+    }
+    push_opt(&mut args, "--system-prompt-override", &opts.system_prompt);
+    for value in &opts.append_system_prompts {
+        args.extend(["--rules".into(), value.clone()]);
+    }
+    for value in &opts.allowed_tools {
+        args.extend(["--allow".into(), value.clone()]);
+    }
+    for value in &opts.disallowed_tools {
+        args.extend(["--deny".into(), value.clone()]);
+    }
+    for value in &opts.tools {
+        args.extend(["--tools".into(), value.clone()]);
+    }
+    if opts.continue_latest {
+        args.push("--continue".into());
+    }
+    if let Some(value) = &opts.resume {
+        args.push("--resume".into());
+        if let Some(value) = value {
+            args.push(value.clone());
+        }
+    }
+    // grok --session-id creates a *new* conversation UUID; it does not resume.
+    // Map the normalized flag through with that native meaning.
+    push_opt(&mut args, "--session-id", &opts.session_id);
+    // Scope the completion contract with Claude-compatible --allow rules. Grok
+    // has no --add-dir; sandbox is off by default so path access is unrestricted
+    // and the permission rules alone clear the tool-permission gate. Skipped
+    // under full bypass, which already auto-approves everything.
+    if !opts.dangerously_skip_permissions
+        && let Some(grant) = &opts.contract_grant
+    {
+        let root = grant.run_root.display().to_string();
+        let abs = format!("//{}", root.trim_start_matches('/'));
+        args.extend(["--allow".into(), format!("Write({abs}/**)")]);
+        args.extend(["--allow".into(), format!("Edit({abs}/**)")]);
+        args.extend([
+            "--allow".into(),
+            format!("Bash({} bridge complete:*)", grant.exe),
+        ]);
+    }
+    Ok(TargetCommand {
+        program: "grok".into(),
         args,
     })
 }
@@ -2158,7 +2235,7 @@ fn print_help() {
     println!(
         "tmuxlet {VERSION}\n\n\
 Usage:\n  tmuxlet -p [options] [prompt]\n  tmuxlet <status|read|send|send-all|attach|stop|reap|prune>\n\n\
-Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --max-concurrency <n>            Cap live sessions machine-wide (0=unlimited; env TMUXLET_MAX_CONCURRENCY; default 24)\n      --memory-pressure-guard          Queue launches under host memory pressure (env TMUXLET_MEMORY_GUARD)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
+Options:\n  -p, --print                         Blocking programmatic mode\n      --target <name>                  Target CLI: claude, gemini, codex, opencode, pi, cursor, grok\n      --output-format <text|json>      Output format for tmuxlet result\n  -C, --cwd <dir>                      Working directory (--cd and --dir aliases)\n  -m, --model <model>                  Model pass-through where supported\n  -c, --continue                       Continue latest session where supported\n  -r, --resume [id]                    Resume session where supported\n      --session <id>                   Normalized session selector\n      --session-id <id>                Explicit normalized session id\n      --dangerously-skip-permissions   Normalized bypass flag (--yolo, --force aliases)\n      --max-concurrency <n>            Cap live sessions machine-wide (0=unlimited; env TMUXLET_MAX_CONCURRENCY; default 24)\n      --memory-pressure-guard          Queue launches under host memory pressure (env TMUXLET_MEMORY_GUARD)\n      --target-arg <arg>               Raw target CLI escape hatch\n      --timeout <seconds>              Print-mode timeout (default: 1800)\n\n\
 Throttling env:\n  TMUXLET_MAX_CONCURRENCY=<n>          Live-session cap (0=unlimited). Consumers that fan out should set this low (e.g. 4).\n  TMUXLET_ACQUIRE_TIMEOUT=<seconds>   Max wait for a free slot (0=forever; default 300)\n  TMUXLET_MEMORY_MIN_FREE=<percent>   Memory-guard threshold; queue when free% drops below it (default 15)\n\n\
 Maintenance:\n  tmuxlet reap [--blocked] [--older-than <s>] [--dry-run] [-y]   Kill stuck/leaked sessions, freeing slots\n  tmuxlet send-all [message] [--interval <s>] [--enter]          Paced keystrokes to every live session (no herd)\n\n\
 Examples:\n  tmuxlet -p \"say ready\"\n  tmuxlet --target codex -p --cwd /tmp \"say ready\"\n  printf 'say ready' | tmuxlet -p -\n  TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\""
@@ -2389,6 +2466,132 @@ mod tests {
         let opts = with_grant(parse(&["--target", "pi", "-p", "x"]));
         let cmd = target_command(&opts).unwrap();
         assert_eq!(cmd.program, "pi");
+    }
+
+    #[test]
+    fn grok_maps_core_flags_and_session_controls() {
+        let opts = parse(&[
+            "--target",
+            "grok",
+            "--model",
+            "grok-4",
+            "--cwd",
+            "/tmp",
+            "--continue",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "grok");
+        assert!(has_pair(&cmd.args, "--model", "grok-4"));
+        assert!(has_pair(&cmd.args, "--cwd", "/tmp"));
+        assert!(cmd.args.contains(&"--continue".to_string()));
+
+        let opts = parse(&["--target", "grok", "--resume", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--resume".to_string()));
+        // value-less --resume stays flag-only (most recent session).
+        let resume_idx = cmd.args.iter().position(|a| a == "--resume").unwrap();
+        assert!(resume_idx + 1 == cmd.args.len() || cmd.args[resume_idx + 1].starts_with('-'));
+
+        let opts = parse(&["--target", "grok", "--resume", "ses_abc", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--resume", "ses_abc"));
+
+        // --session-id is create-new UUID semantics on grok, not resume.
+        let opts = parse(&[
+            "--target",
+            "grok",
+            "--session-id",
+            "01984d2f-0000-0000-0000-000000000001",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(
+            &cmd.args,
+            "--session-id",
+            "01984d2f-0000-0000-0000-000000000001"
+        ));
+        assert!(!cmd.args.contains(&"--resume".to_string()));
+    }
+
+    #[test]
+    fn grok_grant_injects_scoped_allow_rules() {
+        let opts = with_grant(parse(&["--target", "grok", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "grok");
+        assert!(has_pair(
+            &cmd.args,
+            "--allow",
+            "Write(//home/u/.tmuxlet/runs/abc/**)"
+        ));
+        assert!(has_pair(
+            &cmd.args,
+            "--allow",
+            "Edit(//home/u/.tmuxlet/runs/abc/**)"
+        ));
+        assert!(has_pair(
+            &cmd.args,
+            "--allow",
+            "Bash(/usr/local/bin/tmuxlet bridge complete:*)"
+        ));
+        assert!(!cmd.args.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn grok_full_bypass_uses_always_approve_and_suppresses_grant() {
+        let opts = with_grant(parse(&["--target", "grok", "--yolo", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--always-approve".to_string()));
+        assert!(!cmd.args.contains(&"--allow".to_string()));
+        assert!(!cmd.args.contains(&"--permission-mode".to_string()));
+    }
+
+    #[test]
+    fn grok_maps_permission_mode_and_system_prompt() {
+        let opts = parse(&[
+            "--target",
+            "grok",
+            "--permission-mode",
+            "bypassPermissions",
+            "--system-prompt",
+            "be terse",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(
+            &cmd.args,
+            "--permission-mode",
+            "bypassPermissions"
+        ));
+        assert!(has_pair(&cmd.args, "--system-prompt-override", "be terse"));
+    }
+
+    #[test]
+    fn grok_rejects_unsupported_flags() {
+        let opts = parse(&["--target", "grok", "--session", "abc", "-p", "x"]);
+        assert!(target_command(&opts).is_err());
+
+        let opts = parse(&["--target", "grok", "--add-dir", "/extra", "-p", "x"]);
+        assert!(target_command(&opts).is_err());
+
+        let opts = parse(&["--target", "grok", "--settings", "s.json", "-p", "x"]);
+        assert!(target_command(&opts).is_err());
+    }
+
+    #[test]
+    fn grok_launch_receives_final_prompt_argument() {
+        let opts = parse(&["--target", "grok", "--model", "grok-4", "-p", "x"]);
+        let (cmd, prompt_in_launch) =
+            command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
+        assert!(prompt_in_launch);
+        assert_eq!(cmd.args.last().map(String::as_str), Some("final prompt"));
+        assert_eq!(cmd.args.iter().rev().nth(1).map(String::as_str), Some("--"));
+        assert_eq!(cmd.program, "grok");
+        // Must not use grok's headless -p/--single path.
+        assert!(!cmd.args.iter().any(|a| a == "-p" || a == "--single"));
     }
 
     #[test]

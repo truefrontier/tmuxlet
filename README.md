@@ -52,7 +52,7 @@ In practice, the regular subscription bucket is worth many times the Agent SDK c
 
 `tmuxlet` runs the target CLI in its normal interactive mode inside tmux, pastes the prompt as if a user typed it, and waits for a structured completion signal. From Claude's perspective it's a normal interactive session. From your script's perspective it's a `claude -p`-style blocking call returning text or JSON.
 
-The same wrapper works against Codex, Gemini, opencode, pi, and Cursor — one normalized print-mode interface across six coding CLIs. Useful for OpenClaw, Paperclip, scheduled scripts, and any other local automation that wants a blocking `-p` call against the user's local, official CLI without extracting OAuth tokens.
+The same wrapper works against Codex, Gemini, opencode, pi, Cursor, and Grok — one normalized print-mode interface across seven coding CLIs. Useful for OpenClaw, Paperclip, scheduled scripts, and any other local automation that wants a blocking `-p` call against the user's local, official CLI without extracting OAuth tokens.
 
 ## Why not just `claude -p`?
 
@@ -60,7 +60,7 @@ Five reasons, in roughly the order most people care:
 
 **1. Billing pool.** After June 15, 2026, `claude -p` and Agent SDK calls drain from the separate Agent SDK credit ($20 / $100 / $200 by plan). `claude` interactive draws from the regular subscription usage limits, which on a Max plan are worth substantially more than that credit in equivalent API spend. `tmuxlet` runs Claude in interactive mode and drives it from the outside, so programmatic workflows can use the larger subscription bucket. ([Anthropic's announcement](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).)
 
-**2. Multi-CLI normalization.** `claude -p` is Claude-only. `tmuxlet` wraps Claude, Codex, Gemini, opencode, pi, and Cursor with one normalized flag set (`--continue`, `--resume`, `--session-id`, `--cwd`, `--model`, `--dangerously-skip-permissions`). Unsupported combinations fail fast instead of being silently dropped.
+**2. Multi-CLI normalization.** `claude -p` is Claude-only. `tmuxlet` wraps Claude, Codex, Gemini, opencode, pi, Cursor, and Grok with one normalized flag set (`--continue`, `--resume`, `--session-id`, `--cwd`, `--model`, `--dangerously-skip-permissions`). Unsupported combinations fail fast instead of being silently dropped.
 
 **3. Reliable completion signal.** Parsing stdout from `claude -p` is fragile when the target streams partial output or hits a confirmation prompt. `tmuxlet` uses an explicit completion contract — the target writes `answer.txt` and calls `tmuxlet bridge complete`. You get a clean `text` / `json` payload, or a structured `blocked` / `timeout` / `exited` status with a `pane.log` for debugging.
 
@@ -102,6 +102,7 @@ Initial adapters:
 - `opencode`
 - `pi`
 - `cursor` / `cursor-agent`
+- `grok` (xAI Grok Build CLI)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -203,6 +204,7 @@ Target mappings:
 | `opencode` | `--continue` | `--resume <id>`, `--session <id>`, or `--session-id <id>` maps to `--session <id>` | Value-less `--resume` is rejected; use `--continue` for latest. |
 | `pi` | `--continue` or value-less `--resume` | `--resume <id>`, `--session <id>`, or `--session-id <id>` | `--session-id` maps to `--session <id>`. |
 | `cursor` / `cursor-agent` | `--continue` maps to `cursor-agent resume` | `--resume <id>` or `--session-id <id>` maps to `--resume <id>` | `--session` is not supported for Cursor. |
+| `grok` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to grok's create-new UUID flag (does **not** resume; use `--resume` / `--continue`). |
 
 When running through Cargo during development, Cargo's build/status lines are
 separate from tmuxlet output:
@@ -216,7 +218,7 @@ come from Cargo.
 
 ## How Print Mode Works
 
-For Claude and Codex, tmuxlet passes one full prompt in the launch command. The
+For Claude, Codex, and Grok, tmuxlet passes one full prompt in the launch command. The
 target-visible prompt is ordered as:
 
 ```text
@@ -247,6 +249,7 @@ Each target gets the narrowest grant it supports:
 | --- | --- |
 | `claude` | `--permission-mode auto` (classifier) **plus** explicit allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` + `--add-dir <run-dir>` — scoped |
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with the run dir carved in as a `writable_root` — scoped |
+| `grok` | explicit Claude-compatible allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` via `--allow` — scoped (sandbox off by default; no `--add-dir`) |
 | `gemini` | `--yolo` (no graded mode; `auto_edit` does not cover shell) |
 | `opencode` | `--dangerously-skip-permissions` (no confirmed headless allow-list flag) |
 | `cursor` | `--force` (enables print-mode writes) |
@@ -254,21 +257,22 @@ Each target gets the narrowest grant it supports:
 
 Policy: if a target has an auto-classifier (only `claude`'s `auto`), use it **and**
 still pin the exact contract operations with explicit allow-rules rather than
-trusting the classifier; otherwise use that target's yolo/bypass. `claude` and
-`codex` end up genuinely scoped to the contract; `gemini`, `opencode`, and
+trusting the classifier; otherwise use that target's yolo/bypass. `claude`,
+`codex`, and `grok` end up genuinely scoped to the contract; `gemini`, `opencode`, and
 `cursor` fall back to their broad auto-approve because those CLIs offer no graded
 permission tier. If pinning the contract ops under a classifier is ever not
 possible or stops working, the bypass flag is the documented fallback.
 
 Overrides:
 
-- `--permission-mode <mode>` (Claude only): set the mode explicitly to override
-  the `auto` default.
+- `--permission-mode <mode>` (Claude and Grok): set the mode explicitly. On Claude
+  this overrides the `auto` default; on Grok it is passed through as
+  `--permission-mode`.
 - `TMUXLET_CLAUDE_PERMISSION_MODE`: change the Claude default mode globally
   without passing the flag each time.
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass. Takes precedence
-  over and replaces the scoped grant.
+  over and replaces the scoped grant. On Grok this maps to `--always-approve`.
 
 ## Concurrency & Throttling
 
