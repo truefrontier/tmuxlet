@@ -1,6 +1,6 @@
 ---
 name: tmuxlet
-description: Run prompts through local coding CLIs (claude, codex, gemini, opencode, pi, cursor, grok, hermes) as blocking `-p`-style programmatic calls via the tmuxlet CLI, which drives each CLI's interactive mode inside tmux and returns text or JSON. Use when the user asks to dispatch a task or prompt to a coding agent via tmuxlet, run something "through tmuxlet", fan out prompts across multiple agent sessions, check on / read / nudge / unblock tmuxlet runs, investigate a blocked or timed-out tmuxlet run, or clean up tmuxlet sessions and run directories (reap/prune). Also use when automation needs a claude -p equivalent that bills against the interactive subscription pool instead of Agent SDK credits.
+description: Run prompts through local coding CLIs (claude, codex, agy, opencode, pi, cursor, grok, hermes) as blocking `-p`-style programmatic calls via the tmuxlet CLI, which drives each CLI's interactive mode inside tmux and returns text or JSON. Use when the user asks to dispatch a task or prompt to a coding agent via tmuxlet, run something "through tmuxlet", fan out prompts across multiple agent sessions, check on / read / nudge / unblock tmuxlet runs, investigate a blocked or timed-out tmuxlet run, or clean up tmuxlet sessions and run directories (reap/prune). Also use when automation needs a claude -p equivalent that bills against the interactive subscription pool instead of Agent SDK credits.
 ---
 
 # tmuxlet
@@ -9,7 +9,7 @@ description: Run prompts through local coding CLIs (claude, codex, gemini, openc
 fresh tmux session, pastes the prompt, and blocks until the target satisfies a
 completion contract (writes `answer.txt`, calls `tmuxlet bridge complete`). The
 result comes back as text or JSON — like `claude -p`, but driven through the
-interactive TUI, normalized across seven CLIs.
+interactive TUI, normalized across eight CLIs.
 
 Sanity check before first use: `tmuxlet --version` (requires `tmux` on PATH and
 the target CLI installed, e.g. `claude`).

@@ -21,7 +21,7 @@ launch.
 | Target | Latest session | Explicit session id | Not supported |
 | --- | --- | --- | --- |
 | `claude` | `--continue` or value-less `--resume` | `--resume <id>` or `--session-id <id>` | `--session` |
-| `gemini` | `--continue` or value-less `--resume` (maps to `--resume latest`) | `--resume <id>` | `--session`, `--session-id` |
+| `agy` / `gemini` | `--continue` or value-less `--resume` (both map to `--continue`) | `--resume <id>` or `--session-id <id>` (map to `--conversation <id>`) | `--session` |
 | `codex` | `--continue` or value-less `--resume` (maps to `codex resume --last`) | `--resume <id>` or `--session-id <id>` (maps to `codex resume <id>`) | `--session` |
 | `opencode` | `--continue` only | `--resume <id>`, `--session <id>`, or `--session-id <id>` (all map to `--session <id>`) | value-less `--resume` (rejected) |
 | `pi` | `--continue` or value-less `--resume` | `--resume <id>`, `--session <id>`, or `--session-id <id>` | — |
@@ -41,14 +41,14 @@ it supports:
 | `claude` | `--permission-mode auto` + allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` + `--add-dir <run-dir>` | yes |
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with run dir as `writable_root` | yes |
 | `grok` | Claude-compatible allow-rules via `--allow` (sandbox off; no `--add-dir`) | yes |
-| `gemini` | `--yolo` (no graded mode available) | no — broad |
+| `agy` | `--dangerously-skip-permissions` (no graded mode available) | no — broad |
 | `opencode` | `--dangerously-skip-permissions` | no — broad |
 | `cursor` | `--force` | no — broad |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; no scoped tier) | no — broad |
 | `pi` | none needed — auto-approves tool use by default | n/a |
 
 Implication: on `claude`/`codex`/`grok`, work outside the cwd and run dir can
-still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
+still hit permission prompts (→ `blocked` status). On `agy`/`opencode`/
 `cursor`/`hermes`, runs are effectively unrestricted already.
 
 ## Permission overrides
@@ -60,7 +60,8 @@ still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
   pass-through where supported.
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass, replaces the
-  scoped grant. On grok maps to `--always-approve`; on hermes to `--yolo`.
+  scoped grant. On grok maps to `--always-approve`; on hermes to `--yolo`; on agy
+  to `--dangerously-skip-permissions`.
 
 ## Target quirks
 
@@ -72,9 +73,17 @@ still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
   not use — tmuxlet drives hermes' line-oriented classic REPL (`--cli`) and types
   the prompt in. `--session-id <id>` maps to `--resume <id>` (hermes
   has no create-with-id flag); value-less `--resume` maps to `--continue`.
+- **agy (Antigravity CLI)** replaces the deprecated `gemini` CLI; `--target
+  gemini` is kept as an alias that now drives the `agy` binary. agy shows a
+  first-run "trust this folder?" gate (cleared by the startup auto-enter), so the
+  prompt rides in via `--prompt-interactive` rather than a post-startup paste
+  (which the gate would consume). `--resume <id>` and `--session-id <id>` both
+  map to `--conversation <id>`; value-less `--resume`/`--continue` map to
+  `--continue`.
 - **opencode** rejects value-less `--resume`; use `--continue` for latest.
 - **Prompt delivery**: claude, codex, and grok receive the full prompt (user
-  prompt first, tmuxlet's completion contract appended) in the launch command;
+  prompt first, tmuxlet's completion contract appended) as a positional launch
+  argument; agy receives it via `--prompt-interactive` in the launch command;
   other targets get it pasted into the TUI after startup.
 - **Startup confirmation gates** (theme pickers, trust prompts, etc.): tmuxlet
   watches the pane during the startup window and presses Enter up to three
@@ -87,4 +96,4 @@ still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
 `-m/--model` is passed through where the target supports it; unsupported
 combinations fail fast with an error naming the flag, so just try it and read
 the error. Model names are target-native (e.g. `sonnet`/`opus` for claude,
-whatever `codex`/`gemini` accept natively).
+whatever `codex`/`agy` accept natively).
