@@ -471,7 +471,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
     // Authorize the completion-contract operations for this run. The per-target
     // builders translate this into the narrowest grant available (claude/codex/grok
-    // get true scoping; gemini/opencode/cursor/hermes fall back to their auto-approve
+    // get true scoping; agy/opencode/cursor/hermes fall back to their auto-approve
     // mode because their CLIs offer no graded tier).
     opts.contract_grant = Some(ContractGrant {
         run_root: paths.root.clone(),
@@ -617,6 +617,16 @@ fn command_with_prompt(
         command.args.push("--".to_string());
         command.args.push(final_prompt.to_string());
         (command, true)
+    } else if matches!(target, "agy" | "gemini") {
+        // agy (Antigravity) has no positional prompt. Seed the initial prompt
+        // into its interactive session via `--prompt-interactive` so it rides in
+        // the launch command instead of being pasted after startup: agy's
+        // first-run "trust this folder?" gate consumes an early paste, so the
+        // prompt must arrive as a launch argument. (`gemini` is the deprecated
+        // alias for the same `agy` binary.)
+        command.args.push("--prompt-interactive".to_string());
+        command.args.push(final_prompt.to_string());
+        (command, true)
     } else {
         (command, false)
     }
@@ -632,7 +642,7 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
     let target = opts.target.as_str();
     let mut cmd = match target {
         "claude" => claude_command(opts)?,
-        "gemini" => gemini_command(opts)?,
+        "agy" | "gemini" => agy_command(opts)?,
         "codex" => codex_command(opts)?,
         "opencode" => opencode_command(opts)?,
         "pi" => pi_command(opts)?,
@@ -761,41 +771,54 @@ fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     })
 }
 
-fn gemini_command(opts: &Options) -> Result<TargetCommand, String> {
-    reject_any("gemini", "--system-prompt", &opts.system_prompt)?;
-    reject_nonempty(
-        "gemini",
-        "--append-system-prompt",
-        &opts.append_system_prompts,
-    )?;
-    reject_nonempty("gemini", "--allowed-tools/--tools", &opts.allowed_tools)?;
-    reject_nonempty("gemini", "--disallowed-tools", &opts.disallowed_tools)?;
-    reject_nonempty("gemini", "--tools", &opts.tools)?;
-    reject_nonempty("gemini", "--mcp-config", &opts.mcp_configs)?;
-    reject_any("gemini", "--settings", &opts.settings)?;
-    reject_any("gemini", "--permission-mode", &opts.permission_mode)?;
-    reject_any("gemini", "--session-id", &opts.session_id)?;
-    reject_any("gemini", "--session", &opts.session)?;
+// Antigravity CLI (Google) flag mapping — the `agy` binary, successor to the
+// deprecated `gemini` CLI. tmuxlet drives agy's interactive session and the
+// completion contract runs as ordinary tool calls (not agy's native `-p`/`--print`
+// headless mode). The prompt is seeded via `--prompt-interactive <prompt>` in the
+// launch command (see command_with_prompt) rather than pasted after startup: agy
+// shows a full-screen "trust this folder?" gate on first run, and an early paste
+// lands before the REPL input is ready and is lost. The startup auto-enter loop
+// clears that gate with Enter.
+// Sessions: `--continue` resumes the most recent; `--conversation <id>` resumes
+// by id. Value-less `--resume` (latest) and `--continue` map to `--continue`;
+// `--resume <id>` and `--session-id <id>` both map to `--conversation <id>` (agy
+// has no create-with-id flag, so an explicit id resumes). `--session` is rejected.
+// Permissions: agy's only CLI auto-approve is `--dangerously-skip-permissions`
+// (its scoped allowlist lives in settings.json, not a CLI flag), so it fills the
+// same broad bucket as opencode/cursor/hermes.
+fn agy_command(opts: &Options) -> Result<TargetCommand, String> {
+    reject_any("agy", "--system-prompt", &opts.system_prompt)?;
+    reject_nonempty("agy", "--append-system-prompt", &opts.append_system_prompts)?;
+    reject_nonempty("agy", "--allowed-tools/--tools", &opts.allowed_tools)?;
+    reject_nonempty("agy", "--disallowed-tools", &opts.disallowed_tools)?;
+    reject_nonempty("agy", "--tools", &opts.tools)?;
+    reject_nonempty("agy", "--mcp-config", &opts.mcp_configs)?;
+    reject_any("agy", "--settings", &opts.settings)?;
+    reject_any("agy", "--permission-mode", &opts.permission_mode)?;
+    reject_any("agy", "--session", &opts.session)?;
 
     let mut args = Vec::new();
     push_opt(&mut args, "--model", &opts.model);
-    // Gemini has no graded auto mode and `auto_edit` does not cover shell tools,
-    // so the completion-contract shell call requires full auto-approve (--yolo).
+    // agy has no graded auto mode, so the completion-contract shell call requires
+    // full auto-approve (--dangerously-skip-permissions).
     if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
-        args.push("--yolo".into());
+        args.push("--dangerously-skip-permissions".into());
     }
     for value in &opts.add_dirs {
-        args.extend(["--include-directories".into(), value.clone()]);
+        args.extend(["--add-dir".into(), value.clone()]);
     }
     if opts.continue_latest {
-        args.extend(["--resume".into(), "latest".into()]);
+        args.push("--continue".into());
     }
     if let Some(value) = &opts.resume {
-        args.push("--resume".into());
-        args.push(value.clone().unwrap_or_else(|| "latest".into()));
+        match value {
+            Some(id) => args.extend(["--conversation".into(), id.clone()]),
+            None => args.push("--continue".into()),
+        }
     }
+    push_opt(&mut args, "--conversation", &opts.session_id);
     Ok(TargetCommand {
-        program: "gemini".into(),
+        program: "agy".into(),
         args,
     })
 }
@@ -1069,7 +1092,7 @@ fn grok_command(opts: &Options) -> Result<TargetCommand, String> {
 // normalized `--session-id` maps to `--resume <id>` (resume that session).
 // Permissions: no scoped allow/deny tier — `--yolo` (bypass dangerous-command
 // approval) is the only non-interactive auto-approve, so it fills the same broad
-// bucket as gemini/opencode/cursor.
+// bucket as agy/opencode/cursor.
 fn hermes_command(opts: &Options) -> Result<TargetCommand, String> {
     reject_any("hermes", "--system-prompt", &opts.system_prompt)?;
     reject_nonempty(
@@ -2316,7 +2339,7 @@ Usage:
 
 Print-mode options:
   -p, --print                              Blocking programmatic mode (required for runs)
-      --target <name>                      Target CLI: claude, gemini, codex, opencode, pi, cursor, grok, hermes (default: claude)
+      --target <name>                      Target CLI: claude, agy, codex, opencode, pi, cursor, grok, hermes (default: claude)
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
@@ -2647,10 +2670,13 @@ mod tests {
     }
 
     #[test]
-    fn gemini_grant_enables_yolo() {
-        let opts = with_grant(parse(&["--target", "gemini", "-p", "x"]));
+    fn agy_grant_enables_bypass() {
+        let opts = with_grant(parse(&["--target", "agy", "-p", "x"]));
         let cmd = target_command(&opts).unwrap();
-        assert!(cmd.args.contains(&"--yolo".to_string()));
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
     }
 
     #[test]
@@ -2914,18 +2940,22 @@ mod tests {
     }
 
     #[test]
-    fn gemini_maps_resume_latest() {
-        let opts = parse(&["--target", "gemini", "--continue", "-p", "x"]);
+    fn agy_maps_session_controls() {
+        let opts = parse(&["--target", "agy", "--continue", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
-        assert!(has_pair(&cmd.args, "--resume", "latest"));
+        assert!(cmd.args.contains(&"--continue".to_string()));
 
-        let opts = parse(&["--target", "gemini", "--resume", "-p", "x"]);
+        let opts = parse(&["--target", "agy", "--resume", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
-        assert!(has_pair(&cmd.args, "--resume", "latest"));
+        assert!(cmd.args.contains(&"--continue".to_string()));
 
-        let opts = parse(&["--target", "gemini", "--resume", "abc", "-p", "x"]);
+        let opts = parse(&["--target", "agy", "--resume", "abc", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
-        assert!(has_pair(&cmd.args, "--resume", "abc"));
+        assert!(has_pair(&cmd.args, "--conversation", "abc"));
+
+        let opts = parse(&["--target", "agy", "--session-id", "sid", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--conversation", "sid"));
     }
 
     #[test]
@@ -3021,11 +3051,24 @@ mod tests {
 
     #[test]
     fn unsupported_prompt_argument_targets_use_paste_fallback() {
-        let opts = parse(&["--target", "gemini", "-p", "x"]);
+        let opts = parse(&["--target", "opencode", "-p", "x"]);
         let (cmd, prompt_in_launch) =
             command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
         assert!(!prompt_in_launch);
         assert!(!cmd.args.contains(&"final prompt".to_string()));
+    }
+
+    #[test]
+    fn agy_launch_embeds_prompt_via_prompt_interactive() {
+        for target in ["agy", "gemini"] {
+            let opts = parse(&["--target", target, "-p", "x"]);
+            let (cmd, prompt_in_launch) =
+                command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
+            assert!(prompt_in_launch);
+            assert!(has_pair(&cmd.args, "--prompt-interactive", "final prompt"));
+            // agy must NOT use positional `--` prompt delivery.
+            assert!(!cmd.args.contains(&"--".to_string()));
+        }
     }
 
     #[test]
@@ -3087,10 +3130,33 @@ mod tests {
     }
 
     #[test]
-    fn gemini_maps_bypass_to_yolo() {
-        let opts = parse(&["--target", "gemini", "--force", "-p", "x"]);
-        let cmd = gemini_command(&opts).unwrap();
-        assert!(cmd.args.contains(&"--yolo".to_string()));
+    fn agy_maps_bypass_to_skip_permissions() {
+        let opts = parse(&["--target", "agy", "--force", "-p", "x"]);
+        let cmd = agy_command(&opts).unwrap();
+        assert!(
+            cmd.args
+                .contains(&"--dangerously-skip-permissions".to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_alias_and_agy_map_core_flags() {
+        for target in ["agy", "gemini"] {
+            let opts = parse(&[
+                "--target",
+                target,
+                "--model",
+                "gemini-x",
+                "--add-dir",
+                "/tmp/w",
+                "-p",
+                "x",
+            ]);
+            let cmd = target_command(&opts).unwrap();
+            assert_eq!(cmd.program, "agy");
+            assert!(has_pair(&cmd.args, "--model", "gemini-x"));
+            assert!(has_pair(&cmd.args, "--add-dir", "/tmp/w"));
+        }
     }
 
     #[test]
@@ -3105,8 +3171,8 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_flags() {
-        let opts = parse(&["--target", "gemini", "--system-prompt", "sys", "-p", "x"]);
-        assert!(gemini_command(&opts).is_err());
+        let opts = parse(&["--target", "agy", "--system-prompt", "sys", "-p", "x"]);
+        assert!(agy_command(&opts).is_err());
     }
 
     #[test]
