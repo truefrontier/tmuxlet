@@ -471,7 +471,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
     // Authorize the completion-contract operations for this run. The per-target
     // builders translate this into the narrowest grant available (claude/codex/grok
-    // get true scoping; gemini/opencode/cursor fall back to their auto-approve
+    // get true scoping; gemini/opencode/cursor/hermes fall back to their auto-approve
     // mode because their CLIs offer no graded tier).
     opts.contract_grant = Some(ContractGrant {
         run_root: paths.root.clone(),
@@ -638,6 +638,7 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "pi" => pi_command(opts)?,
         "cursor" | "cursor-agent" => cursor_command(opts)?,
         "grok" => grok_command(opts)?,
+        "hermes" | "hermes-agent" => hermes_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
     cmd.args.extend(opts.target_args.iter().cloned());
@@ -1051,6 +1052,67 @@ fn grok_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     Ok(TargetCommand {
         program: "grok".into(),
+        args,
+    })
+}
+
+// Hermes Agent (Nous Research) flag mapping — official `hermes` binary.
+// tmuxlet drives the line-oriented classic REPL (`--cli`), not the full-screen
+// TUI: the prompt is typed in after startup and the completion contract runs as
+// ordinary tool calls, so hermes is NOT in `target_accepts_prompt_argument`.
+// Prompt delivery: hermes takes no positional prompt argument. Its headless
+// one-shot prompt is a flag value (`-z <prompt>` or `chat -q <prompt>`), which
+// tmuxlet does not use; the prompt is typed into the REPL after startup.
+// Sessions: `--continue [name]` resumes the most recent; `--resume <id>` resumes
+// by id/title. Value-less `--resume` (latest) maps to `--continue` because
+// hermes `--resume` requires an id. There is no create-with-id flag, so the
+// normalized `--session-id` maps to `--resume <id>` (resume that session).
+// Permissions: no scoped allow/deny tier — `--yolo` (bypass dangerous-command
+// approval) is the only non-interactive auto-approve, so it fills the same broad
+// bucket as gemini/opencode/cursor.
+fn hermes_command(opts: &Options) -> Result<TargetCommand, String> {
+    reject_any("hermes", "--system-prompt", &opts.system_prompt)?;
+    reject_nonempty(
+        "hermes",
+        "--append-system-prompt",
+        &opts.append_system_prompts,
+    )?;
+    reject_nonempty("hermes", "--add-dir", &opts.add_dirs)?;
+    reject_nonempty("hermes", "--allowed-tools", &opts.allowed_tools)?;
+    reject_nonempty("hermes", "--disallowed-tools", &opts.disallowed_tools)?;
+    reject_nonempty("hermes", "--tools", &opts.tools)?;
+    reject_nonempty("hermes", "--mcp-config", &opts.mcp_configs)?;
+    reject_any("hermes", "--settings", &opts.settings)?;
+    reject_any("hermes", "--permission-mode", &opts.permission_mode)?;
+    if opts.session.is_some() {
+        unsupported("hermes", "--session", "use --resume or --continue")?;
+    }
+
+    let mut args = Vec::new();
+    // Force the classic prompt_toolkit REPL. The full-screen TUI captures raw
+    // keys and redraws, which tmux send-keys/capture-pane cannot drive reliably.
+    args.push("--cli".into());
+    push_opt(&mut args, "--model", &opts.model);
+    if opts.continue_latest {
+        args.push("--continue".into());
+    }
+    if let Some(value) = &opts.resume {
+        match value {
+            Some(id) => args.extend(["--resume".into(), id.clone()]),
+            // hermes --resume needs an id; --continue resumes the most recent.
+            None => args.push("--continue".into()),
+        }
+    }
+    // No create-with-id flag on hermes: the explicit id resumes that session.
+    push_opt(&mut args, "--resume", &opts.session_id);
+    // hermes has no graded permission tier, so the completion contract's shell +
+    // file-write calls need full auto-approve (--yolo). Skipped when neither a
+    // grant nor an explicit bypass asks for it, matching the other broad targets.
+    if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
+        args.push("--yolo".into());
+    }
+    Ok(TargetCommand {
+        program: "hermes".into(),
         args,
     })
 }
@@ -2254,7 +2316,7 @@ Usage:
 
 Print-mode options:
   -p, --print                              Blocking programmatic mode (required for runs)
-      --target <name>                      Target CLI: claude, gemini, codex, opencode, pi, cursor, grok (default: claude)
+      --target <name>                      Target CLI: claude, gemini, codex, opencode, pi, cursor, grok, hermes (default: claude)
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
@@ -2739,6 +2801,116 @@ mod tests {
         assert_eq!(cmd.program, "grok");
         // Must not use grok's headless -p/--single path.
         assert!(!cmd.args.iter().any(|a| a == "-p" || a == "--single"));
+    }
+
+    #[test]
+    fn hermes_maps_core_flags_and_session_controls() {
+        let opts = parse(&[
+            "--target",
+            "hermes",
+            "--model",
+            "hermes-4",
+            "--continue",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "hermes");
+        // Always drives the classic REPL, never the full-screen TUI.
+        assert!(cmd.args.contains(&"--cli".to_string()));
+        assert!(has_pair(&cmd.args, "--model", "hermes-4"));
+        assert!(cmd.args.contains(&"--continue".to_string()));
+
+        // Value-less --resume (latest) maps to --continue (hermes --resume needs an id).
+        let opts = parse(&["--target", "hermes", "--resume", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--continue".to_string()));
+        assert!(!cmd.args.contains(&"--resume".to_string()));
+
+        // --resume <id> resumes by id/title.
+        let opts = parse(&["--target", "hermes", "--resume", "ses_abc", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--resume", "ses_abc"));
+
+        // --session-id maps to --resume <id> (no create-with-id flag on hermes).
+        let opts = parse(&["--target", "hermes", "--session-id", "ses_xyz", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--resume", "ses_xyz"));
+        assert!(!cmd.args.contains(&"--continue".to_string()));
+    }
+
+    #[test]
+    fn hermes_agent_alias_resolves_to_hermes() {
+        let opts = parse(&["--target", "hermes-agent", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "hermes");
+    }
+
+    #[test]
+    fn hermes_grant_uses_yolo_and_no_scoped_rules() {
+        // No grant, no bypass: nothing to auto-approve, so no --yolo.
+        let opts = parse(&["--target", "hermes", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(!cmd.args.contains(&"--yolo".to_string()));
+
+        // Contract grant present: broad --yolo (hermes has no scoped allow/deny tier).
+        let opts = with_grant(parse(&["--target", "hermes", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "hermes");
+        assert!(cmd.args.contains(&"--yolo".to_string()));
+        assert!(
+            !cmd.args
+                .iter()
+                .any(|a| a == "--allow" || a == "--allowed-tools")
+        );
+    }
+
+    #[test]
+    fn hermes_full_bypass_uses_yolo() {
+        let opts = with_grant(parse(&["--target", "hermes", "--yolo", "-p", "x"]));
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--yolo".to_string()));
+    }
+
+    #[test]
+    fn hermes_rejects_unsupported_flags() {
+        let cases: &[&[&str]] = &[
+            &["--target", "hermes", "--session", "abc", "-p", "x"],
+            &["--target", "hermes", "--add-dir", "/extra", "-p", "x"],
+            &["--target", "hermes", "--settings", "s.json", "-p", "x"],
+            &["--target", "hermes", "--permission-mode", "auto", "-p", "x"],
+            &[
+                "--target",
+                "hermes",
+                "--system-prompt",
+                "be terse",
+                "-p",
+                "x",
+            ],
+            &["--target", "hermes", "--allowed-tools", "Bash", "-p", "x"],
+            &["--target", "hermes", "--mcp-config", "m.json", "-p", "x"],
+        ];
+        for case in cases {
+            let opts = parse(case);
+            assert!(
+                target_command(&opts).is_err(),
+                "expected error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_prompt_is_typed_not_positional() {
+        // hermes -p is --profile, not a prompt flag: the prompt must be typed into
+        // the REPL, never appended as a positional launch argument.
+        let opts = parse(&["--target", "hermes", "-p", "x"]);
+        let (cmd, prompt_in_launch) =
+            command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
+        assert!(!prompt_in_launch);
+        assert_eq!(cmd.program, "hermes");
+        assert!(!cmd.args.iter().any(|a| a == "final prompt"));
+        assert!(!cmd.args.iter().any(|a| a == "--"));
+        assert!(!cmd.args.iter().any(|a| a == "-p" || a == "--profile"));
     }
 
     #[test]

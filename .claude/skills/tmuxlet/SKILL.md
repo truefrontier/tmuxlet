@@ -1,6 +1,6 @@
 ---
 name: tmuxlet
-description: Run prompts through local coding CLIs (claude, codex, gemini, opencode, pi, cursor, grok) as blocking `-p`-style programmatic calls via the tmuxlet CLI, which drives each CLI's interactive mode inside tmux and returns text or JSON. Use when the user asks to dispatch a task or prompt to a coding agent via tmuxlet, run something "through tmuxlet", fan out prompts across multiple agent sessions, check on / read / nudge / unblock tmuxlet runs, investigate a blocked or timed-out tmuxlet run, or clean up tmuxlet sessions and run directories (reap/prune). Also use when automation needs a claude -p equivalent that bills against the interactive subscription pool instead of Agent SDK credits.
+description: Run prompts through local coding CLIs (claude, codex, gemini, opencode, pi, cursor, grok, hermes) as blocking `-p`-style programmatic calls via the tmuxlet CLI, which drives each CLI's interactive mode inside tmux and returns text or JSON. Use when the user asks to dispatch a task or prompt to a coding agent via tmuxlet, run something "through tmuxlet", fan out prompts across multiple agent sessions, check on / read / nudge / unblock tmuxlet runs, investigate a blocked or timed-out tmuxlet run, or clean up tmuxlet sessions and run directories (reap/prune). Also use when automation needs a claude -p equivalent that bills against the interactive subscription pool instead of Agent SDK credits.
 ---
 
 # tmuxlet
@@ -169,7 +169,8 @@ periodic `prune -y` is the normal hygiene step.
 ## Per-target details
 
 Session resume mappings, permission-grant behavior, and target quirks (e.g.
-grok's `--session-id` creates a session rather than resuming) differ by target.
+grok's `--session-id` creates a session rather than resuming; hermes takes no
+positional prompt — tmuxlet types into its `--cli` REPL) differ by target.
 Read [references/targets.md](references/targets.md) whenever using
 `--continue`/`--resume`/`--session`/`--session-id`, permission flags, or a
 non-claude target for the first time in a session.

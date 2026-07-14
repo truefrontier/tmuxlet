@@ -27,6 +27,7 @@ launch.
 | `pi` | `--continue` or value-less `--resume` | `--resume <id>`, `--session <id>`, or `--session-id <id>` | — |
 | `cursor` / `cursor-agent` | `--continue` (maps to `cursor-agent resume`) | `--resume <id>` or `--session-id <id>` (maps to `--resume <id>`) | `--session` |
 | `grok` | `--continue` or value-less `--resume` | `--resume <id>` | `--session`; `--session-id` does NOT resume (see quirks) |
+| `hermes` / `hermes-agent` | `--continue` or value-less `--resume` | `--resume <id>` | `--session`; `--session-id` maps to `--resume <id>` (see quirks) |
 
 ## Default permission grants
 
@@ -43,11 +44,12 @@ it supports:
 | `gemini` | `--yolo` (no graded mode available) | no — broad |
 | `opencode` | `--dangerously-skip-permissions` | no — broad |
 | `cursor` | `--force` | no — broad |
+| `hermes` | `--yolo` (bypasses dangerous-command approval; no scoped tier) | no — broad |
 | `pi` | none needed — auto-approves tool use by default | n/a |
 
 Implication: on `claude`/`codex`/`grok`, work outside the cwd and run dir can
 still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
-`cursor`, runs are effectively unrestricted already.
+`cursor`/`hermes`, runs are effectively unrestricted already.
 
 ## Permission overrides
 
@@ -58,13 +60,18 @@ still hit permission prompts (→ `blocked` status). On `gemini`/`opencode`/
   pass-through where supported.
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass, replaces the
-  scoped grant. On grok maps to `--always-approve`.
+  scoped grant. On grok maps to `--always-approve`; on hermes to `--yolo`.
 
 ## Target quirks
 
 - **grok `--session-id <id>`** passes grok's create-new-UUID flag — it creates
   a session with that id rather than resuming one. To resume, use `--resume
   <id>` or `--continue`.
+- **hermes takes no positional prompt.** Its headless one-shot prompt is a flag
+  value (`hermes -z <prompt>` or `hermes chat -q <prompt>`), which tmuxlet does
+  not use — tmuxlet drives hermes' line-oriented classic REPL (`--cli`) and types
+  the prompt in. `--session-id <id>` maps to `--resume <id>` (hermes
+  has no create-with-id flag); value-less `--resume` maps to `--continue`.
 - **opencode** rejects value-less `--resume`; use `--continue` for latest.
 - **Prompt delivery**: claude, codex, and grok receive the full prompt (user
   prompt first, tmuxlet's completion contract appended) in the launch command;

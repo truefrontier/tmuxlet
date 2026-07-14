@@ -52,7 +52,7 @@ In practice, the regular subscription bucket is worth many times the Agent SDK c
 
 `tmuxlet` runs the target CLI in its normal interactive mode inside tmux, pastes the prompt as if a user typed it, and waits for a structured completion signal. From Claude's perspective it's a normal interactive session. From your script's perspective it's a `claude -p`-style blocking call returning text or JSON.
 
-The same wrapper works against Codex, Gemini, opencode, pi, Cursor, and Grok — one normalized print-mode interface across seven coding CLIs. Useful for OpenClaw, Paperclip, scheduled scripts, and any other local automation that wants a blocking `-p` call against the user's local, official CLI without extracting OAuth tokens.
+The same wrapper works against Codex, Gemini, opencode, pi, Cursor, Grok, and Hermes — one normalized print-mode interface across eight coding CLIs. Useful for OpenClaw, Paperclip, scheduled scripts, and any other local automation that wants a blocking `-p` call against the user's local, official CLI without extracting OAuth tokens.
 
 ## Why not just `claude -p`?
 
@@ -60,7 +60,7 @@ Five reasons, in roughly the order most people care:
 
 **1. Billing pool.** After June 15, 2026, `claude -p` and Agent SDK calls drain from the separate Agent SDK credit ($20 / $100 / $200 by plan). `claude` interactive draws from the regular subscription usage limits, which on a Max plan are worth substantially more than that credit in equivalent API spend. `tmuxlet` runs Claude in interactive mode and drives it from the outside, so programmatic workflows can use the larger subscription bucket. ([Anthropic's announcement](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).)
 
-**2. Multi-CLI normalization.** `claude -p` is Claude-only. `tmuxlet` wraps Claude, Codex, Gemini, opencode, pi, Cursor, and Grok with one normalized flag set (`--continue`, `--resume`, `--session-id`, `--cwd`, `--model`, `--dangerously-skip-permissions`). Unsupported combinations fail fast instead of being silently dropped.
+**2. Multi-CLI normalization.** `claude -p` is Claude-only. `tmuxlet` wraps Claude, Codex, Gemini, opencode, pi, Cursor, Grok, and Hermes with one normalized flag set (`--continue`, `--resume`, `--session-id`, `--cwd`, `--model`, `--dangerously-skip-permissions`). Unsupported combinations fail fast instead of being silently dropped.
 
 **3. Reliable completion signal.** Parsing stdout from `claude -p` is fragile when the target streams partial output or hits a confirmation prompt. `tmuxlet` uses an explicit completion contract — the target writes `answer.txt` and calls `tmuxlet bridge complete`. You get a clean `text` / `json` payload, or a structured `blocked` / `timeout` / `exited` status with a `pane.log` for debugging.
 
@@ -103,6 +103,7 @@ Initial adapters:
 - `pi`
 - `cursor` / `cursor-agent`
 - `grok` (xAI Grok Build CLI)
+- `hermes` / `hermes-agent` (Nous Research Hermes Agent CLI)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -138,7 +139,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | Flag / aliases | Value | Default | Purpose |
 | --- | --- | --- | --- |
 | `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
-| `--target` | `<name>` | `claude` | Target CLI: `claude`, `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`. |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`. |
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
@@ -249,6 +250,7 @@ Target mappings:
 | `pi` | `--continue` or value-less `--resume` | `--resume <id>`, `--session <id>`, or `--session-id <id>` | `--session-id` maps to `--session <id>`. |
 | `cursor` / `cursor-agent` | `--continue` maps to `cursor-agent resume` | `--resume <id>` or `--session-id <id>` maps to `--resume <id>` | `--session` is not supported for Cursor. |
 | `grok` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to grok's create-new UUID flag (does **not** resume; use `--resume` / `--continue`). |
+| `hermes` / `hermes-agent` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to `--resume <id>` (resume that session; hermes has no create-with-id flag). |
 
 When running through Cargo during development, Cargo's build/status lines are
 separate from tmuxlet output:
@@ -297,13 +299,14 @@ Each target gets the narrowest grant it supports:
 | `gemini` | `--yolo` (no graded mode; `auto_edit` does not cover shell) |
 | `opencode` | `--dangerously-skip-permissions` (no confirmed headless allow-list flag) |
 | `cursor` | `--force` (enables print-mode writes) |
+| `hermes` | `--yolo` (bypasses dangerous-command approval; hermes has no scoped allow/deny tier) |
 | `pi` | none — auto-approves tool use by default |
 
 Policy: if a target has an auto-classifier (only `claude`'s `auto`), use it **and**
 still pin the exact contract operations with explicit allow-rules rather than
 trusting the classifier; otherwise use that target's yolo/bypass. `claude`,
-`codex`, and `grok` end up genuinely scoped to the contract; `gemini`, `opencode`, and
-`cursor` fall back to their broad auto-approve because those CLIs offer no graded
+`codex`, and `grok` end up genuinely scoped to the contract; `gemini`, `opencode`,
+`cursor`, and `hermes` fall back to their broad auto-approve because those CLIs offer no graded
 permission tier. If pinning the contract ops under a classifier is ever not
 possible or stops working, the bypass flag is the documented fallback.
 
@@ -316,7 +319,7 @@ Overrides:
   without passing the flag each time.
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass. Takes precedence
-  over and replaces the scoped grant. On Grok this maps to `--always-approve`.
+  over and replaces the scoped grant. On Grok this maps to `--always-approve`; on Hermes to `--yolo`.
 
 ## Concurrency & Throttling
 
