@@ -300,6 +300,9 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
                 opts.prompt_parts.extend(args[i + 1..].iter().cloned());
                 break;
             }
+            // A bare "-" is the stdin sentinel, not an option; prompt_from reads
+            // stdin when it is the whole prompt.
+            "-" => opts.prompt_parts.push(arg.clone()),
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             _ => opts.prompt_parts.push(arg.clone()),
         }
@@ -3659,6 +3662,33 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_options(&mut args).is_err());
+    }
+
+    #[test]
+    fn bare_dash_is_a_prompt_part_not_an_option() {
+        let opts = parse(&["-p", "-"]);
+        assert_eq!(opts.prompt_parts, vec!["-".to_string()]);
+    }
+
+    #[test]
+    fn unknown_dash_options_are_still_rejected() {
+        let mut args: Vec<String> = ["-p", "--not-a-flag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_options(&mut args).is_err());
+        let mut args: Vec<String> = ["-p", "-x"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_options(&mut args).is_err());
+    }
+
+    #[test]
+    fn dash_prompt_part_selects_the_stdin_branch() {
+        // prompt_from reads stdin for a bare "-" and for an empty prompt; both
+        // are distinct from a literal prompt that merely contains a dash.
+        let opts = parse(&["-p", "--", "-", "extra"]);
+        assert_eq!(opts.prompt_parts.join(" "), "- extra");
+        let opts = parse(&["-p", "-"]);
+        assert_eq!(opts.prompt_parts.join(" "), "-");
     }
 
     #[test]
