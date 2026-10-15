@@ -28,6 +28,8 @@ launch.
 | `cursor` / `cursor-agent` | `--continue` (maps to `cursor-agent resume`) | `--resume <id>` or `--session-id <id>` (maps to `--resume <id>`) | `--session` |
 | `grok` | `--continue` or value-less `--resume` | `--resume <id>` | `--session`; `--session-id` does NOT resume (see quirks) |
 | `hermes` / `hermes-agent` | `--continue` or value-less `--resume` | `--resume <id>` | `--session`; `--session-id` maps to `--resume <id>` (see quirks) |
+| `muse` / `musecli` | `--continue` or value-less `--resume` (map to `-c`) | `--resume <id>`, `--session <id>`, or `--session-id <id>` (map to `--chat <id>`; `main` = main chat) | — |
+| `gweb` / `gemini-web` | `--continue` or value-less `--resume` (map to `-c`) | `--resume <id>`, `--session <id>`, or `--session-id <id>` (map to `--chat <id>`) | — |
 
 ## Default permission grants
 
@@ -46,6 +48,7 @@ it supports:
 | `cursor` | `--force` | no — broad |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; no scoped tier) | no — broad |
 | `pi` | none needed — auto-approves tool use by default | n/a |
+| `muse` / `gweb` | none — chat backends run no tools and no completion contract | n/a |
 
 Implication: on `claude`/`codex`/`grok`, work outside the cwd and run dir can
 still hit permission prompts (→ `blocked` status). On `agy`/`opencode`/
@@ -81,6 +84,16 @@ still hit permission prompts (→ `blocked` status). On `agy`/`opencode`/
   map to `--conversation <id>`; value-less `--resume`/`--continue` map to
   `--continue`.
 - **opencode** rejects value-less `--resume`; use `--continue` for latest.
+- **muse / gweb are chat backends**, not coding agents: Meta Muse via `musecli`
+  and Gemini web via `gweb` (override with `TMUXLET_MUSECLI_BIN` /
+  `TMUXLET_GWEB_BIN`). They get the raw prompt (no completion contract) via
+  `--prompt-file`, and a `sh` wrapper calls `bridge complete` itself. On failure
+  (not signed in, profile lock busy, CLI timeout) the run ends `exited` and the
+  output is the CLI's error message. Agent-only flags (system prompt, tools,
+  permissions, `--add-dir`, `--mcp-config`, `--settings`, bypass) fail fast.
+  Runs on the same backend queue on that CLI's Chrome profile lock; tmuxlet
+  passes `--lock-wait <timeout>`. An explicit `--timeout` is also forwarded to
+  the CLI. No startup auto-Enter or `blocked` detection.
 - **Prompt delivery**: claude, codex, and grok receive the full prompt (user
   prompt first, tmuxlet's completion contract appended) as a positional launch
   argument; agy receives it via `--prompt-interactive` in the launch command;
@@ -96,4 +109,5 @@ still hit permission prompts (→ `blocked` status). On `agy`/`opencode`/
 `-m/--model` is passed through where the target supports it; unsupported
 combinations fail fast with an error naming the flag, so just try it and read
 the error. Model names are target-native (e.g. `sonnet`/`opus` for claude,
-whatever `codex`/`agy` accept natively).
+whatever `codex`/`agy` accept natively). `gweb` takes a Gemini model menu name
+(e.g. `-m "3.8 Flash"`); `muse` rejects `-m` (Muse has no model picker).

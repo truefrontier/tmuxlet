@@ -71,6 +71,8 @@ struct Options {
     target_args: Vec<String>,
     contract_grant: Option<ContractGrant>,
     timeout: Duration,
+    // True when --timeout was passed; chat backends forward only an explicit value.
+    timeout_explicit: bool,
     // None => resolve from TMUXLET_MAX_CONCURRENCY env, else DEFAULT_MAX_CONCURRENCY.
     // 0 == unlimited (semaphore disabled).
     max_concurrency: Option<usize>,
@@ -104,6 +106,7 @@ impl Default for Options {
             target_args: Vec::new(),
             contract_grant: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout_explicit: false,
             max_concurrency: None,
             memory_guard: false,
         }
@@ -285,6 +288,7 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
                     .parse::<u64>()
                     .map_err(|_| "--timeout must be an integer number of seconds".to_string())?;
                 opts.timeout = Duration::from_secs(seconds);
+                opts.timeout_explicit = true;
             }
             "--max-concurrency" => {
                 let n = take_value(args, &mut i, arg)?
@@ -483,10 +487,16 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
     let prompt = prompt_from(&opts)?;
     fs::write(&paths.prompt, &prompt).map_err(|e| format!("failed to write prompt: {e}"))?;
-    let instruction = completion_prompt(&prompt, &run_id, &paths.answer);
     let base_command = target_command(&opts)?;
-    let (launch_command, prompt_in_launch) =
-        command_with_prompt(base_command.clone(), &opts.target, &instruction);
+    let chat = is_chat_target(&opts.target);
+    let (launch_command, paste) = launch_plan(
+        &opts.target,
+        base_command.clone(),
+        &paths,
+        &run_id,
+        &tmuxlet_exe(),
+        &prompt,
+    );
 
     write_meta(&paths, &run_id, &tmux_session, &opts, &base_command)?;
     // Acquire a concurrency slot before the heavy TUI session exists. Blocks/queues
@@ -498,8 +508,8 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     }
     start_tmux_session(&tmux_session, &opts.cwd)?;
     send_launch_command(&tmux_session, &launch_command)?;
-    if !prompt_in_launch {
-        paste_text(&tmux_session, &instruction)?;
+    if let Some(text) = paste {
+        paste_text(&tmux_session, &text)?;
     }
 
     let startup_auto_enter_deadline =
@@ -532,7 +542,9 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             });
         }
 
-        if Instant::now() >= next_pane_poll {
+        // Chat backends never show confirmation prompts, so skip the auto-Enter
+        // and blocked heuristics for them.
+        if !chat && Instant::now() >= next_pane_poll {
             let pane = capture_pane(&tmux_session, 200).unwrap_or_default();
             if Instant::now() <= startup_auto_enter_deadline
                 && startup_enter_attempts < STARTUP_AUTO_ENTER_MAX_ATTEMPTS
@@ -588,6 +600,11 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         }
 
         if !tmux_session_exists(&tmux_session) {
+            // A chat backend's pane exits right after `bridge complete`; recheck so
+            // that race reads as completed, not exited.
+            if paths.complete.exists() {
+                continue;
+            }
             let pane = fs::read_to_string(&paths.pane_log).unwrap_or_default();
             return Ok(RunResult {
                 id: run_id,
@@ -603,6 +620,62 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         }
 
         thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The pane launch command plus any text to paste after startup. Agent targets
+/// get the prompt wrapped in the completion contract; chat backends never see
+/// the contract and read the raw prompt from prompt.txt.
+fn launch_plan(
+    target: &str,
+    base: TargetCommand,
+    paths: &RunPaths,
+    run_id: &str,
+    exe: &str,
+    prompt: &str,
+) -> (TargetCommand, Option<String>) {
+    if is_chat_target(target) {
+        return (chat_launch_command(&base, paths, run_id, exe), None);
+    }
+    let instruction = completion_prompt(prompt, run_id, &paths.answer);
+    let (command, prompt_in_launch) = command_with_prompt(base, target, &instruction);
+    (command, (!prompt_in_launch).then_some(instruction))
+}
+
+fn is_chat_target(target: &str) -> bool {
+    matches!(target, "muse" | "musecli" | "gweb" | "gemini-web")
+}
+
+/// Chat backends can't follow the completion contract, so tmuxlet completes the
+/// run itself: the CLI writes answer.txt, then the wrapper calls `bridge
+/// complete`. On failure the CLI's stderr becomes pane.log and the pane exits
+/// (`exec` replaces the pane's shell), so the run ends `exited` with that error
+/// as its output. stderr goes to stderr.txt, not error.txt: any error.txt
+/// content marks a run terminal for status/prune, even while the CLI still runs.
+/// The run dir is named once (`$r`) because the line is typed into a shell that
+/// may not be ready yet, and the tty drops input past 1024 bytes (macOS). The
+/// pane does not inherit tmuxlet's env, so the bridge gets TMUXLET_HOME (the
+/// state dir, `$r/../..`) explicitly.
+fn chat_launch_command(
+    cli: &TargetCommand,
+    paths: &RunPaths,
+    run_id: &str,
+    exe: &str,
+) -> TargetCommand {
+    let mut cli_line = vec![shell_quote(&cli.program)];
+    cli_line.extend(cli.args.iter().map(|arg| shell_quote(arg)));
+    let script = format!(
+        "r={root}; {cli} --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" \
+2> \"$r/stderr.txt\" && TMUXLET_HOME=\"$r/../..\" {exe} bridge complete --run {run} --file \"$r/answer.txt\" \
+2>> \"$r/stderr.txt\" || {{ cp \"$r/stderr.txt\" \"$r/pane.log\"; exit 1; }}",
+        root = shell_quote(&paths.root.display().to_string()),
+        cli = cli_line.join(" "),
+        exe = shell_quote(exe),
+        run = shell_quote(run_id),
+    );
+    TargetCommand {
+        program: "exec".into(),
+        args: vec!["sh".into(), "-c".into(), script],
     }
 }
 
@@ -652,6 +725,8 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "cursor" | "cursor-agent" => cursor_command(opts)?,
         "grok" => grok_command(opts)?,
         "hermes" | "hermes-agent" => hermes_command(opts)?,
+        "muse" | "musecli" => muse_command(opts)?,
+        "gweb" | "gemini-web" => gweb_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
     cmd.args.extend(opts.target_args.iter().cloned());
@@ -1139,6 +1214,79 @@ fn hermes_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     Ok(TargetCommand {
         program: "hermes".into(),
+        args,
+    })
+}
+
+// Chat backends: Meta Muse via `musecli` and Gemini web via `gweb` (programs
+// overridable with TMUXLET_MUSECLI_BIN / TMUXLET_GWEB_BIN). They are print-mode
+// chat CLIs, not agent TUIs, so they get the raw prompt and tmuxlet completes the
+// run itself (see chat_launch_command). Sessions are the CLI's chat ids: an
+// explicit id (`--resume <id>`, `--session-id`, `--session`) maps to `--chat
+// <id>`; `--continue` or value-less `--resume` maps to `-c` (the CLI's last
+// chat). Agent-only flags fail fast. Both CLIs share one Chrome profile per CLI
+// and queue on its lock, so `--lock-wait` lets a queued run wait for the whole
+// run timeout instead of the CLI's 30s default. `--timeout` is forwarded only
+// when given explicitly; otherwise the CLI keeps its own answer timeout.
+fn muse_command(opts: &Options) -> Result<TargetCommand, String> {
+    if opts.model.is_some() {
+        unsupported("muse", "--model", "Muse has no model picker")?;
+    }
+    chat_command(opts, "muse", "TMUXLET_MUSECLI_BIN", "musecli")
+}
+
+fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
+    let mut cmd = chat_command(opts, "gweb", "TMUXLET_GWEB_BIN", "gweb")?;
+    push_opt(&mut cmd.args, "--model", &opts.model);
+    Ok(cmd)
+}
+
+fn chat_command(
+    opts: &Options,
+    target: &str,
+    bin_env: &str,
+    default_bin: &str,
+) -> Result<TargetCommand, String> {
+    reject_any(target, "--system-prompt", &opts.system_prompt)?;
+    reject_nonempty(
+        target,
+        "--append-system-prompt",
+        &opts.append_system_prompts,
+    )?;
+    reject_nonempty(target, "--add-dir", &opts.add_dirs)?;
+    reject_nonempty(target, "--allowed-tools", &opts.allowed_tools)?;
+    reject_nonempty(target, "--disallowed-tools", &opts.disallowed_tools)?;
+    reject_nonempty(target, "--tools", &opts.tools)?;
+    reject_nonempty(target, "--mcp-config", &opts.mcp_configs)?;
+    reject_any(target, "--settings", &opts.settings)?;
+    reject_any(target, "--permission-mode", &opts.permission_mode)?;
+    if opts.dangerously_skip_permissions {
+        unsupported(target, "--dangerously-skip-permissions", "")?;
+    }
+
+    let mut args = vec![
+        "--lock-wait".into(),
+        opts.timeout.as_secs().to_string(),
+        "-p".into(),
+        "--quiet".into(),
+    ];
+    let chat_id = match &opts.resume {
+        Some(Some(id)) => Some(id),
+        _ => opts.session_id.as_ref().or(opts.session.as_ref()),
+    };
+    if let Some(id) = chat_id {
+        args.extend(["--chat".into(), id.clone()]);
+    } else if opts.continue_latest || opts.resume.is_some() {
+        args.push("-c".into());
+    }
+    if opts.timeout_explicit {
+        args.extend(["--timeout".into(), opts.timeout.as_secs().to_string()]);
+    }
+    Ok(TargetCommand {
+        program: env::var(bin_env)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| default_bin.into()),
         args,
     })
 }
@@ -2342,7 +2490,8 @@ Usage:
 
 Print-mode options:
   -p, --print                              Blocking programmatic mode (required for runs)
-      --target <name>                      Target CLI: claude, agy, codex, opencode, pi, cursor, grok, hermes (default: claude)
+      --target <name>                      Target CLI: claude, agy, codex, opencode, pi, cursor, grok, hermes,
+                                           or chat backends muse, gweb (default: claude)
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
@@ -2387,12 +2536,16 @@ Environment:
   TMUXLET_MEMORY_GUARD=<truthy>            Enable memory-pressure guard
   TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
   TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
+  TMUXLET_MUSECLI_BIN=<path>               musecli program for --target muse (default: musecli)
+  TMUXLET_GWEB_BIN=<path>                  gweb program for --target gweb (default: gweb)
 
 Examples:
   tmuxlet -p \"say ready\"
   tmuxlet --target codex -p --cwd /tmp \"say ready\"
   printf 'say ready' | tmuxlet -p -
   TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\"
+  tmuxlet -p --target muse \"Reply with exactly: pong\"
+  tmuxlet -p --target gweb -m \"3.8 Flash\" \"Reply with exactly: pong\"
   tmuxlet bridge complete --run <id> --file answer.txt"
     )
 }
@@ -2490,6 +2643,10 @@ mod tests {
             "TMUXLET_MEMORY_GUARD",
             "TMUXLET_MEMORY_MIN_FREE",
             "TMUXLET_CLAUDE_PERMISSION_MODE",
+            "TMUXLET_MUSECLI_BIN",
+            "TMUXLET_GWEB_BIN",
+            "muse",
+            "gweb",
         ];
         for needle in required {
             assert!(
@@ -2940,6 +3097,170 @@ mod tests {
         assert!(!cmd.args.iter().any(|a| a == "final prompt"));
         assert!(!cmd.args.iter().any(|a| a == "--"));
         assert!(!cmd.args.iter().any(|a| a == "-p" || a == "--profile"));
+    }
+
+    fn fixed_paths() -> RunPaths {
+        let root = PathBuf::from("/home/u/.tmuxlet/runs/abc");
+        RunPaths {
+            meta: root.join("meta.json"),
+            prompt: root.join("prompt.txt"),
+            answer: root.join("answer.txt"),
+            complete: root.join("complete.txt"),
+            pane_log: root.join("pane.log"),
+            error: root.join("error.txt"),
+            root,
+        }
+    }
+
+    fn chat_argv<'a>(target: &'a str, flags: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec!["--target", target];
+        argv.extend(flags);
+        argv.extend(["-p", "x"]);
+        argv
+    }
+
+    #[test]
+    fn chat_targets_launch_print_mode_with_lock_wait() {
+        for target in ["muse", "musecli", "gweb", "gemini-web"] {
+            let opts = with_grant(parse(&["--target", target, "-p", "x"]));
+            let cmd = target_command(&opts).unwrap();
+            // Only print-mode flags: the contract grant adds nothing, and tmuxlet's
+            // default timeout is not forwarded (the CLI keeps its own).
+            assert_eq!(cmd.args, ["--lock-wait", "1800", "-p", "--quiet"]);
+        }
+    }
+
+    #[test]
+    fn chat_target_aliases_share_a_program() {
+        let program = |t: &str| {
+            target_command(&parse(&["--target", t, "-p", "x"]))
+                .unwrap()
+                .program
+        };
+        assert_eq!(program("muse"), program("musecli"));
+        assert_eq!(program("gweb"), program("gemini-web"));
+        if env::var_os("TMUXLET_MUSECLI_BIN").is_none() {
+            assert_eq!(program("muse"), "musecli");
+        }
+        if env::var_os("TMUXLET_GWEB_BIN").is_none() {
+            assert_eq!(program("gweb"), "gweb");
+        }
+    }
+
+    #[test]
+    fn chat_targets_map_session_controls_to_chat() {
+        for target in ["muse", "gweb"] {
+            for flags in [
+                ["--resume", "c1"],
+                ["--session-id", "c1"],
+                ["--session", "c1"],
+            ] {
+                let argv = chat_argv(target, &flags);
+                let cmd = target_command(&parse(&argv)).unwrap();
+                assert!(has_pair(&cmd.args, "--chat", "c1"), "{argv:?}");
+                assert!(!cmd.args.contains(&"-c".to_string()), "{argv:?}");
+            }
+            for flag in ["--continue", "-c", "--resume"] {
+                let cmd = target_command(&parse(&chat_argv(target, &[flag]))).unwrap();
+                assert!(cmd.args.contains(&"-c".to_string()), "{flag}");
+                assert!(!cmd.args.contains(&"--chat".to_string()), "{flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_targets_forward_explicit_timeout_and_target_args() {
+        let argv = chat_argv("muse", &["--timeout", "90", "--target-arg", "--headed"]);
+        let cmd = target_command(&parse(&argv)).unwrap();
+        assert!(has_pair(&cmd.args, "--lock-wait", "90"));
+        assert!(has_pair(&cmd.args, "--timeout", "90"));
+        assert_eq!(cmd.args.last().map(String::as_str), Some("--headed"));
+    }
+
+    #[test]
+    fn gweb_passes_model_and_muse_rejects_it() {
+        let cmd = target_command(&parse(&chat_argv("gweb", &["-m", "3.8 Flash"]))).unwrap();
+        assert!(has_pair(&cmd.args, "--model", "3.8 Flash"));
+
+        let err = target_command(&parse(&chat_argv("muse", &["-m", "x"]))).unwrap_err();
+        assert!(err.contains("Muse has no model picker"), "{err}");
+    }
+
+    #[test]
+    fn chat_targets_reject_agent_only_flags() {
+        let cases: &[&[&str]] = &[
+            &["--system-prompt", "be terse"],
+            &["--append-system-prompt", "be terse"],
+            &["--add-dir", "/extra"],
+            &["--allowed-tools", "Bash"],
+            &["--disallowed-tools", "Bash"],
+            &["--tools", "Bash"],
+            &["--mcp-config", "m.json"],
+            &["--settings", "s.json"],
+            &["--permission-mode", "auto"],
+            &["--dangerously-skip-permissions"],
+        ];
+        for target in ["muse", "gweb"] {
+            for flags in cases {
+                let argv = chat_argv(target, flags);
+                let err = target_command(&parse(&argv)).unwrap_err();
+                assert!(
+                    err.starts_with(&format!("{target} does not support")),
+                    "{argv:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chat_launch_sends_raw_prompt_file_and_self_completes() {
+        let base = target_command(&parse(&chat_argv("muse", &["--continue"]))).unwrap();
+        let program = base.program.clone();
+        let (launch, paste) = launch_plan(
+            "muse",
+            base,
+            &fixed_paths(),
+            "run-1",
+            "/bin/tmuxlet",
+            "user prompt",
+        );
+        assert!(paste.is_none());
+        // `exec` and `sh` are separate words: the pane's shell is replaced, so the
+        // pane exits with the wrapper and a failed run ends `exited`.
+        assert_eq!(launch.program, "exec");
+        assert_eq!(launch.args[..2], ["sh", "-c"]);
+        assert_eq!(
+            launch.args[2],
+            format!(
+                "r=/home/u/.tmuxlet/runs/abc; {program} --lock-wait 1800 -p --quiet -c \
+--prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" 2> \"$r/stderr.txt\" \
+&& TMUXLET_HOME=\"$r/../..\" /bin/tmuxlet bridge complete --run run-1 --file \"$r/answer.txt\" 2>> \"$r/stderr.txt\" \
+|| {{ cp \"$r/stderr.txt\" \"$r/pane.log\"; exit 1; }}"
+            )
+        );
+        assert!(!launch.args[2].contains("COMPLETION CONTRACT"));
+        assert!(!launch.args[2].contains("user prompt"));
+    }
+
+    #[test]
+    fn agent_launch_wraps_prompt_in_contract() {
+        let contract = "user prompt\n\nTMUXLET COMPLETION CONTRACT:";
+        let base = target_command(&parse(&["-p", "x"])).unwrap();
+        let (launch, paste) =
+            launch_plan("claude", base, &fixed_paths(), "r", "/bin/t", "user prompt");
+        assert!(paste.is_none());
+        assert!(launch.args.last().unwrap().starts_with(contract));
+
+        let base = target_command(&parse(&["--target", "opencode", "-p", "x"])).unwrap();
+        let (_, paste) = launch_plan(
+            "opencode",
+            base,
+            &fixed_paths(),
+            "r",
+            "/bin/t",
+            "user prompt",
+        );
+        assert!(paste.unwrap().starts_with(contract));
     }
 
     #[test]

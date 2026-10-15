@@ -104,6 +104,8 @@ Initial adapters:
 - `cursor` / `cursor-agent`
 - `grok` (xAI Grok Build CLI)
 - `hermes` / `hermes-agent` (Nous Research Hermes Agent CLI)
+- `muse` / `musecli` (Meta Muse via [musecli](https://github.com/truefrontier/muse-cli); a chat backend, see [Chat backends](#chat-backends-muse-gweb))
+- `gweb` / `gemini-web` (Gemini on the web via [gweb](https://github.com/truefrontier/gemini-web-cli); a chat backend)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -139,7 +141,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | Flag / aliases | Value | Default | Purpose |
 | --- | --- | --- | --- |
 | `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
-| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`. |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli`, `gweb` / `gemini-web`. |
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
@@ -158,7 +160,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--mcp-config` | `<path>` (repeatable) | unset | MCP config path pass-through where supported. |
 | `--settings` | `<path>` | unset | Settings file pass-through where supported. |
 | `--target-arg` | `<arg>` (repeatable) | unset | Raw escape hatch appended to the target launch command. |
-| `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. |
+| `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. Chat backends also get it as the CLI's `--timeout` when given explicitly. |
 | `--max-concurrency` | `<n>` | `24` (or `TMUXLET_MAX_CONCURRENCY`) | Machine-wide live-session cap; `0` = unlimited. |
 | `--memory-pressure-guard`, `--memory-guard` | flag | off | Queue launches under host memory pressure (also `TMUXLET_MEMORY_GUARD`). |
 
@@ -218,6 +220,8 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
+| `TMUXLET_MUSECLI_BIN` | `musecli` | Program run for `--target muse`. |
+| `TMUXLET_GWEB_BIN` | `gweb` | Program run for `--target gweb`. |
 
 ## Resuming Target Sessions
 
@@ -251,6 +255,8 @@ Target mappings:
 | `cursor` / `cursor-agent` | `--continue` maps to `cursor-agent resume` | `--resume <id>` or `--session-id <id>` maps to `--resume <id>` | `--session` is not supported for Cursor. |
 | `grok` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to grok's create-new UUID flag (does **not** resume; use `--resume` / `--continue`). |
 | `hermes` / `hermes-agent` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to `--resume <id>` (resume that session; hermes has no create-with-id flag). |
+| `muse` / `musecli` | `--continue` or value-less `--resume` map to `-c` (the CLI's last chat) | `--resume <id>`, `--session <id>`, or `--session-id <id>` map to `--chat <id>` | Chat ids are musecli chat ids; `main` is the main chat. |
+| `gweb` / `gemini-web` | `--continue` or value-less `--resume` map to `-c` (the CLI's last chat) | `--resume <id>`, `--session <id>`, or `--session-id <id>` map to `--chat <id>` | Chat ids are Gemini chat ids. |
 
 When running through Cargo during development, Cargo's build/status lines are
 separate from tmuxlet output:
@@ -277,6 +283,54 @@ TMUXLET COMPLETION CONTRACT:
 The completion contract tells the target CLI to write its final response to
 `answer.txt` and then run `tmuxlet bridge complete`. Other targets currently use
 a paste fallback when tmuxlet cannot safely assume positional prompt support.
+Chat backends (`muse`, `gweb`) never see the contract; see below.
+
+## Chat backends (muse, gweb)
+
+`muse` sends the prompt to Meta Muse through `musecli`, and `gweb` sends it to
+Gemini on the web through `gweb`. They return the answer exactly like any other
+target:
+
+```bash
+tmuxlet -p --target muse "Reply with exactly: pong"
+tmuxlet -p --target gweb -m "3.8 Flash" "Reply with exactly: pong"
+tmuxlet -p --target gweb --resume <chatId> "and again"
+tmuxlet -p --target muse --continue "follow-up"
+```
+
+These are chat CLIs, not coding agents, so they cannot follow the completion
+contract. tmuxlet completes the run itself:
+
+- The raw prompt goes to the CLI through `<run>/prompt.txt`. No contract text is
+  added.
+- The pane runs `exec sh -c '<cli> --lock-wait <timeout> -p --quiet [flags]
+  --prompt-file <run>/prompt.txt --output-file <run>/answer.txt 2> <run>/stderr.txt
+  && tmuxlet bridge complete ... || { cp <run>/stderr.txt <run>/pane.log; exit 1; }'`.
+- On success the run is `completed` and the output is the answer.
+- On failure (not signed in, profile lock busy, the CLI's own timeout) the pane
+  exits, the run ends `exited`, and the output is the CLI's error message.
+- The startup auto-Enter and `blocked` detection are skipped.
+
+Flag mapping:
+
+| tmuxlet flag | `muse` | `gweb` |
+| --- | --- | --- |
+| `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` |
+| `--continue`, value-less `--resume` | `-c` | `-c` |
+| `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
+| `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |
+| `--target-arg <arg>` | passed through | passed through |
+| `--system-prompt`, `--append-system-prompt`, tools flags, `--permission-mode`, `--add-dir`, `--mcp-config`, `--settings`, `--dangerously-skip-permissions` | rejected | rejected |
+
+Each CLI drives one Chrome profile, so runs on the same backend queue on that
+CLI's profile lock. tmuxlet passes `--lock-wait <timeout>` so a queued run waits
+up to its run timeout instead of failing after the CLI's 30s default. The CLI's
+answer timeout starts only after it gets the lock, so a long queue can still end
+in tmuxlet's own `timeout`.
+
+You need `musecli` / `gweb` with print mode (`-p`) on the `PATH` of your login
+shell, already signed in (`musecli login` / `gweb login`). Point
+`TMUXLET_MUSECLI_BIN` / `TMUXLET_GWEB_BIN` at another program to override.
 
 ## Permissions
 
@@ -301,6 +355,7 @@ Each target gets the narrowest grant it supports:
 | `cursor` | `--force` (enables print-mode writes) |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; hermes has no scoped allow/deny tier) |
 | `pi` | none — auto-approves tool use by default |
+| `muse` / `gweb` | none — chat backends run no tools and no completion contract |
 
 Policy: if a target has an auto-classifier (only `claude`'s `auto`), use it **and**
 still pin the exact contract operations with explicit allow-rules rather than
@@ -381,6 +436,7 @@ Runtime files live in:
   complete.txt
   pane.log
   error.txt
+  stderr.txt   # chat backends: the CLI's stderr
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
@@ -418,7 +474,8 @@ Nonzero statuses:
   permission or confirmation prompt.
 - `timeout`: the target did not satisfy the completion contract before
   `--timeout`.
-- `exited`: the tmux session ended before completion.
+- `exited`: the tmux session ended before completion. For chat backends the
+  output is the CLI's error message.
 
 On `blocked` and `timeout`, tmuxlet writes `pane.log` and `error.txt` under the
 run directory for debugging.
