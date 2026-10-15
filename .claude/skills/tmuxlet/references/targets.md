@@ -111,3 +111,5 @@ combinations fail fast with an error naming the flag, so just try it and read
 the error. Model names are target-native (e.g. `sonnet`/`opus` for claude,
 whatever `codex`/`agy` accept natively). `gweb` takes a Gemini model menu name
 (e.g. `-m "3.8 Flash"`); `muse` rejects `-m` (Muse has no model picker).
+`--thinking low|medium|high` (or `l`/`m`/`h`) sets Gemini's Thinking level and
+is `gweb`-only; every other target rejects it.

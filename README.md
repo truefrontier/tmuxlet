@@ -145,6 +145,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
+| `--thinking` | `<level>` | unset | Gemini's Thinking level for `gweb`: `low`, `medium`, `high` (or `l`, `m`, `h`). Other targets reject it. |
 | `-c`, `--continue` | flag | off | Continue the latest target session where supported. Mutually exclusive with `--resume` / `--session` / `--session-id`. |
 | `-r`, `--resume` | optional `[id]` | unset | Resume latest/picker (value-less) or a specific session id where supported. |
 | `--session` | `<id>` | unset | Target-native session selector where supported (e.g. opencode, pi). |
@@ -294,6 +295,7 @@ target:
 ```bash
 tmuxlet -p --target muse "Reply with exactly: pong"
 tmuxlet -p --target gweb -m "3.8 Flash" "Reply with exactly: pong"
+tmuxlet -p --target gweb -m pro --thinking high "Prove it step by step"
 tmuxlet -p --target gweb --resume <chatId> "and again"
 tmuxlet -p --target muse --continue "follow-up"
 ```
@@ -307,7 +309,8 @@ contract. tmuxlet completes the run itself:
   --prompt-file <run>/prompt.txt --output-file <run>/answer.txt 2> <run>/stderr.txt
   && tmuxlet bridge complete ... || { cp <run>/stderr.txt <run>/pane.log; exit 1; }'`.
 - On success the run is `completed` and the output is the answer.
-- On failure (not signed in, profile lock busy, the CLI's own timeout) the pane
+- On failure (not signed in, profile lock busy, the CLI's own timeout, or Gemini
+  answering with its own error message, which `gweb` exits 5 on) the pane
   exits, the run ends `exited`, and the output is the CLI's error message.
 - The startup auto-Enter and `blocked` detection are skipped.
 
@@ -316,6 +319,7 @@ Flag mapping:
 | tmuxlet flag | `muse` | `gweb` |
 | --- | --- | --- |
 | `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` |
+| `--thinking <level>` | rejected | `--thinking <level>` |
 | `--continue`, value-less `--resume` | `-c` | `-c` |
 | `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
 | `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |

@@ -54,6 +54,8 @@ struct Options {
     cwd: PathBuf,
     prompt_parts: Vec<String>,
     model: Option<String>,
+    // gweb only: Gemini's Thinking level (low/medium/high; gweb validates the value).
+    thinking: Option<String>,
     resume: Option<Option<String>>,
     continue_latest: bool,
     session: Option<String>,
@@ -89,6 +91,7 @@ impl Default for Options {
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             prompt_parts: Vec::new(),
             model: None,
+            thinking: None,
             resume: None,
             continue_latest: false,
             session: None,
@@ -250,6 +253,7 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
                 opts.cwd = expand_home(&take_value(args, &mut i, arg)?);
             }
             "-m" | "--model" => opts.model = Some(take_value(args, &mut i, arg)?),
+            "--thinking" => opts.thinking = Some(take_value(args, &mut i, arg)?),
             "-c" | "--continue" => opts.continue_latest = true,
             "-r" | "--resume" => {
                 let value = optional_value(args, &mut i);
@@ -716,6 +720,9 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
     validate_session_controls(opts)?;
 
     let target = opts.target.as_str();
+    if opts.thinking.is_some() && !matches!(target, "gweb" | "gemini-web") {
+        unsupported(target, "--thinking", "only gweb has a thinking level")?;
+    }
     let mut cmd = match target {
         "claude" => claude_command(opts)?,
         "agy" | "gemini" => agy_command(opts)?,
@@ -1238,6 +1245,7 @@ fn muse_command(opts: &Options) -> Result<TargetCommand, String> {
 fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
     let mut cmd = chat_command(opts, "gweb", "TMUXLET_GWEB_BIN", "gweb")?;
     push_opt(&mut cmd.args, "--model", &opts.model);
+    push_opt(&mut cmd.args, "--thinking", &opts.thinking);
     Ok(cmd)
 }
 
@@ -2495,6 +2503,7 @@ Print-mode options:
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
+      --thinking <level>                   gweb Thinking level: low, medium, high (or l, m, h)
   -c, --continue                           Continue latest target session where supported
   -r, --resume [id]                        Resume session (optional id) where supported
       --session <id>                       Target-native session selector where supported
@@ -2591,6 +2600,7 @@ mod tests {
             "--dir",
             "-m",
             "--model",
+            "--thinking",
             "-c",
             "--continue",
             "-r",
@@ -3184,6 +3194,32 @@ mod tests {
 
         let err = target_command(&parse(&chat_argv("muse", &["-m", "x"]))).unwrap_err();
         assert!(err.contains("Muse has no model picker"), "{err}");
+    }
+
+    #[test]
+    fn gweb_passes_thinking_and_other_targets_reject_it() {
+        let cmd = target_command(&parse(&chat_argv(
+            "gweb",
+            &["-m", "pro", "--thinking", "high"],
+        )))
+        .unwrap();
+        assert!(has_pair(&cmd.args, "--model", "pro"));
+        assert!(has_pair(&cmd.args, "--thinking", "high"));
+
+        let cmd = target_command(&parse(&chat_argv("gweb", &[]))).unwrap();
+        assert!(!cmd.args.contains(&"--thinking".to_string()));
+
+        for target in ["muse", "claude", "codex", "agy"] {
+            let argv = chat_argv(target, &["--thinking", "high"]);
+            let err = target_command(&parse(&argv)).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "{target} does not support normalized flag --thinking (only gweb has a thinking level)"
+                ),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]
