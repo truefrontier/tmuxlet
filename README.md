@@ -307,11 +307,19 @@ contract. tmuxlet completes the run itself:
   added.
 - The pane runs `exec sh -c '<cli> --lock-wait <timeout> -p --quiet [flags]
   --prompt-file <run>/prompt.txt --output-file <run>/answer.txt 2> <run>/stderr.txt
-  && tmuxlet bridge complete ... || { cp <run>/stderr.txt <run>/pane.log; exit 1; }'`.
+  && tmuxlet bridge complete ... || { c=$?; cp <run>/stderr.txt <run>/pane.log; printf "%s\n" "$c" > <run>/exit-code.txt; exit "$c"; }'`.
 - On success the run is `completed` and the output is the answer.
 - On failure (not signed in, profile lock busy, the CLI's own timeout, or Gemini
   answering with its own error message, which `gweb` exits 5 on) the pane
   exits, the run ends `exited`, and the output is the CLI's error message.
+- For `gweb` / `gemini-web`, gweb exit **6** becomes tmuxlet exit **6**, with
+  status `rate_limited`. The wrapper forces `GWEB_FORMAT=json` for reliable error
+  capture. stderr contains `{"error":"rate_limited","code":6,"message":<original
+  notice>,"resets_at":<ISO 8601 timestamp or null>}`. `--output-format json` adds
+  the same four fields to the normal run object on stdout. Text mode emits the
+  error on stderr and no answer on stdout. Reset timestamps retain gweb's
+  `America/Chicago` offset. tmuxlet does not retry the prompt. Other backend
+  failures retain status `exited` and tmuxlet exit 1 (including gweb exit 5).
 - The startup auto-Enter and `blocked` detection are skipped.
 
 Flag mapping:

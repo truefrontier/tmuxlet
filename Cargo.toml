@@ -1,9 +1,10 @@
 [package]
 name = "tmuxlet"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "Run interactive coding CLIs through tmux with a claude -p style interface"
 license = "MIT"
 repository = "https://github.com/CodefiLabs/tmuxlet"
 
 [dependencies]
+serde_json = "1"

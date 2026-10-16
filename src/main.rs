@@ -191,7 +191,7 @@ struct TargetCommand {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("tmuxlet: {err}");
             ExitCode::from(1)
@@ -199,11 +199,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<u8, String> {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         print_help();
-        return Ok(());
+        return Ok(0);
     }
 
     match args[0].as_str() {
@@ -228,6 +228,10 @@ fn run() -> Result<(), String> {
             let opts = parse_options(&mut args)?;
             if opts.print {
                 let result = run_print(opts)?;
+                if result.status == "rate_limited" {
+                    emit_result(&result)?;
+                    return Ok(6);
+                }
                 emit_result(&result)?;
             } else {
                 return Err("tmuxlet currently supports print mode only; pass -p/--print".into());
@@ -235,6 +239,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
     }
+    .map(|_| 0)
 }
 
 fn parse_options(args: &mut [String]) -> Result<Options, String> {
@@ -610,10 +615,11 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 continue;
             }
             let pane = fs::read_to_string(&paths.pane_log).unwrap_or_default();
+            let status = chat_failure_status(&opts.target, &paths.root).into();
             return Ok(RunResult {
                 id: run_id,
                 target: opts.target,
-                status: "exited".into(),
+                status,
                 output: pane,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
@@ -639,7 +645,16 @@ fn launch_plan(
     prompt: &str,
 ) -> (TargetCommand, Option<String>) {
     if is_chat_target(target) {
-        return (chat_launch_command(&base, paths, run_id, exe), None);
+        return (
+            chat_launch_command(
+                &base,
+                paths,
+                run_id,
+                exe,
+                matches!(target, "gweb" | "gemini-web"),
+            ),
+            None,
+        );
     }
     let instruction = completion_prompt(prompt, run_id, &paths.answer);
     let (command, prompt_in_launch) = command_with_prompt(base, target, &instruction);
@@ -665,13 +680,15 @@ fn chat_launch_command(
     paths: &RunPaths,
     run_id: &str,
     exe: &str,
+    gweb: bool,
 ) -> TargetCommand {
     let mut cli_line = vec![shell_quote(&cli.program)];
     cli_line.extend(cli.args.iter().map(|arg| shell_quote(arg)));
     let script = format!(
-        "r={root}; {cli} --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" \
+        "r={root}; {env}{cli} --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" \
 2> \"$r/stderr.txt\" && TMUXLET_HOME=\"$r/../..\" {exe} bridge complete --run {run} --file \"$r/answer.txt\" \
-2>> \"$r/stderr.txt\" || {{ cp \"$r/stderr.txt\" \"$r/pane.log\"; exit 1; }}",
+2>> \"$r/stderr.txt\" || {{ c=$?; cp \"$r/stderr.txt\" \"$r/pane.log\"; printf '%s\\n' \"$c\" > \"$r/exit-code.txt\"; exit \"$c\"; }}",
+        env = if gweb { "GWEB_FORMAT=json " } else { "" },
         root = shell_quote(&paths.root.display().to_string()),
         cli = cli_line.join(" "),
         exe = shell_quote(exe),
@@ -681,6 +698,34 @@ fn chat_launch_command(
         program: "exec".into(),
         args: vec!["sh".into(), "-c".into(), script],
     }
+}
+
+fn chat_failure_status(target: &str, root: &Path) -> &'static str {
+    if matches!(target, "gweb" | "gemini-web")
+        && fs::read_to_string(root.join("exit-code.txt"))
+            .unwrap_or_default()
+            .trim()
+            == "6"
+    {
+        "rate_limited"
+    } else {
+        "exited"
+    }
+}
+
+// gweb stderr is forced to JSON in the wrapper; preserve its original message
+// and timezone-aware reset timestamp, including null when no time was supplied.
+fn rate_limit_error(result: &RunResult) -> serde_json::Value {
+    let payload = result.output.lines().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .filter(|v| v["error"] == "rate_limited" && v["code"] == 6 && v["message"].is_string())
+    });
+    let payload = payload.unwrap_or_else(|| serde_json::json!({"message": result.output.trim()}));
+    serde_json::json!({
+        "error": "rate_limited", "code": 6,
+        "message": payload["message"], "resets_at": payload["resets_at"]
+    })
 }
 
 fn command_with_prompt(
@@ -2307,6 +2352,13 @@ fn tmux_name_from_id(id: &str) -> String {
 }
 
 fn emit_result(result: &RunResult) -> Result<(), String> {
+    if result.status == "rate_limited" {
+        if result.output_format == OutputFormat::Json {
+            println!("{}", result_json(result));
+        }
+        eprintln!("{}", rate_limit_error(result));
+        return Ok(());
+    }
     match result.completion_source.as_str() {
         "explicit" => {}
         _ if result.status == "timeout" => {
@@ -2345,7 +2397,11 @@ fn print_result(result: &RunResult) {
 }
 
 fn result_status_code(status: &str) -> i32 {
-    if status == "completed" { 0 } else { 1 }
+    match status {
+        "completed" => 0,
+        "rate_limited" => 6,
+        _ => 1,
+    }
 }
 
 fn write_meta(
@@ -2373,7 +2429,7 @@ fn write_meta(
 }
 
 fn result_json(result: &RunResult) -> String {
-    format!(
+    let base = format!(
         "{{\"id\":\"{}\",\"target\":\"{}\",\"status\":\"{}\",\"output\":\"{}\",\"cwd\":\"{}\",\"tmuxSession\":\"{}\",\"completionSource\":\"{}\",\"elapsedMs\":{}}}",
         json_escape(&result.id),
         json_escape(&result.target),
@@ -2383,7 +2439,16 @@ fn result_json(result: &RunResult) -> String {
         json_escape(&result.tmux_session),
         json_escape(&result.completion_source),
         result.elapsed_ms,
-    )
+    );
+    if result.status == "rate_limited" {
+        let mut value: serde_json::Value = serde_json::from_str(&base).expect("valid result JSON");
+        for (key, field) in rate_limit_error(result).as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        value.to_string()
+    } else {
+        base
+    }
 }
 
 fn json_array(values: &[String]) -> String {
@@ -3271,11 +3336,88 @@ mod tests {
                 "r=/home/u/.tmuxlet/runs/abc; {program} --lock-wait 1800 -p --quiet -c \
 --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" 2> \"$r/stderr.txt\" \
 && TMUXLET_HOME=\"$r/../..\" /bin/tmuxlet bridge complete --run run-1 --file \"$r/answer.txt\" 2>> \"$r/stderr.txt\" \
-|| {{ cp \"$r/stderr.txt\" \"$r/pane.log\"; exit 1; }}"
+|| {{ c=$?; cp \"$r/stderr.txt\" \"$r/pane.log\"; printf '%s\\n' \"$c\" > \"$r/exit-code.txt\"; exit \"$c\"; }}"
             )
         );
         assert!(!launch.args[2].contains("COMPLETION CONTRACT"));
         assert!(!launch.args[2].contains("user prompt"));
+    }
+
+    #[test]
+    fn chat_wrapper_preserves_backend_exit_and_stderr() {
+        for code in [5, 6] {
+            let root = env::temp_dir().join(format!("tmuxlet-quota-{}", make_run_id()));
+            fs::create_dir_all(&root).unwrap();
+            let mut paths = fixed_paths();
+            paths.root = root.clone();
+            let payload = serde_json::json!({
+                "error": "rate_limited", "code": code,
+                "message": "You've reached your limit.\nYour limit resets at 1:53 PM",
+                "resets_at": "2026-10-16T13:53:00-05:00"
+            })
+            .to_string();
+            let cli = TargetCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "test \"$GWEB_FORMAT\" = json || exit 99; printf '%s\\n' {} >&2; exit {code}",
+                        shell_quote(&payload)
+                    ),
+                ],
+            };
+            let launch = chat_launch_command(&cli, &paths, "run", "/must-not-call-bridge", true);
+            let status = Command::new("sh").args(&launch.args[1..]).status().unwrap();
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(
+                fs::read_to_string(root.join("exit-code.txt"))
+                    .unwrap()
+                    .trim(),
+                code.to_string()
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("pane.log")).unwrap().trim(),
+                payload
+            );
+            for target in ["gweb", "gemini-web"] {
+                assert_eq!(
+                    chat_failure_status(target, &root),
+                    if code == 6 { "rate_limited" } else { "exited" }
+                );
+            }
+            assert_eq!(chat_failure_status("muse", &root), "exited");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rate_limit_json_preserves_original_message_and_nullable_reset() {
+        for reset in [
+            serde_json::Value::Null,
+            serde_json::json!("2026-10-16T13:53:00-05:00"),
+        ] {
+            let message = "You've reached your limit.\nReset \"soon\" \u{2014} quota exceeded";
+            let payload = serde_json::json!({"error": "rate_limited", "code": 6, "message": message, "resets_at": reset});
+            let result = RunResult {
+                id: "rate-test".into(),
+                target: "gweb".into(),
+                status: "rate_limited".into(),
+                output: format!("{}\n", payload),
+                output_format: OutputFormat::Json,
+                cwd: PathBuf::from("/tmp"),
+                tmux_session: "test".into(),
+                completion_source: "fallback".into(),
+                elapsed_ms: 1,
+            };
+            assert_eq!(rate_limit_error(&result), payload);
+            let json: serde_json::Value = serde_json::from_str(&result_json(&result)).unwrap();
+            assert_eq!(json["status"], "rate_limited");
+            for key in ["error", "code", "message", "resets_at"] {
+                assert_eq!(json[key], payload[key]);
+            }
+            assert_eq!(result_status_code(&result.status), 6);
+            assert_eq!(result_status_code("exited"), 1);
+        }
     }
 
     #[test]
