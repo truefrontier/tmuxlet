@@ -758,7 +758,10 @@ fn command_with_prompt(
 }
 
 fn target_accepts_prompt_argument(target: &str) -> bool {
-    matches!(target, "claude" | "codex" | "grok")
+    // cursor-agent takes `[prompt...]` positionally. Pasting after launch races
+    // its TUI startup: the paste + Enter land in the tty before raw mode, so the
+    // text shows in the input box but the Enter is lost and the run hangs.
+    matches!(target, "claude" | "codex" | "grok" | "cursor" | "cursor-agent")
 }
 
 fn target_command(opts: &Options) -> Result<TargetCommand, String> {
@@ -1126,6 +1129,9 @@ fn cursor_command(opts: &Options) -> Result<TargetCommand, String> {
     // depending on version; --force is the best single-flag auto-approve available.
     if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
         args.push("--force".into());
+        // Skip the first-run "Workspace Trust Required" modal, which the
+        // startup auto-enter heuristics do not recognize.
+        args.push("--trust".into());
     }
     Ok(TargetCommand {
         program: "cursor-agent".into(),
