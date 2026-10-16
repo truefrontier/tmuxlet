@@ -1122,7 +1122,9 @@ fn cursor_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     push_opt(&mut args, "--resume", &opts.session_id);
     if opts.continue_latest {
-        args.push("resume".into());
+        // `--continue` flag, not the `resume` subcommand: `agent resume` takes
+        // no positional prompt, so `resume -- "<prompt>"` would drop the prompt.
+        args.push("--continue".into());
     }
     // --force lets cursor-agent print mode perform writes (incl. the answer file).
     // The bridge shell call may additionally need a .cursor/cli.json allow entry
@@ -3514,7 +3516,8 @@ mod tests {
     fn cursor_maps_session_controls() {
         let opts = parse(&["--target", "cursor", "--continue", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
-        assert!(cmd.args.contains(&"resume".to_string()));
+        assert!(cmd.args.contains(&"--continue".to_string()));
+        assert!(!cmd.args.contains(&"resume".to_string()));
 
         let opts = parse(&["--target", "cursor", "--session-id", "abc", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();

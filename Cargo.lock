@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "tmuxlet"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "serde_json",
 ]
