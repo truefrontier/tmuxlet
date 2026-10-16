@@ -13,6 +13,9 @@ const DEFAULT_TARGET: &str = "claude";
 const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 const STARTUP_AUTO_ENTER_WINDOW_SECS: u64 = 8;
 const STARTUP_AUTO_ENTER_MAX_ATTEMPTS: usize = 3;
+// How long a codex run is watched for startup dialogs, unless its chat UI shows
+// first. Later stalls fall to the generic blocked-pane check.
+const CODEX_STARTUP_WINDOW_SECS: u64 = 60;
 const EXECUTION_STALL_SECS: u64 = 60;
 const PANE_POLL_SECS: u64 = 1;
 // Concurrency / throttling. The live-session semaphore is a soft cap: the count
@@ -656,6 +659,9 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     let startup_auto_enter_deadline =
         Instant::now() + Duration::from_secs(STARTUP_AUTO_ENTER_WINDOW_SECS);
     let mut startup_enter_attempts = 0usize;
+    let codex = opts.target == "codex";
+    let codex_startup_deadline = Instant::now() + Duration::from_secs(CODEX_STARTUP_WINDOW_SECS);
+    let mut codex_ready = false;
     let mut last_pane = String::new();
     let mut last_pane_changed_at = Instant::now();
     let mut next_pane_poll = Instant::now();
@@ -687,7 +693,21 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         // and blocked heuristics for them.
         if !chat && Instant::now() >= next_pane_poll {
             let pane = capture_pane(&tmux_session, 200).unwrap_or_default();
-            if Instant::now() <= startup_auto_enter_deadline
+            if codex {
+                // Never auto-Enter codex: fail fast on its startup dialogs instead.
+                if !codex_ready && Instant::now() <= codex_startup_deadline {
+                    match codex_startup_state(&pane, &run_id) {
+                        CodexStartup::Pending => {}
+                        CodexStartup::Ready => codex_ready = true,
+                        CodexStartup::Blocked(err) => {
+                            fs::write(&paths.pane_log, &pane).ok();
+                            fs::write(&paths.error, format!("{err}\n")).ok();
+                            kill_session_exact(&tmux_session);
+                            return Err(err);
+                        }
+                    }
+                }
+            } else if Instant::now() <= startup_auto_enter_deadline
                 && startup_enter_attempts < STARTUP_AUTO_ENTER_MAX_ATTEMPTS
                 && is_startup_auto_enter_prompt(&pane)
                 && send_enter(&tmux_session).is_ok()
@@ -1119,6 +1139,31 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
     } else if let Some(value) = &opts.session_id {
         args.extend(["resume".into(), value.clone()]);
     }
+    // A headless run can't answer codex's startup screens, so skip the shared
+    // background server (and its version-mismatch prompt) and the update check.
+    // `codex resume` accepts both after its own arguments.
+    args.extend([
+        "--no-daemon".into(),
+        "-c".into(),
+        "check_for_update_on_startup=false".into(),
+    ]);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(dir) = codex_trusted_dir(
+        &opts.cwd,
+        home.as_deref(),
+        opts.dangerously_skip_permissions,
+    ) {
+        // Trusts the folder for this invocation only; nothing is saved to
+        // config.toml. The dotted `projects."<path>".trust_level` key breaks on
+        // paths containing dots, so pass an inline table instead.
+        args.extend([
+            "-c".into(),
+            format!(
+                "projects={{{}={{trust_level=\"trusted\"}}}}",
+                toml_string(&dir.display().to_string())
+            ),
+        ]);
+    }
     push_opt(&mut args, "--model", &opts.model);
     args.extend(["--cd".into(), opts.cwd.display().to_string()]);
     for value in &opts.add_dirs {
@@ -1135,8 +1180,8 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
         args.extend([
             "-c".into(),
             format!(
-                "sandbox_workspace_write.writable_roots=[\"{}\"]",
-                grant.run_root.display()
+                "sandbox_workspace_write.writable_roots=[{}]",
+                toml_string(&grant.run_root.display().to_string())
             ),
         ]);
     }
@@ -1144,6 +1189,20 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
         program: "codex".into(),
         args,
     })
+}
+
+/// The folder codex may trust for this run: the canonical cwd, when the caller
+/// passed --force or the cwd sits under ~/Sites. Elsewhere codex's own trust
+/// screen stays in charge (and fails the run fast; see `codex_startup_state`).
+fn codex_trusted_dir(cwd: &Path, home: Option<&Path>, force: bool) -> Option<PathBuf> {
+    let cwd = fs::canonicalize(cwd).ok()?;
+    let sites = home.and_then(|home| fs::canonicalize(home.join("Sites")).ok());
+    (force || sites.is_some_and(|sites| cwd.starts_with(sites))).then_some(cwd)
+}
+
+/// A TOML basic string, for paths spliced into codex `-c` overrides.
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn opencode_command(opts: &Options) -> Result<TargetCommand, String> {
@@ -1723,6 +1782,114 @@ fn is_execution_confirmation_blocker(pane: &str) -> bool {
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodexStartup {
+    Pending,
+    Ready,
+    Blocked(String),
+}
+
+// How lines of codex's chat UI start (lowercased); once one shows, the startup
+// screens are behind it. Matched at line start because dialogs print the cwd.
+const CODEX_CHAT_CHROME: &[&str] = &[
+    ">_ openai codex (v",
+    "› ask codex to do anything",
+    "? for shortcuts",
+    "• working (",
+];
+
+// Text that only appears inside a codex startup dialog. Broader words ("folder
+// access", "update now", "background server") only choose the hint: codex
+// prints "Running without the shared background server" as a plain notice.
+const CODEX_DIALOG_PHRASES: &[&str] = &[
+    "trust this folder?",
+    "run without daemon",
+    "incompatible feature settings",
+    "restart the shared codex background server",
+    "skip until next version",
+];
+
+/// Classify codex's startup from its own screen: the pane below the last line
+/// naming this run. Everything above that line is the shell echo of the launch
+/// command or codex's rendering of the prompt, both of which end in the
+/// completion contract naming the run, so a prompt that quotes a menu is never
+/// mistaken for one. tmuxlet never answers these dialogs: a trust choice is
+/// saved, and the update and daemon menus would upgrade codex or restart the
+/// shared server.
+fn codex_startup_state(pane: &str, run_id: &str) -> CodexStartup {
+    let screen = match pane.rfind(run_id) {
+        Some(i) => pane[i..].split_once('\n').map_or("", |(_, rest)| rest),
+        None => pane,
+    };
+    let text = screen.to_ascii_lowercase();
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.iter().any(|line| {
+        let line = line.to_ascii_lowercase();
+        CODEX_CHAT_CHROME
+            .iter()
+            .any(|chrome| line.starts_with(chrome))
+    }) {
+        return CodexStartup::Ready;
+    }
+    if !contains_any(&text, CODEX_DIALOG_PHRASES) && !is_selection_menu(&lines) {
+        return CodexStartup::Pending;
+    }
+    let hint = if text.contains("trust this folder") || text.contains("folder access") {
+        "pass --force, or run under ~/Sites, so tmuxlet trusts this folder for the run"
+    } else if text.contains("daemon") || text.contains("background server") {
+        "tmuxlet already passes --no-daemon; upgrade the codex CLI to match the background server"
+    } else if text.contains("update") {
+        "tmuxlet already sets check_for_update_on_startup=false; update codex manually"
+    } else {
+        "run codex in this folder once and answer the prompt"
+    };
+    let relevant: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            menu_item(line)
+                || line.contains('?')
+                || contains_any(&line.to_ascii_lowercase(), CODEX_DIALOG_PHRASES)
+        })
+        .collect();
+    let shown = if relevant.is_empty() {
+        &lines
+    } else {
+        &relevant
+    };
+    let shown = shown
+        .iter()
+        .take(4)
+        .map(|line| match line.char_indices().nth(100) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    CodexStartup::Blocked(format!(
+        "codex startup blocked by interactive prompt: {shown}; hint: {hint}"
+    ))
+}
+
+/// A numbered choice list with a selection caret: "› 1. Trust and continue",
+/// "2. Quit". Plain numbered lists have no caret.
+fn is_selection_menu(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.starts_with(['›', '❯']) && menu_item(line))
+        && lines.iter().filter(|line| menu_item(line)).count() >= 2
+}
+
+fn menu_item(line: &str) -> bool {
+    let rest = line.trim_start_matches(['›', '❯']).trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(". ")
 }
 
 fn blocked_error_message(target: &str, run_id: &str, startup_enter_attempts: usize) -> String {
@@ -3068,7 +3235,7 @@ Environment:
 
 Examples:
   tmuxlet -p \"say ready\"
-  tmuxlet --target codex -p --cwd /tmp \"say ready\"
+  tmuxlet --target codex -p --cwd ~/Sites/app \"say ready\"
   printf 'say ready' | tmuxlet -p -
   TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\"
   tmuxlet -p --target muse \"Reply with exactly: pong\"
@@ -3934,6 +4101,156 @@ mod tests {
         let cmd = target_command(&opts).unwrap();
         assert_eq!(cmd.args[0], "resume");
         assert_eq!(cmd.args[1], "abc");
+    }
+
+    #[test]
+    fn codex_always_skips_daemon_and_update_check() {
+        let cmd = target_command(&parse(&["--target", "codex", "-p", "x"])).unwrap();
+        assert_eq!(
+            cmd.args[..3],
+            ["--no-daemon", "-c", "check_for_update_on_startup=false"]
+        );
+
+        let opts = parse(&["--target", "codex", "--continue", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(
+            cmd.args[..5],
+            [
+                "resume",
+                "--last",
+                "--no-daemon",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_trusts_cwd_only_with_force_or_under_sites() {
+        let root = env::temp_dir().join(make_run_id());
+        let home = root.join("home");
+        let app = home.join("Sites/app");
+        let lookalike = home.join("SitesOld/app");
+        let elsewhere = root.join("tmp.d");
+        for dir in [&app, &lookalike, &elsewhere] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let canonical = |dir: &Path| fs::canonicalize(dir).unwrap();
+
+        assert_eq!(
+            codex_trusted_dir(&app, Some(&home), false),
+            Some(canonical(&app))
+        );
+        assert_eq!(codex_trusted_dir(&lookalike, Some(&home), false), None);
+        assert_eq!(codex_trusted_dir(&elsewhere, Some(&home), false), None);
+        assert_eq!(codex_trusted_dir(&elsewhere, None, false), None);
+        assert_eq!(
+            codex_trusted_dir(&elsewhere, Some(&home), true),
+            Some(canonical(&elsewhere))
+        );
+
+        let cwd = elsewhere.display().to_string();
+        let opts = parse(&["--target", "codex", "--force", "--cwd", &cwd, "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        let trust = format!(
+            "projects={{\"{}\"={{trust_level=\"trusted\"}}}}",
+            canonical(&elsewhere).display()
+        );
+        assert!(has_pair(&cmd.args, "-c", &trust), "{:?}", cmd.args);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn toml_string_escapes_backslashes_and_quotes() {
+        assert_eq!(toml_string(r#"/a\b "c".d"#), r#""/a\\b \"c\".d""#);
+        assert_eq!(toml_string("/private/tmp/x"), "\"/private/tmp/x\"");
+    }
+
+    #[test]
+    fn codex_startup_dialogs_block_with_a_hint() {
+        let trust = "\n  Folder access\n  /private/tmp/x\n\n  \
+Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.\n\n\
+› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n";
+        assert_eq!(
+            codex_startup_state(trust, "run-1"),
+            CodexStartup::Blocked(
+                "codex startup blocked by interactive prompt: Trust this folder? Codex can read, \
+edit, and run files here, subject to your permission settings. | › 1. Trust and continue | \
+2. Quit; hint: pass --force, or run under ~/Sites, so tmuxlet trusts this folder for the run"
+                    .into()
+            )
+        );
+
+        // The dialog prints the cwd; chat-UI words inside a path don't count.
+        let odd_cwd = trust.replace("/private/tmp/x", "/tmp/? for shortcuts/context left");
+        assert!(matches!(
+            codex_startup_state(&odd_cwd, "run-1"),
+            CodexStartup::Blocked(_)
+        ));
+
+        let daemon = "  Background server has incompatible feature settings\n\
+  Restart will use these shared feature settings:\n    memories = true\n\n\
+› 1. Restart with these settings\n  2. Run without daemon this time\n";
+        let CodexStartup::Blocked(err) = codex_startup_state(daemon, "run-1") else {
+            panic!("daemon prompt not detected");
+        };
+        assert!(err.contains("Background server has incompatible feature settings"));
+        assert!(err.ends_with("hint: tmuxlet already passes --no-daemon; upgrade the codex CLI to match the background server"));
+
+        let update = "  ✨ Update available! 0.159.3 -> 0.163.0\n\n\
+› 1. Update now (runs `brew upgrade codex`)\n  2. Skip\n  3. Skip until next version\n";
+        let CodexStartup::Blocked(err) = codex_startup_state(update, "run-1") else {
+            panic!("update prompt not detected");
+        };
+        assert!(err.ends_with("update codex manually"), "{err}");
+
+        let unknown = "  Pick a reasoning level\n\n› 1. Low\n  2. High\n";
+        assert_eq!(
+            codex_startup_state(unknown, "run-1"),
+            CodexStartup::Blocked(
+                "codex startup blocked by interactive prompt: › 1. Low | 2. High; \
+hint: run codex in this folder once and answer the prompt"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn codex_startup_ignores_chat_ui_notices_and_quoted_prompts() {
+        let idle = "  >_ OpenAI Codex (v0.159.3)\n\n› Ask Codex to do anything\n\n• pong\n";
+        assert_eq!(codex_startup_state(idle, "run-1"), CodexStartup::Ready);
+        assert_eq!(
+            codex_startup_state("› Ask Codex to do anything\n\n• pong\n", "run-1"),
+            CodexStartup::Ready
+        );
+
+        for pending in [
+            "",
+            "Running without the shared background server: disabled by --no-daemon\n",
+            "Steps:\n1. Build\n2. Test\n",
+        ] {
+            assert_eq!(
+                codex_startup_state(pending, "run-1"),
+                CodexStartup::Pending,
+                "{pending}"
+            );
+        }
+
+        // The shell echo of the launch command (and codex's transcript of the
+        // prompt) ends in the contract naming the run; anything quoted above
+        // that line is prompt text, not a dialog.
+        let echo = "% codex --no-daemon -- 'Folder access\nquote> Trust this folder?\n\
+quote> › 1. Trust and continue\nquote>   2. Quit\nquote> › Ask Codex to do anything\n\
+quote> tmuxlet bridge complete --run run-1 --file /h/.tmuxlet/runs/run-1/answer.txt\n\
+quote> Do not wait for the user after the final response is written.'\n";
+        assert_eq!(codex_startup_state(echo, "run-1"), CodexStartup::Pending);
+        let transcript = "› 1. Trust and continue\n  2. Quit\n  bridge complete --run run-1\n\n\
+• Working (0s • esc to interrupt)\n\n› Ask Codex to do anything\n";
+        assert_eq!(
+            codex_startup_state(transcript, "run-1"),
+            CodexStartup::Ready
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ programmatic interface.
 ```bash
 tmuxlet -p "say ready"
 tmuxlet -p --target claude --output-format json "say ready"
-tmuxlet -p --target codex --cwd /tmp "say ready"
+tmuxlet -p --target codex --cwd ~/Sites/app "say ready"
 printf "say ready" | tmuxlet -p -
 ```
 
@@ -500,7 +500,9 @@ confirmation; automatic reap always leaves those sessions for their owner.
 A successful print-mode run auto-kills its tmux session before returning, but
 the run directory itself is left on disk so callers can inspect `complete.txt`,
 `pane.log`, and the rest. Runs that end in `timeout` or `blocked` leave the
-tmux session alive too, so you can `attach` and investigate. `tmuxlet prune` is
+tmux session alive too, so you can `attach` and investigate. A Codex run stopped
+by a startup dialog is the exception: its session is killed and only the run
+directory remains (see [Codex startup](#codex-startup)). `tmuxlet prune` is
 how those run directories and any leftover sessions get cleaned up.
 
 ## Confirmation Handling
@@ -510,8 +512,33 @@ the user's prompt first and tmuxlet's completion contract after it. By default
 tmuxlet grants scoped permissions for the contract operations (see
 [Permissions](#permissions)), so the completion step itself does not prompt.
 During the startup window, tmuxlet also watches for common confirmation gates and
-sends `Enter` up to three times. This startup check runs during normal print-mode
-polling, so successful runs can return as soon as the completion file appears.
+sends `Enter` up to three times (every target except Codex; see below). This
+startup check runs during normal print-mode polling, so successful runs can
+return as soon as the completion file appears.
+
+### Codex startup
+
+tmuxlet never presses `Enter` for Codex. Its startup menus save a folder-trust
+choice, upgrade Codex, or restart the shared background server, so tmuxlet
+avoids them instead:
+
+- Every Codex launch passes `--no-daemon` (no shared background server, so no
+  version-mismatch prompt) and `-c check_for_update_on_startup=false`.
+- tmuxlet trusts the working folder for that run only when you pass `--force`
+  (or another bypass alias) or the canonical cwd is under `~/Sites`. It passes
+  `-c 'projects={"<canonical cwd>"={trust_level="trusted"}}'`. Nothing is saved
+  to `~/.codex/config.toml`.
+
+If Codex still stops on a startup dialog before its chat screen appears (the
+folder-trust screen elsewhere, or any other numbered menu), tmuxlet kills the
+run's tmux session and exits 1 within a few seconds instead of waiting for
+`--timeout`:
+
+```text
+tmuxlet: codex startup blocked by interactive prompt: Trust this folder? ... | › 1. Trust and continue | 2. Quit; hint: pass --force, or run under ~/Sites, so tmuxlet trusts this folder for the run
+```
+
+The run directory keeps `pane.log` and `error.txt`.
 
 If a run stalls later on a permission or confirmation prompt outside the default
 grant, tmuxlet returns a nonzero `blocked` status with the captured pane output.
