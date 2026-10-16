@@ -80,6 +80,8 @@ struct Options {
     max_concurrency: Option<usize>,
     // Opt-in host-memory backpressure (also enabled by TMUXLET_MEMORY_GUARD).
     memory_guard: bool,
+    owner: Option<String>,
+    reap_min_age: Option<u64>,
 }
 
 impl Default for Options {
@@ -112,6 +114,8 @@ impl Default for Options {
             timeout_explicit: false,
             max_concurrency: None,
             memory_guard: false,
+            owner: None,
+            reap_min_age: None,
         }
     }
 }
@@ -242,6 +246,128 @@ fn run() -> Result<u8, String> {
     .map(|_| 0)
 }
 
+// Keep identity based on the caller's cwd, even when a run uses --cwd elsewhere.
+fn pick_owner(cli: Option<&str>, environment: Option<&str>, fallback: &str) -> String {
+    cli.or(environment).unwrap_or(fallback).to_string()
+}
+
+fn caller_owner(cli: Option<&str>) -> String {
+    let environment = env::var("TMUXLET_OWNER").ok();
+    if cli.is_some() || environment.is_some() {
+        return pick_owner(cli, environment.as_deref(), "");
+    }
+    let parent = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let name = parent
+        .and_then(|pid| {
+            Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid])
+                .output()
+                .ok()
+        })
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-process".into());
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    pick_owner(
+        cli,
+        environment.as_deref(),
+        &format!("{name}@{}", cwd.display()),
+    )
+}
+
+fn is_foreign(recorded: Option<&str>, caller: &str, force: bool) -> bool {
+    !force && recorded.is_some_and(|owner| owner != caller)
+}
+
+fn read_meta(id: &str) -> Result<serde_json::Value, String> {
+    let paths = run_paths(id.strip_prefix("tmuxlet-").unwrap_or(id))?;
+    match fs::read_to_string(paths.meta) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("cannot read metadata for run {id}: {e}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(e) => Err(format!("cannot read metadata for run {id}: {e}")),
+    }
+}
+
+fn check_owner(id: &str, caller: &str, force: bool) -> Result<(), String> {
+    let meta = read_meta(id)?;
+    let owner = meta["owner"].as_str();
+    if is_foreign(owner, caller, force) {
+        return Err(format!(
+            "run {id} belongs to owner {:?}; caller is {caller:?}; use --force-foreign to override",
+            owner.unwrap()
+        ));
+    }
+    if owner.is_none() {
+        eprintln!("tmuxlet: warning: run {id} has unknown owner (legacy run); allowing access");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ManagementAccess {
+    owner: String,
+    force_foreign: bool,
+}
+
+// -- ends flag parsing, so send messages can contain literal management flags.
+fn management_args(args: &[String]) -> Result<(Vec<String>, ManagementAccess), String> {
+    let mut rest = Vec::new();
+    let mut owner = None;
+    let mut force_foreign = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--owner" => owner = Some(take_value(args, &mut i, "--owner")?),
+            "--force-foreign" => force_foreign = true,
+            "--" => {
+                rest.extend_from_slice(&args[i..]);
+                break;
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    Ok((
+        rest,
+        ManagementAccess {
+            owner: caller_owner(owner.as_deref()),
+            force_foreign,
+        },
+    ))
+}
+
+fn parse_minutes(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|n| n.checked_mul(60).is_some())
+        .ok_or_else(|| "reap minimum age must be a non-negative integer number of minutes".into())
+}
+
+fn pick_reap_min_age(cli: Option<u64>, environment: Option<&str>) -> Result<u64, String> {
+    let minutes = match cli {
+        Some(n) => n,
+        None => match environment {
+            Some(value) => parse_minutes(value)?,
+            None => 10,
+        },
+    };
+    minutes
+        .checked_mul(60)
+        .ok_or_else(|| "reap minimum age is too large".into())
+}
+
+fn resolve_reap_min_age(cli: Option<u64>) -> Result<u64, String> {
+    pick_reap_min_age(cli, env::var("TMUXLET_REAP_MIN_AGE_MIN").ok().as_deref())
+}
+
 fn parse_options(args: &mut [String]) -> Result<Options, String> {
     let mut opts = Options::default();
     let mut i = 0;
@@ -250,6 +376,10 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
         let arg = &args[i];
         match arg.as_str() {
             "-p" | "--print" => opts.print = true,
+            "--owner" => opts.owner = Some(take_value(args, &mut i, arg)?),
+            "--reap-min-age" => {
+                opts.reap_min_age = Some(parse_minutes(&take_value(args, &mut i, arg)?)?);
+            }
             "--target" => opts.target = take_value(args, &mut i, arg)?,
             "--output-format" => {
                 opts.output_format = OutputFormat::parse(&take_value(args, &mut i, arg)?)?;
@@ -478,6 +608,8 @@ fn prompt_from(opts: &Options) -> Result<String, String> {
 }
 
 fn run_print(mut opts: Options) -> Result<RunResult, String> {
+    let _ = resolve_reap_min_age(opts.reap_min_age)?;
+    opts.owner = Some(caller_owner(opts.owner.as_deref()));
     ensure_tmux()?;
     let started = Instant::now();
     let run_id = make_run_id();
@@ -761,7 +893,10 @@ fn target_accepts_prompt_argument(target: &str) -> bool {
     // cursor-agent takes `[prompt...]` positionally. Pasting after launch races
     // its TUI startup: the paste + Enter land in the tty before raw mode, so the
     // text shows in the input box but the Enter is lost and the run hangs.
-    matches!(target, "claude" | "codex" | "grok" | "cursor" | "cursor-agent")
+    matches!(
+        target,
+        "claude" | "codex" | "grok" | "cursor" | "cursor-agent"
+    )
 }
 
 fn target_command(opts: &Options) -> Result<TargetCommand, String> {
@@ -1533,27 +1668,57 @@ fn is_startup_auto_enter_prompt(pane: &str) -> bool {
 }
 
 fn is_execution_confirmation_blocker(pane: &str) -> bool {
-    let text = confirmation_scan_text(pane);
-    contains_any(
-        &text,
-        &[
-            "yes/no",
-            "[y/n]",
-            "(y/n)",
-            "allow",
-            "approve",
-            "proceed",
-            "permission",
-            "confirm",
-            "do you want to continue",
-            "continue?",
-            "requires approval",
-            "waiting for approval",
-            "press enter",
-            "press return",
-            "enter to continue",
-        ],
-    )
+    // Inspect only the current prompt area, not old tools, code, or launch flags.
+    pane.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(15)
+        .any(|line| {
+            let text = line.trim().to_ascii_lowercase();
+            contains_any(
+                &text,
+                &[
+                    "[y/n]",
+                    "[y/n/",
+                    "(y/n)",
+                    "yes/no",
+                    "do you trust the files in this folder",
+                    "do you trust this",
+                    "trust this workspace",
+                    "trust this folder",
+                ],
+            ) || (text.contains('?')
+                && contains_any(
+                    &text,
+                    &[
+                        "allow ",
+                        "approve",
+                        "proceed",
+                        "continue?",
+                        "confirm ",
+                        "do you want",
+                    ],
+                ))
+                || contains_any(
+                    &text,
+                    &[
+                        "press enter to continue",
+                        "press return to continue",
+                        "waiting for approval",
+                    ],
+                )
+                || (contains_any(&text, &["1.", "1)", "❯", "›", "> "])
+                    && contains_any(
+                        &text,
+                        &[
+                            "yes, proceed",
+                            "yes, allow",
+                            "yes, approve",
+                            "approve once",
+                            "allow once",
+                        ],
+                    ))
+        })
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -1917,12 +2082,14 @@ fn acquire_run_slot(opts: &Options) -> Result<(), String> {
             announced = true;
         }
 
-        // Self-heal: one reap pass after the grace window so a fully-leaked
-        // machine recovers without a manual `tmuxlet reap`. Only blocked, aged
-        // sessions are killed (same safety as the standalone reaper).
+        // Self-heal once: only owned runs old enough to qualify whose panes
+        // remain unchanged; permission/trust prompts are always spared.
         if cap_block && !self_reaped && start.elapsed() >= Duration::from_secs(REAP_GRACE_SECS) {
             self_reaped = true;
-            let killed = reap_run_sessions(&ReapCriteria::default());
+            let killed = auto_reap_sessions(
+                &caller_owner(opts.owner.as_deref()),
+                resolve_reap_min_age(opts.reap_min_age)?,
+            )?;
             if killed > 0 {
                 eprintln!("tmuxlet: reaped {killed} stuck session(s)");
                 continue;
@@ -1985,43 +2152,221 @@ fn reap_decision(
     }
 }
 
-/// Age of a run from its run-dir mtime (proxy for last activity). None if absent.
-fn run_age_secs(id: &str) -> Option<u64> {
-    let dir = state_dir().join("runs").join(id);
-    let modified = fs::metadata(&dir).ok()?.modified().ok()?;
+fn epoch_secs() -> u64 {
     SystemTime::now()
-        .duration_since(modified)
-        .ok()
-        .map(|d| d.as_secs())
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-/// Inspect every live run session and select reap targets per criteria.
-fn select_reap_targets(criteria: &ReapCriteria) -> Vec<ReapTarget> {
+// Legacy runs use metadata creation time, never directory mtime (which changes
+// when output files are written). Unknown age is always spared by auto-reap.
+fn run_age_secs(id: &str) -> Option<u64> {
+    let meta = read_meta(id).ok()?;
+    let started = meta["startedAt"].as_u64().or_else(|| {
+        fs::metadata(run_paths(id).ok()?.meta)
+            .ok()?
+            .created()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    })?;
+    epoch_secs().checked_sub(started)
+}
+
+fn auto_reap_decision(
+    age: Option<u64>,
+    min_age: u64,
+    prompt: bool,
+    unchanged: bool,
+) -> Result<&'static str, &'static str> {
+    if prompt {
+        return Err("waiting on permission/trust prompt");
+    }
+    if age.is_none_or(|age| age < min_age) {
+        return Err("younger than minimum age or unknown start time");
+    }
+    if !unchanged {
+        return Err("pane changed or could not be captured");
+    }
+    Ok("old with unchanged pane")
+}
+
+fn iso_timestamp(epoch: u64) -> String {
+    // Gregorian civil date from days since 1970-01-01, in UTC.
+    let days = (epoch / 86400) as i64 + 719468;
+    let era = days / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let seconds = epoch % 86400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn reap_log_line(
+    timestamp: u64,
+    action: &str,
+    target: &ReapTarget,
+    meta: &serde_json::Value,
+    reason: &str,
+) -> String {
+    // JSON lines escape cwd/owner/reason so each event occupies exactly one line.
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "timestamp": iso_timestamp(timestamp), "action": action, "run": target.id,
+            "owner": meta["owner"].as_str().unwrap_or("unknown owner"),
+            "cwd": meta["cwd"].as_str().unwrap_or("unknown"),
+            "target": meta["target"].as_str().unwrap_or("unknown"),
+            "age": target.age_secs, "reason": reason,
+        })
+    )
+}
+
+fn log_reap(action: &str, target: &ReapTarget, reason: &str) -> Result<(), String> {
+    let meta = read_meta(&target.id).unwrap_or_else(|_| serde_json::json!({}));
+    fs::create_dir_all(state_dir())
+        .map_err(|e| format!("cannot create reap log directory: {e}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir().join("reap.log"))
+        .map_err(|e| format!("cannot open reap.log: {e}"))?;
+    file.write_all(reap_log_line(epoch_secs(), action, target, &meta, reason).as_bytes())
+        .map_err(|e| format!("cannot write reap.log: {e}"))
+}
+
+fn select_reap_targets(
+    criteria: &ReapCriteria,
+    access: &ManagementAccess,
+) -> Result<Vec<ReapTarget>, String> {
     let mut targets = Vec::new();
+    let mut refusals = Vec::new();
     for session in list_run_sessions() {
         let id = session
             .strip_prefix("tmuxlet-")
             .unwrap_or(&session)
             .to_string();
-        let age = run_age_secs(&id);
-        // Only inspect the pane when blocked-state can change the outcome.
-        let blocked = if criteria.blocked || criteria.older_than.is_none() {
-            let pane = capture_pane(&session, 200).unwrap_or_default();
-            is_execution_confirmation_blocker(&pane)
-        } else {
-            false
+        let mut target = ReapTarget {
+            age_secs: run_age_secs(&id),
+            id,
+            session,
+            reason: "",
         };
-        if let Some(reason) = reap_decision(blocked, age, criteria, REAP_GRACE_SECS) {
-            targets.push(ReapTarget {
-                id,
-                session,
-                reason,
-                age_secs: age,
-            });
+        let pane = match capture_pane(&target.session, 200) {
+            Ok(pane) => pane,
+            Err(e) => {
+                log_reap("skipped", &target, &format!("cannot capture pane: {e}"))?;
+                continue;
+            }
+        };
+        match reap_decision(
+            is_execution_confirmation_blocker(&pane),
+            target.age_secs,
+            criteria,
+            REAP_GRACE_SECS,
+        ) {
+            Some(reason) => {
+                if let Err(e) = check_owner(&target.id, &access.owner, access.force_foreign) {
+                    eprintln!("tmuxlet: skipped: {e}");
+                    log_reap("skipped", &target, &e)?;
+                    refusals.push(e);
+                    continue;
+                }
+                target.reason = reason;
+                targets.push(target);
+            }
+            None => log_reap("skipped", &target, "does not match manual reap criteria")?,
         }
     }
+    if !refusals.is_empty() {
+        for target in &targets {
+            log_reap(
+                "skipped",
+                target,
+                "manual reap refused due to foreign or unreadable runs",
+            )?;
+        }
+        return Err(refusals.join("; "));
+    }
     targets.sort_by(|a, b| a.id.cmp(&b.id));
-    targets
+    Ok(targets)
+}
+
+fn auto_reap_sessions(owner: &str, min_age: u64) -> Result<usize, String> {
+    let mut candidates = Vec::new();
+    for session in list_run_sessions() {
+        let id = session
+            .strip_prefix("tmuxlet-")
+            .unwrap_or(&session)
+            .to_string();
+        let target = ReapTarget {
+            age_secs: run_age_secs(&id),
+            id,
+            session,
+            reason: "old with unchanged pane",
+        };
+        if let Err(e) = check_owner(&target.id, owner, false) {
+            log_reap("skipped", &target, &e)?;
+            continue;
+        }
+        let pane = capture_pane(&target.session, 200)
+            .ok()
+            .filter(|pane| !pane.trim().is_empty());
+        let prompt = pane
+            .as_ref()
+            .is_some_and(|p| is_execution_confirmation_blocker(p));
+        if let Err(reason) = auto_reap_decision(target.age_secs, min_age, prompt, pane.is_some()) {
+            log_reap("skipped", &target, reason)?;
+        } else {
+            candidates.push((target, pane.unwrap()));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // One shared observation interval, rather than delaying two seconds per run.
+    thread::sleep(Duration::from_secs(2));
+    let mut killed = 0;
+    for (target, before) in candidates {
+        let after = capture_pane(&target.session, 200)
+            .ok()
+            .filter(|pane| !pane.trim().is_empty());
+        let prompt = after
+            .as_ref()
+            .is_some_and(|p| is_execution_confirmation_blocker(p));
+        let decision = auto_reap_decision(
+            target.age_secs,
+            min_age,
+            prompt,
+            after.as_ref() == Some(&before),
+        );
+        match decision {
+            Ok(_) => {
+                // Recheck ownership at the point of mutation as well.
+                if let Err(e) = check_owner(&target.id, owner, false) {
+                    log_reap("skipped", &target, &e)?;
+                    continue;
+                }
+                if reap_target(&target)? {
+                    killed += 1;
+                }
+            }
+            Err(reason) => log_reap("skipped", &target, reason)?,
+        }
+    }
+    Ok(killed)
 }
 
 fn kill_session_exact(session: &str) -> bool {
@@ -2033,13 +2378,26 @@ fn kill_session_exact(session: &str) -> bool {
     .is_ok()
 }
 
-/// Reap (kill) all sessions matching criteria; returns the count killed. Used by
-/// the acquire self-heal — the standalone `reap` command lists/confirms first.
-fn reap_run_sessions(criteria: &ReapCriteria) -> usize {
-    select_reap_targets(criteria)
-        .iter()
-        .filter(|t| kill_session_exact(&t.session))
-        .count()
+fn reap_target(target: &ReapTarget) -> Result<bool, String> {
+    // Ensure the audit destination can be opened before killing anything.
+    fs::create_dir_all(state_dir())
+        .map_err(|e| format!("cannot create reap log directory: {e}"))?;
+    let _log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir().join("reap.log"))
+        .map_err(|e| format!("cannot open reap.log: {e}"))?;
+    let killed = kill_session_exact(&target.session);
+    log_reap(
+        if killed { "reaped" } else { "skipped" },
+        target,
+        if killed {
+            target.reason
+        } else {
+            "tmux kill failed or session vanished"
+        },
+    )?;
+    Ok(killed)
 }
 
 fn parse_reap_args(args: &[String]) -> Result<(ReapCriteria, bool, bool), String> {
@@ -2069,8 +2427,9 @@ fn parse_reap_args(args: &[String]) -> Result<(ReapCriteria, bool, bool), String
 }
 
 fn handle_reap(args: &[String]) -> Result<(), String> {
-    let (criteria, yes, dry_run) = parse_reap_args(args)?;
-    let targets = select_reap_targets(&criteria);
+    let (args, access) = management_args(args)?;
+    let (criteria, yes, dry_run) = parse_reap_args(&args)?;
+    let targets = select_reap_targets(&criteria, &access)?;
     if targets.is_empty() {
         println!("Nothing to reap.");
         return Ok(());
@@ -2085,6 +2444,9 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
         println!("  {:<10} {:<8} {}", short_id(&t.id), t.reason, age);
     }
     if dry_run {
+        for t in &targets {
+            log_reap("skipped", t, "dry run")?;
+        }
         return Ok(());
     }
     if !yes {
@@ -2095,14 +2457,23 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
             .read_line(&mut response)
             .map_err(|e| format!("failed to read confirmation: {e}"))?;
         if !matches!(response.trim().to_lowercase().as_str(), "y" | "yes") {
+            for t in &targets {
+                log_reap("skipped", t, "confirmation declined")?;
+            }
             println!("Aborted.");
             return Ok(());
         }
     }
-    let killed = targets
-        .iter()
-        .filter(|t| kill_session_exact(&t.session))
-        .count();
+    let mut killed = 0;
+    for t in &targets {
+        if let Err(e) = check_owner(&t.id, &access.owner, access.force_foreign) {
+            log_reap("skipped", t, &e)?;
+            continue;
+        }
+        if reap_target(t)? {
+            killed += 1;
+        }
+    }
     println!("Reaped {killed} session(s).");
     if killed < targets.len() {
         return Err(format!(
@@ -2114,6 +2485,7 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
 }
 
 fn handle_send_all(args: &[String]) -> Result<(), String> {
+    let (args, access) = management_args(args)?;
     let mut interval = Duration::from_secs(SEND_ALL_DEFAULT_INTERVAL_SECS);
     let mut enter = false;
     let mut message_parts: Vec<String> = Vec::new();
@@ -2154,7 +2526,14 @@ fn handle_send_all(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let total = sessions.len();
+    let mut skipped = 0;
     for (idx, session) in sessions.iter().enumerate() {
+        let id = session.strip_prefix("tmuxlet-").unwrap_or(session);
+        if let Err(e) = check_owner(id, &access.owner, access.force_foreign) {
+            eprintln!("tmuxlet: skipped: {e}");
+            skipped += 1;
+            continue;
+        }
         // Pace between sessions — never fire send-keys at every session at once.
         if idx > 0 && !interval.is_zero() {
             thread::sleep(interval);
@@ -2171,6 +2550,7 @@ fn handle_send_all(args: &[String]) -> Result<(), String> {
             Err(e) => eprintln!("  -- {} skipped: {e}", short_id(id)),
         }
     }
+    println!("Skipped {skipped} foreign or unreadable session(s).");
     Ok(())
 }
 fn handle_bridge(args: &[String]) -> Result<(), String> {
@@ -2213,7 +2593,14 @@ fn handle_status() -> Result<(), String> {
         let entry = entry.map_err(|e| format!("failed to read run: {e}"))?;
         let meta = entry.path().join("meta.json");
         if meta.exists() {
-            println!("{}", fs::read_to_string(meta).unwrap_or_default().trim());
+            let text =
+                fs::read_to_string(meta).map_err(|e| format!("failed to read metadata: {e}"))?;
+            let mut value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| format!("invalid metadata: {e}"))?;
+            if value.get("owner").is_none() {
+                value["owner"] = serde_json::json!("unknown owner");
+            }
+            println!("{value}");
         }
     }
     Ok(())
@@ -2242,8 +2629,12 @@ fn handle_read(args: &[String]) -> Result<(), String> {
 }
 
 fn handle_send(args: &[String]) -> Result<(), String> {
+    let (args, access) = management_args(args)?;
     let id = args.first().ok_or("usage: tmuxlet send <id> <message>")?;
-    let message = args.get(1..).unwrap_or_default().join(" ");
+    check_owner(id, &access.owner, access.force_foreign)?;
+    let parts = args.get(1..).unwrap_or_default();
+    let parts = parts.strip_prefix(&["--".to_string()]).unwrap_or(parts);
+    let message = parts.join(" ");
     if message.is_empty() {
         return Err("usage: tmuxlet send <id> <message>".into());
     }
@@ -2264,7 +2655,12 @@ fn handle_attach(args: &[String]) -> Result<(), String> {
 }
 
 fn handle_stop(args: &[String]) -> Result<(), String> {
+    let (args, access) = management_args(args)?;
     let id = args.first().ok_or("usage: tmuxlet stop <id>")?;
+    if args.len() != 1 {
+        return Err("usage: tmuxlet stop <id> [--owner <name>] [--force-foreign]".into());
+    }
+    check_owner(id, &access.owner, access.force_foreign)?;
     let name = tmux_name_from_id(id);
     if tmux_session_exists(&name) {
         run_tmux([
@@ -2289,9 +2685,41 @@ fn handle_stop(args: &[String]) -> Result<(), String> {
 }
 
 fn handle_prune(args: &[String]) -> Result<(), String> {
-    let parsed = parse_prune_args(args)?;
-    let runs = discover_runs();
-    let selected = prune_selection(runs, &parsed.ids)?;
+    let (args, access) = management_args(args)?;
+    let parsed = parse_prune_args(&args)?;
+    let mut runs = Vec::new();
+    let mut skipped_ids = Vec::new();
+    for rec in discover_runs() {
+        if !parsed.ids.is_empty() && !parsed.ids.contains(&rec.id) {
+            runs.push(rec);
+            continue;
+        }
+        match check_owner(&rec.id, &access.owner, access.force_foreign) {
+            Ok(()) => runs.push(rec),
+            Err(e) => {
+                eprintln!("tmuxlet: skipped: {e}");
+                skipped_ids.push(rec.id);
+            }
+        }
+    }
+    if !skipped_ids.is_empty() {
+        println!(
+            "Skipped {} foreign or unreadable run(s).",
+            skipped_ids.len()
+        );
+    }
+    // Explicit foreign ids were already reported; do not turn skips into unknown ids.
+    let ids: Vec<_> = parsed
+        .ids
+        .iter()
+        .filter(|id| !skipped_ids.contains(id))
+        .cloned()
+        .collect();
+    let selected = if !parsed.ids.is_empty() && ids.is_empty() {
+        Vec::new()
+    } else {
+        prune_selection(runs, &ids)?
+    };
 
     if selected.is_empty() {
         println!("Nothing to prune.");
@@ -2432,7 +2860,11 @@ fn write_meta(
             OutputFormat::Json => "json",
         },
     );
-    fs::write(&paths.meta, meta).map_err(|e| format!("failed to write metadata: {e}"))?;
+    let mut meta: serde_json::Value = serde_json::from_str(&meta).expect("valid metadata JSON");
+    meta["owner"] = serde_json::json!(caller_owner(opts.owner.as_deref()));
+    meta["startedAt"] = serde_json::json!(epoch_secs());
+    fs::write(&paths.meta, format!("{meta}\n"))
+        .map_err(|e| format!("failed to write metadata: {e}"))?;
     Ok(())
 }
 
@@ -2593,6 +3025,8 @@ Print-mode options:
       --settings <path>                    Settings file where supported
       --target-arg <arg>                   Raw target CLI escape hatch (repeatable)
       --timeout <seconds>                  Print-mode timeout (default: 1800)
+      --owner <name>                       Run owner (flag > TMUXLET_OWNER > parent-process-name@caller-cwd)
+      --reap-min-age <minutes>             Auto-reap minimum run age (default 10; env TMUXLET_REAP_MIN_AGE_MIN)
       --max-concurrency <n>                Live-session cap (0=unlimited; default 24; env TMUXLET_MAX_CONCURRENCY)
       --memory-pressure-guard, --memory-guard  Queue under host memory pressure (env TMUXLET_MEMORY_GUARD)
   --                                       End options; remaining args are the prompt
@@ -2611,7 +3045,18 @@ Subcommands:
   prune [<id>...] [-y|--yes] [--dry-run]   Delete terminal runs + leftover sessions
   bridge complete --run <id> --file <path> Completion contract (used by target CLI)
 
+Management ownership (send, send-all, stop, prune, reap):
+  --owner <name>                           Caller identity (same precedence as print mode)
+  --force-foreign                          Allow management of another owner's runs
+  Legacy runs without owner are allowed with a warning. send-all and prune skip
+  foreign runs and report a count; send, stop, and manual reap refuse them.
+  status includes owner. Use -- before literal message flags.
+  Auto-reap only kills old, unchanged panes and never permission/trust prompts.
+  All reap actions/skips append JSON lines to <state-dir>/reap.log.
+
 Environment:
+  TMUXLET_OWNER=<name>                     Default caller/run identity
+  TMUXLET_REAP_MIN_AGE_MIN=<minutes>       Auto-reap minimum run age (default 10)
   TMUXLET_HOME=<dir>                       State root (default: ~/.tmuxlet)
   TMUXLET_MAX_CONCURRENCY=<n>              Live-session cap (0=unlimited; default 24)
   TMUXLET_ACQUIRE_TIMEOUT=<seconds>        Max wait for a free slot (0=forever; default 300)
@@ -2698,6 +3143,9 @@ mod tests {
             "--settings",
             "--target-arg",
             "--timeout",
+            "--owner",
+            "--force-foreign",
+            "--reap-min-age",
             "--max-concurrency",
             "--memory-pressure-guard",
             "--memory-guard",
@@ -2720,6 +3168,8 @@ mod tests {
             "bridge complete",
             "--run",
             "--file",
+            "TMUXLET_OWNER",
+            "TMUXLET_REAP_MIN_AGE_MIN",
             "TMUXLET_HOME",
             "TMUXLET_MAX_CONCURRENCY",
             "TMUXLET_ACQUIRE_TIMEOUT",
@@ -4277,5 +4727,174 @@ mod tests {
         assert!(dry);
         assert!(parse_reap_args(&to_vec(&["--older-than", "soon"])).is_err());
         assert!(parse_reap_args(&to_vec(&["--bogus"])).is_err());
+    }
+    #[test]
+    fn owner_precedence_and_foreign_access() {
+        assert_eq!(pick_owner(Some("flag"), Some("env"), "parent@cwd"), "flag");
+        assert_eq!(pick_owner(None, Some("env"), "parent@cwd"), "env");
+        assert_eq!(pick_owner(None, None, "parent@cwd"), "parent@cwd");
+        assert!(!is_foreign(Some("mine"), "mine", false));
+        assert!(is_foreign(Some("theirs"), "mine", false));
+        assert!(!is_foreign(Some("theirs"), "mine", true));
+        assert!(!is_foreign(None, "mine", false)); // legacy runs remain accessible
+    }
+
+    #[test]
+    fn ownership_flags_and_literal_messages_parse() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (rest, access) = management_args(&args(&[
+            "--owner",
+            "worker",
+            "id",
+            "--force-foreign",
+            "hello",
+        ]))
+        .unwrap();
+        assert_eq!(rest, args(&["id", "hello"]));
+        assert_eq!(access.owner, "worker");
+        assert!(access.force_foreign);
+        let (rest, access) = management_args(&args(&[
+            "--owner", "worker", "id", "--", "--owner", "literal",
+        ]))
+        .unwrap();
+        assert_eq!(rest, args(&["id", "--", "--owner", "literal"]));
+        assert!(!access.force_foreign);
+        assert!(management_args(&args(&["--owner"])).is_err());
+        let opts = parse(&["-p", "--owner", "worker", "--reap-min-age", "12", "hello"]);
+        assert_eq!(opts.owner.as_deref(), Some("worker"));
+        assert_eq!(opts.reap_min_age, Some(12));
+    }
+
+    #[test]
+    fn reap_age_configuration_precedence_and_validation() {
+        assert_eq!(pick_reap_min_age(None, None).unwrap(), 600);
+        assert_eq!(pick_reap_min_age(None, Some("3")).unwrap(), 180);
+        assert_eq!(pick_reap_min_age(Some(2), Some("invalid")).unwrap(), 120);
+        assert_eq!(pick_reap_min_age(Some(0), None).unwrap(), 0);
+        for invalid in ["-1", "abc", "1.5", "18446744073709551615"] {
+            assert!(parse_minutes(invalid).is_err());
+            assert!(pick_reap_min_age(None, Some(invalid)).is_err());
+        }
+        assert!(pick_reap_min_age(Some(u64::MAX), None).is_err());
+    }
+
+    #[test]
+    fn auto_reap_requires_known_age_and_stable_pane_and_spares_prompts() {
+        assert_eq!(
+            auto_reap_decision(Some(600), 600, false, true),
+            Ok("old with unchanged pane")
+        );
+        for age in [None, Some(0), Some(599)] {
+            assert!(auto_reap_decision(age, 600, false, true).is_err());
+        }
+        assert!(auto_reap_decision(Some(9999), 600, false, false).is_err());
+        for unchanged in [true, false] {
+            assert_eq!(
+                auto_reap_decision(Some(9999), 600, true, unchanged),
+                Err("waiting on permission/trust prompt")
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_detection_uses_prompt_shapes_and_recent_nonempty_lines() {
+        for prompt in [
+            "Do you trust the files in this folder?",
+            "Allow this command?",
+            "[Y/n]",
+            "1. Yes, proceed (y)",
+            "› Approve once",
+        ] {
+            assert!(is_execution_confirmation_blocker(prompt), "{prompt}");
+        }
+        for ordinary in [
+            "Reading Bash output: allow, confirm, permission",
+            "fn allow_permission() { confirm(); }",
+            "The command requires approval handling in its source.",
+        ] {
+            assert!(!is_execution_confirmation_blocker(ordinary), "{ordinary}");
+        }
+        let recent = format!("Allow this command?\n{}", "working\n\n".repeat(15));
+        assert!(!is_execution_confirmation_blocker(&recent));
+        let recent = format!("{}\nAllow this command?", "working\n".repeat(20));
+        assert!(is_execution_confirmation_blocker(&recent));
+    }
+
+    #[test]
+    fn reap_log_is_one_json_line_with_iso_timestamp_and_context() {
+        let target = ReapTarget {
+            id: "run-1".into(),
+            session: "tmuxlet-run-1".into(),
+            reason: "old",
+            age_secs: Some(600),
+        };
+        let meta =
+            serde_json::json!({"owner": "worker\nname", "cwd": "/tmp/a\nb", "target": "codex"});
+        let line = reap_log_line(
+            0,
+            "skipped",
+            &target,
+            &meta,
+            "waiting on permission/trust prompt",
+        );
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.ends_with('\n'));
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["timestamp"], "1970-01-01T00:00:00Z");
+        assert_eq!(value["action"], "skipped");
+        assert_eq!(value["run"], "run-1");
+        assert_eq!(value["owner"], "worker\nname");
+        assert_eq!(value["cwd"], "/tmp/a\nb");
+        assert_eq!(value["target"], "codex");
+        assert_eq!(value["age"], 600);
+        assert_eq!(value["reason"], "waiting on permission/trust prompt");
+        let legacy: serde_json::Value = serde_json::from_str(&reap_log_line(
+            0,
+            "reaped",
+            &target,
+            &serde_json::json!({}),
+            "old",
+        ))
+        .unwrap();
+        assert_eq!(legacy["owner"], "unknown owner");
+        assert_eq!(iso_timestamp(951782400), "2000-02-29T00:00:00Z");
+        assert_eq!(iso_timestamp(1767225599), "2025-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn metadata_records_owner_and_run_start() {
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+        let paths = RunPaths {
+            root: root.clone(),
+            meta: root.join("meta.json"),
+            prompt: root.join("prompt.txt"),
+            answer: root.join("answer.txt"),
+            complete: root.join("complete.txt"),
+            pane_log: root.join("pane.log"),
+            error: root.join("error.txt"),
+        };
+        let opts = Options {
+            owner: Some("worker".into()),
+            ..Options::default()
+        };
+        let before = epoch_secs();
+        write_meta(
+            &paths,
+            "id",
+            "session",
+            &opts,
+            &TargetCommand {
+                program: "codex".into(),
+                args: vec![],
+            },
+        )
+        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(meta["owner"], "worker");
+        assert!(meta["startedAt"].as_u64().unwrap() >= before);
+        assert!(meta["startedAt"].as_u64().unwrap() <= epoch_secs());
+        fs::remove_dir_all(root).unwrap();
     }
 }

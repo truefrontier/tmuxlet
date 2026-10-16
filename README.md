@@ -131,6 +131,30 @@ Non-print prompt launches are intentionally unsupported; pass `-p` / `--print`
 for runs. Prompt text may be positional args, `-` (read stdin), or empty stdin
 when no prompt args are given. `--` ends option parsing so the rest is prompt.
 
+### Session ownership (0.8.0)
+
+Print-mode runs record `owner` and `startedAt` (Unix epoch seconds) in `meta.json`.
+Identity resolves from `--owner <name>`, then `TMUXLET_OWNER`, then
+`<parent-process-name>@<caller-cwd>`. A print-mode `--cwd` does not change the
+caller identity. Set an explicit owner for automation that launches from different
+parent processes or directories. `tmuxlet status` includes the recorded owner.
+
+`send`, `send-all`, `stop`, `prune`, and manual `reap` accept `--owner <name>`
+and `--force-foreign`. A foreign run is refused with its id and owner; `send-all`
+and `prune` instead skip foreign runs and report the count. Manual `reap` refuses
+the pass if any selected runs are foreign. `--force-foreign` explicitly overrides
+these checks. Legacy runs without an owner remain accessible with a warning
+and appear as `unknown owner` in status. `read` and `attach` remain read/interactive
+inspection commands without an ownership restriction.
+
+```bash
+tmuxlet -p --owner nightly "Run the checks"
+tmuxlet send <id> --owner nightly "Continue"
+tmuxlet send-all --owner nightly --enter
+tmuxlet stop <id> --owner maintenance --force-foreign
+tmuxlet send <id> --owner nightly -- "literal --owner text"
+```
+
 ### Print-mode options
 
 Every flag accepted by `parse_options` (print mode). Unsupported combinations
@@ -162,6 +186,8 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--settings` | `<path>` | unset | Settings file pass-through where supported. |
 | `--target-arg` | `<arg>` (repeatable) | unset | Raw escape hatch appended to the target launch command. |
 | `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. Chat backends also get it as the CLI's `--timeout` when given explicitly. |
+| `--owner` | `<name>` | `TMUXLET_OWNER` or parent-process-name@caller-cwd | Record the run's owner. |
+| `--reap-min-age` | `<minutes>` | `10` (or `TMUXLET_REAP_MIN_AGE_MIN`) | Minimum run age for automatic self-healing; non-negative integer. |
 | `--max-concurrency` | `<n>` | `24` (or `TMUXLET_MAX_CONCURRENCY`) | Machine-wide live-session cap; `0` = unlimited. |
 | `--memory-pressure-guard`, `--memory-guard` | flag | off | Queue launches under host memory pressure (also `TMUXLET_MEMORY_GUARD`). |
 
@@ -202,7 +228,9 @@ to preview and `-y` / `--yes` to skip the confirmation prompt.
 up (see [Concurrency & Throttling](#concurrency--throttling)). With no flags it
 is conservative — only sessions sitting at a confirmation/permission prompt
 **and** older than the 60s grace window. `--blocked` reaps any session at such a
-prompt regardless of age; `--older-than <secs>` reaps by run-dir age. Like
+prompt regardless of age; `--older-than <secs>` reaps by age since run start.
+When both filters are set they are ORed. Age uses `startedAt` or legacy
+`meta.json` creation time, never directory modification time. Like
 `prune`, it lists candidates and asks before killing; pass `-y` / `--yes` for
 cron, `--dry-run` to preview. It only kills sessions — `prune` cleans the dirs.
 
@@ -215,6 +243,8 @@ of a tight loop firing keystrokes at every session simultaneously.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `TMUXLET_OWNER` | parent-process-name@caller-cwd | Default identity for runs and management commands; `--owner` wins. |
+| `TMUXLET_REAP_MIN_AGE_MIN` | `10` | Minimum run age in minutes for automatic reap; `--reap-min-age` wins. |
 | `TMUXLET_HOME` | `~/.tmuxlet` | Root directory for runtime state (`runs/`, etc.). |
 | `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap when `--max-concurrency` is omitted; `0` = unlimited. |
 | `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free concurrency slot; `0` = wait forever. |
@@ -410,10 +440,15 @@ counts what is actually alive, not how many launches a caller has fired.
   tighter value (e.g. `TMUXLET_MAX_CONCURRENCY=4`). Set `0` to disable entirely
   and restore the original unbounded behavior. A single run pays at most one
   cheap `tmux list-sessions` call; with the cap disabled there is zero overhead.
-- **Self-healing.** If a run waits past the grace window while saturated, it runs
-  one conservative reap pass (kills only sessions stuck at a confirmation prompt)
-  so a fully-leaked machine recovers without manual intervention. At the acquire
-  timeout it exits non-zero with `at capacity …; run \`tmuxlet reap\`` rather than
+- **Self-healing.** If a run waits past the 60s grace window while saturated, it
+  runs one conservative reap pass. Only owned sessions at least **10 minutes**
+  old whose panes are unchanged across two captures **2 seconds** apart qualify.
+  `--reap-min-age <minutes>` overrides `TMUXLET_REAP_MIN_AGE_MIN` (default 10).
+  Unknown ages, empty panes, and failed captures are skipped. Permission/trust prompts are
+  always spared, including prompts appearing during the observation interval.
+  Detection checks only the last 15 non-empty lines for prompt-shaped text;
+  ordinary mentions of allow, confirm, or permission are insufficient.
+  At the acquire timeout it exits non-zero with `at capacity …; run \`tmuxlet reap\`` rather than
   hanging forever.
 - **Memory backpressure (opt-in).** `--memory-pressure-guard` /
   `TMUXLET_MEMORY_GUARD` queues launches while host free memory is below
@@ -452,6 +487,15 @@ Runtime files live in:
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
+
+Every automatic/manual reap and every skip appends a JSON line to
+`<state-dir>/reap.log`, including dry runs and declined confirmations. Each line
+records an ISO UTC timestamp, `action` (`reaped` or `skipped`), full run id,
+owner, cwd, target, age in seconds (null if unknown), and reason. Permission
+skips say `waiting on permission/trust prompt`. Foreign and unreadable metadata
+are also logged. Audit-log failures are reported; an unopenable log prevents
+reaping. Manual reap can intentionally kill permission-blocked sessions after
+confirmation; automatic reap always leaves those sessions for their owner.
 
 A successful print-mode run auto-kills its tmux session before returning, but
 the run directory itself is left on disk so callers can inspect `complete.txt`,
