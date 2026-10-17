@@ -170,6 +170,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
 | `--thinking` | `<level>` | unset | Gemini's Thinking level for `gweb`: `low`, `medium`, `high` (or `l`, `m`, `h`). Other targets reject it. |
+| `--image-out` | `<dir\|path>` | unset | `gweb` only: save the reply's images there (gweb `--image-out`; relative paths are taken from `--cwd`). The JSON result gets `images`. Other targets reject it. See [Chat backends](#chat-backends-muse-gweb). |
 | `-c`, `--continue` | flag | off | Continue the latest target session where supported. Mutually exclusive with `--resume` / `--session` / `--session-id`. |
 | `-r`, `--resume` | optional `[id]` | unset | Resume latest/picker (value-less) or a specific session id where supported. |
 | `--session` | `<id>` | unset | Target-native session selector where supported (e.g. opencode, pi). |
@@ -328,6 +329,7 @@ tmuxlet -p --target gweb -m "3.8 Flash" "Reply with exactly: pong"
 tmuxlet -p --target gweb -m pro --thinking high "Prove it step by step"
 tmuxlet -p --target gweb --resume <chatId> "and again"
 tmuxlet -p --target muse --continue "follow-up"
+tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json "a seamless tileable pattern of small blue stars on white"
 ```
 
 These are chat CLIs, not coding agents, so they cannot follow the completion
@@ -351,6 +353,21 @@ contract. tmuxlet completes the run itself:
   `America/Chicago` offset. tmuxlet does not retry the prompt. Other backend
   failures retain status `exited` and tmuxlet exit 1 (including gweb exit 5).
 - The startup auto-Enter and `blocked` detection are skipped.
+- `gweb --image-out <dir|path>` (needs gweb 0.3.0) turns on Gemini's Create image
+  tool and saves the reply's images at full size. tmuxlet forwards it as an
+  absolute path and also passes `--output-format json`, so `answer.txt` holds
+  gweb's JSON result. The run's output is gweb's text form, the answer and then
+  one saved path per line, and `--output-format json` adds gweb's `images` list:
+
+  ```json
+  {"id":"…","target":"gweb","status":"completed","output":"/abs/out/a-seamless-tileable-pattern-of-small-blue-stars-1.png\n",
+   "…":"…","images":[{"path":"/abs/out/a-seamless-tileable-pattern-of-small-blue-stars-1.png","width":2752,"height":1536,
+   "bytes":3098113,"mime":"image/png","source_url_kind":"full_size"}]}
+  ```
+
+  A reply without an image is a gweb exit 5, so the run ends `exited`. Image
+  generation takes minutes, so gweb's own default timeout is 300s with
+  `--image-out`.
 
 Flag mapping:
 
@@ -358,6 +375,7 @@ Flag mapping:
 | --- | --- | --- |
 | `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` |
 | `--thinking <level>` | rejected | `--thinking <level>` |
+| `--image-out <dir\|path>` | rejected | `--image-out <absolute path> --output-format json` |
 | `--continue`, value-less `--resume` | `-c` | `-c` |
 | `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
 | `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |

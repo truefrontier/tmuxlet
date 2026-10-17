@@ -59,6 +59,8 @@ struct Options {
     model: Option<String>,
     // gweb only: Gemini's Thinking level (low/medium/high; gweb validates the value).
     thinking: Option<String>,
+    // gweb only: where gweb saves the reply's images (a directory or a file path).
+    image_out: Option<String>,
     resume: Option<Option<String>>,
     continue_latest: bool,
     session: Option<String>,
@@ -97,6 +99,7 @@ impl Default for Options {
             prompt_parts: Vec::new(),
             model: None,
             thinking: None,
+            image_out: None,
             resume: None,
             continue_latest: false,
             session: None,
@@ -150,6 +153,8 @@ struct RunResult {
     target: String,
     status: String,
     output: String,
+    // gweb --image-out: gweb's list of saved images, passed through to the JSON result.
+    images: Option<serde_json::Value>,
     output_format: OutputFormat,
     cwd: PathBuf,
     tmux_session: String,
@@ -392,6 +397,7 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
             }
             "-m" | "--model" => opts.model = Some(take_value(args, &mut i, arg)?),
             "--thinking" => opts.thinking = Some(take_value(args, &mut i, arg)?),
+            "--image-out" => opts.image_out = Some(take_value(args, &mut i, arg)?),
             "-c" | "--continue" => opts.continue_latest = true,
             "-r" | "--resume" => {
                 let value = optional_value(args, &mut i);
@@ -670,6 +676,11 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         if paths.complete.exists() {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
+            let (output, images) = if chat && opts.image_out.is_some() {
+                gweb_image_result(&output)
+            } else {
+                (output, None)
+            };
             capture_pane_to_file(&tmux_session, &paths.pane_log).ok();
             let _ = run_tmux([
                 OsStr::new("kill-session"),
@@ -681,6 +692,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 target: opts.target,
                 status: "completed".into(),
                 output,
+                images,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -733,6 +745,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     target: opts.target,
                     status: "blocked".into(),
                     output: pane,
+                    images: None,
                     output_format: opts.output_format,
                     cwd: opts.cwd,
                     tmux_session,
@@ -752,6 +765,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 target: opts.target,
                 status: "timeout".into(),
                 output: pane,
+                images: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -773,6 +787,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 target: opts.target,
                 status,
                 output: pane,
+                images: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -925,6 +940,9 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
     let target = opts.target.as_str();
     if opts.thinking.is_some() && !matches!(target, "gweb" | "gemini-web") {
         unsupported(target, "--thinking", "only gweb has a thinking level")?;
+    }
+    if opts.image_out.is_some() && !matches!(target, "gweb" | "gemini-web") {
+        unsupported(target, "--image-out", "only gweb saves images")?;
     }
     let mut cmd = match target {
         "claude" => claude_command(opts)?,
@@ -1493,7 +1511,60 @@ fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
     let mut cmd = chat_command(opts, "gweb", "TMUXLET_GWEB_BIN", "gweb")?;
     push_opt(&mut cmd.args, "--model", &opts.model);
     push_opt(&mut cmd.args, "--thinking", &opts.thinking);
+    if let Some(out) = &opts.image_out {
+        // gweb then writes its JSON result to answer.txt, saved paths included;
+        // gweb_image_result turns it back into the answer text plus `images`.
+        cmd.args.extend([
+            "--image-out".into(),
+            absolute_from(out, &opts.cwd),
+            "--output-format".into(),
+            "json".into(),
+        ]);
+    }
     Ok(cmd)
+}
+
+/// `value` with `~` expanded and a relative path joined to `cwd`. A trailing `/`
+/// (gweb reads it as "a directory") is kept.
+fn absolute_from(value: &str, cwd: &Path) -> String {
+    let path = expand_home(value);
+    let mut text = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+    .display()
+    .to_string();
+    if value.ends_with('/') && !text.ends_with('/') {
+        text.push('/');
+    }
+    text
+}
+
+/// gweb `--image-out` runs complete with gweb's JSON result. The run's output is
+/// gweb's text form (the answer, then one saved path per line) and `images` is its
+/// list of {path, width, height, bytes, mime, source_url_kind}. Output that isn't
+/// that JSON passes through unchanged.
+fn gweb_image_result(output: &str) -> (String, Option<serde_json::Value>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
+        return (output.to_string(), None);
+    };
+    let Some(images) = value.get("images").filter(|v| v.is_array()).cloned() else {
+        return (output.to_string(), None);
+    };
+    let mut lines: Vec<&str> = value["answer"]
+        .as_str()
+        .filter(|answer| !answer.is_empty())
+        .into_iter()
+        .collect();
+    lines.extend(
+        images
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|image| image["path"].as_str()),
+    );
+    (format!("{}\n", lines.join("\n")), Some(images))
 }
 
 fn chat_command(
@@ -3053,6 +3124,8 @@ fn result_json(result: &RunResult) -> String {
             value[key] = field.clone();
         }
         value.to_string()
+    } else if let Some(images) = &result.images {
+        format!("{},\"images\":{images}}}", &base[..base.len() - 1])
     } else {
         base
     }
@@ -3176,6 +3249,7 @@ Print-mode options:
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
       --thinking <level>                   gweb Thinking level: low, medium, high (or l, m, h)
+      --image-out <dir|path>               gweb: save the reply's images there; JSON result gets `images`
   -c, --continue                           Continue latest target session where supported
   -r, --resume [id]                        Resume session (optional id) where supported
       --session <id>                       Target-native session selector where supported
@@ -3240,6 +3314,7 @@ Examples:
   TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\"
   tmuxlet -p --target muse \"Reply with exactly: pong\"
   tmuxlet -p --target gweb -m \"3.8 Flash\" \"Reply with exactly: pong\"
+  tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json \"blue stars\"
   tmuxlet bridge complete --run <id> --file answer.txt"
     )
 }
@@ -3286,6 +3361,7 @@ mod tests {
             "-m",
             "--model",
             "--thinking",
+            "--image-out",
             "-c",
             "--continue",
             "-r",
@@ -3913,6 +3989,107 @@ mod tests {
     }
 
     #[test]
+    fn gweb_forwards_image_out_as_an_absolute_path_with_json_output() {
+        let argv = chat_argv("gweb", &["-C", "/work", "--image-out", "out/"]);
+        let cmd = target_command(&parse(&argv)).unwrap();
+        assert!(
+            has_pair(&cmd.args, "--image-out", "/work/out/"),
+            "{:?}",
+            cmd.args
+        );
+        assert!(has_pair(&cmd.args, "--output-format", "json"));
+
+        let argv = chat_argv(
+            "gemini-web",
+            &["--image-out", "/tmp/gweb-image-test/stars.png"],
+        );
+        let cmd = target_command(&parse(&argv)).unwrap();
+        assert!(has_pair(
+            &cmd.args,
+            "--image-out",
+            "/tmp/gweb-image-test/stars.png"
+        ));
+
+        if let Some(home) = env::var_os("HOME") {
+            let cmd =
+                target_command(&parse(&chat_argv("gweb", &["--image-out", "~/pics"]))).unwrap();
+            let want = PathBuf::from(home).join("pics").display().to_string();
+            assert!(has_pair(&cmd.args, "--image-out", &want));
+        }
+
+        let cmd = target_command(&parse(&chat_argv("gweb", &[]))).unwrap();
+        assert!(!cmd.args.contains(&"--image-out".to_string()));
+        assert!(!cmd.args.contains(&"--output-format".to_string())); // plain runs keep text answers
+    }
+
+    #[test]
+    fn image_out_is_rejected_for_other_targets() {
+        for target in ["muse", "claude", "codex", "agy", "opencode"] {
+            let argv = chat_argv(target, &["--image-out", "/tmp/out"]);
+            let err = target_command(&parse(&argv)).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "{target} does not support normalized flag --image-out (only gweb saves images)"
+                ),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gweb_image_result_turns_gweb_json_into_text_and_images() {
+        let image = serde_json::json!({"path": "/tmp/tm/blue-stars-1.png", "width": 2752, "height": 1536,
+            "bytes": 3098113, "mime": "image/png", "source_url_kind": "full_size"});
+        let gweb = serde_json::json!({"chatId": "16047677facb5f88", "answer": "", "imageCount": 1,
+            "images": [image.clone()]});
+        let (output, images) = gweb_image_result(&format!("{gweb}\n"));
+        assert_eq!(output, "/tmp/tm/blue-stars-1.png\n");
+        assert_eq!(images, Some(serde_json::json!([image])));
+
+        let with_text =
+            serde_json::json!({"answer": "Here you go.", "images": [image.clone(), image]});
+        let (output, _) = gweb_image_result(&with_text.to_string());
+        assert_eq!(
+            output,
+            "Here you go.\n/tmp/tm/blue-stars-1.png\n/tmp/tm/blue-stars-1.png\n"
+        );
+
+        for raw in [
+            "plain answer\n",
+            "{\"answer\": \"no images field\"}",
+            "[1, 2]",
+        ] {
+            assert_eq!(gweb_image_result(raw), (raw.to_string(), None), "{raw}");
+        }
+    }
+
+    #[test]
+    fn result_json_carries_gweb_images() {
+        let images = serde_json::json!([{"path": "/tmp/tm/a-1.png", "width": 2, "height": 1,
+            "bytes": 9, "mime": "image/png", "source_url_kind": "full_size"}]);
+        let mut result = RunResult {
+            id: "img".into(),
+            target: "gweb".into(),
+            status: "completed".into(),
+            output: "/tmp/tm/a-1.png\n".into(),
+            images: Some(images.clone()),
+            output_format: OutputFormat::Json,
+            cwd: PathBuf::from("/tmp"),
+            tmux_session: "tmuxlet-img".into(),
+            completion_source: "explicit".into(),
+            elapsed_ms: 5,
+        };
+        let json: serde_json::Value = serde_json::from_str(&result_json(&result)).unwrap();
+        assert_eq!(json["images"], images);
+        assert_eq!(json["output"], "/tmp/tm/a-1.png\n");
+        assert_eq!(json["status"], "completed");
+        result.images = None;
+        let json: serde_json::Value = serde_json::from_str(&result_json(&result)).unwrap();
+        assert!(json.get("images").is_none());
+    }
+
+    #[test]
     fn chat_targets_reject_agent_only_flags() {
         let cases: &[&[&str]] = &[
             &["--system-prompt", "be terse"],
@@ -4028,6 +4205,7 @@ mod tests {
                 target: "gweb".into(),
                 status: "rate_limited".into(),
                 output: format!("{}\n", payload),
+                images: None,
                 output_format: OutputFormat::Json,
                 cwd: PathBuf::from("/tmp"),
                 tmux_session: "test".into(),
