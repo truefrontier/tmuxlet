@@ -376,10 +376,10 @@ Limits and refusals:
 - The launch line is typed into the pane's shell, sometimes before the shell
   is reading: the tty then keeps only 1024 bytes and drops the rest (macOS), and
   tmux refuses any command over about 16 KiB. So when the line would pass 1000
-  bytes, tmuxlet writes its last argument (the prompt, or a chat backend's
-  wrapper script) to `<run>/launch-arg.txt` and launches with
-  `"$(command cat <run>/launch-arg.txt)"` in its place. Many `--file` paths fit this
-  way, and long prompts no longer fail with "command too long".
+  bytes, tmuxlet writes it to `<run>/launch.sh` and types `. <run>/launch.sh`
+  instead. The pane's own shell runs it, with your aliases and functions, and
+  every argument arrives byte for byte. Many `--file` paths fit this way, and
+  long prompts no longer fail with "command too long".
 
 ```bash
 tmuxlet -p --target gweb --file README.md --file chart.png "Summarize both"
@@ -588,7 +588,7 @@ Runtime files live in:
   pane.log
   error.txt
   stderr.txt   # chat backends: the CLI's stderr
-  launch-arg.txt  # the prompt or wrapper script, when the launch line would pass 1000 bytes
+  launch.sh    # the launch command, when it would pass 1000 bytes typed
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
