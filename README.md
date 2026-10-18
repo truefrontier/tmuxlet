@@ -171,6 +171,9 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
 | `--thinking` | `<level>` | unset | Gemini's Thinking level for `gweb`: `low`, `medium`, `high` (or `l`, `m`, `h`). Other targets reject it. |
 | `--image-out` | `<dir\|path>` | unset | `gweb` only: save the reply's images there (gweb `--image-out`; relative paths are taken from `--cwd`). The JSON result gets `images`. Other targets reject it. See [Chat backends](#chat-backends-muse-gweb). |
+| `--canvas` | flag | off | `gweb` only: turn on Gemini's Canvas tool. The JSON result gets `canvas`. Other targets reject it. |
+| `--canvas-out` | `<path>` | unset | `gweb` only: also write the Canvas doc's markdown to this path (relative paths are taken from `--cwd`; implies `--canvas`). Other targets reject it. |
+| `--file`, `--attach` | `<path>` (repeatable) | unset | Attach a file with the target's own mechanism, or inline it if it's text. Relative paths are taken from `--cwd`. Exit 7 if the target can't take it. See [Attachments](#attachments---file). |
 | `-c`, `--continue` | flag | off | Continue the latest target session where supported. Mutually exclusive with `--resume` / `--session` / `--session-id`. |
 | `-r`, `--resume` | optional `[id]` | unset | Resume latest/picker (value-less) or a specific session id where supported. |
 | `--session` | `<id>` | unset | Target-native session selector where supported (e.g. opencode, pi). |
@@ -317,6 +320,70 @@ The completion contract tells the target CLI to write its final response to
 a paste fallback when tmuxlet cannot safely assume positional prompt support.
 Chat backends (`muse`, `gweb`) never see the contract; see below.
 
+## Attachments (`--file`)
+
+`--file <path>` (alias `--attach`, repeatable) hands a file to the target. Each
+path is resolved against `--cwd`, made absolute (symlinks resolved), and must be
+a regular file. tmuxlet then sniffs its first 8 KiB: PNG, JPEG, GIF, and WebP
+are images, `%PDF-` is a PDF, UTF-8 with no control characters (tab, newlines,
+form feed, and escape are fine) is text, and anything else is binary. All of
+this happens before a run directory or tmux session exists.
+
+Each target gets the file through its own mechanism where it has one, checked
+against the installed CLI's `--help` and docs (2026-10-18):
+
+| Target | Text | Image | PDF | Other binary | Mechanism |
+| --- | --- | --- | --- | --- | --- |
+| `claude` | `@path` | `@path` | `@path` | refused | `@/abs/path` lines under "Attached files:" in the prompt. Claude Code reads `@` mentions into context, and its Read tool takes images and PDFs. There is no local-file flag: `--file` takes Files API ids. |
+| `codex` | inlined | `--image` | refused | refused | `--image <abs path>` launch arguments, before the `--` that ends options, so the variadic `-i` can't swallow the prompt. No flag for other files. |
+| `pi` | `@path` arg | `@path` arg | refused | refused | `@<abs path>` launch arguments: `pi [options] [@files...]` includes "a text file or image in the first prompt". Not live-checked: pi isn't installed here. |
+| `hermes` | `@file:` | refused | refused | refused | `@file:/abs/path` lines in the REPL message, which Hermes expands. Its `--image` exists only on `hermes chat -q`, not the `--cli` REPL tmuxlet drives. |
+| `gweb` | `--file` | `--file` | `--file` | `--file` | `--file <abs path>` per file. gweb enforces Gemini's own limits (10 files per prompt, 100 MB per file, 2 GB per video) and exits 2 past them, so the run ends `exited` with gweb's error. |
+| `cursor` | inlined | refused | refused | refused | No file flag. |
+| `agy` / `gemini` | inlined | refused | refused | refused | No file flag. Its `@` file picker is interactive, so the `--prompt-interactive` launch prompt gets the text inlined. |
+| `opencode` | inlined | refused | refused | refused | `-f/--file` exists only on `opencode run`, not the TUI that tmuxlet drives. |
+| `grok` | inlined | refused | refused | refused | No file flag. Its `@` operator opens an interactive fuzzy picker, so the launch prompt gets the text inlined. |
+| `muse` | inlined | refused | refused | refused | musecli takes text only. |
+
+Inlined files go after your prompt (and before tmuxlet's completion contract), one block each:
+
+```text
+<<<FILE path="/abs/notes.md" bytes=1234>>>
+...the file's text...
+<<<END FILE>>>
+```
+
+`bytes` is the file's exact size, so a reader can find the end even if the text
+contains the closing marker. A newline is added before the marker when the file
+doesn't end with one.
+
+Limits and refusals:
+
+- Inlined text is capped at **256 KiB per file** and **768 KiB in total** (raw
+  bytes; `INLINE_FILE_MAX_BYTES`, `INLINE_TOTAL_MAX_BYTES`). The total stays
+  under macOS's 1 MiB argument limit, because claude, codex, grok, cursor, and
+  agy get the whole prompt as one launch argument. Files sent by mention or flag
+  aren't capped by tmuxlet.
+- `@`-mention paths may hold only letters, digits, and `-_./+,@%~=`. Other text
+  files are inlined instead; other images and PDFs are refused.
+- **Exit 7** (`EXIT_ATTACHMENT_REFUSED`) means a `--file` was refused: a file the
+  target has no native way to take and that isn't text, or inlined text over the
+  caps. The message names the file and the targets that can take it, for example
+  `--file /abs/pic.png: cursor can't take image files: it has no native way to
+  attach one, and only text is inlined (targets that take image files: claude,
+  codex, pi, gweb)`. A missing path or a directory is exit 1, like other bad
+  arguments.
+- tmux refuses commands over about 16 KiB. When the launch line would pass
+  8 KiB, tmuxlet writes the prompt argument to `<run>/launch-prompt.txt` and
+  launches with `"$(cat <run>/launch-prompt.txt)"` in its place. This also fixes
+  long prompts without attachments, which used to fail with "command too long".
+
+```bash
+tmuxlet -p --target gweb --file README.md --file chart.png "Summarize both"
+tmuxlet -p --target codex --file screenshot.png --file notes.md "Fix what the screenshot shows"
+tmuxlet -p --target claude --file src/main.rs "Review this file"
+```
+
 ## Chat backends (muse, gweb)
 
 `muse` sends the prompt to Meta Muse through `musecli`, and `gweb` sends it to
@@ -368,6 +435,19 @@ contract. tmuxlet completes the run itself:
   A reply without an image is a gweb exit 5, so the run ends `exited`. Image
   generation takes minutes, so gweb's own default timeout is 300s with
   `--image-out`.
+- `gweb --canvas` and `--canvas-out <path>` (need gweb 0.4.0) turn on Gemini's
+  Canvas tool and read the reply's Canvas doc. tmuxlet forwards `--canvas-out`
+  as an absolute path (resolved against `--cwd`) and passes `--output-format
+  json`. The run's output is the answer, then the saved path (or the doc's
+  markdown with `--canvas` alone), and `--output-format json` adds gweb's
+  `canvas` object `{title, markdown, chars, path}`. A reply without a Canvas doc
+  is a gweb exit 5, so the run ends `exited`. gweb's default timeout is 300s
+  with `--canvas`.
+
+  ```bash
+  tmuxlet -p --target gweb -m Argon --canvas-out ./scene.md --output-format json "Write a 3-sentence scene into a Canvas doc"
+  ```
+- `--file <path>` becomes gweb `--file <absolute path>`; see [Attachments](#attachments---file).
 
 Flag mapping:
 
@@ -376,6 +456,9 @@ Flag mapping:
 | `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` |
 | `--thinking <level>` | rejected | `--thinking <level>` |
 | `--image-out <dir\|path>` | rejected | `--image-out <absolute path> --output-format json` |
+| `--canvas` | rejected | `--canvas --output-format json` |
+| `--canvas-out <path>` | rejected | `--canvas-out <absolute path> --output-format json` |
+| `--file <path>` | text inlined into `prompt.txt`; other files refused (exit 7) | `--file <absolute path>` |
 | `--continue`, value-less `--resume` | `-c` | `-c` |
 | `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
 | `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |
@@ -502,6 +585,7 @@ Runtime files live in:
   pane.log
   error.txt
   stderr.txt   # chat backends: the CLI's stderr
+  launch-prompt.txt  # only when the launch line would be too long for tmux
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
@@ -577,6 +661,10 @@ Nonzero statuses:
   `--timeout`.
 - `exited`: the tmux session ended before completion. For chat backends the
   output is the CLI's error message.
+
+Exit codes: **0** completed; **1** an error, or a run that ended `blocked`,
+`timeout`, or `exited`; **6** gweb rate limited (`rate_limited`); **7** a
+`--file` the target can't take (see [Attachments](#attachments---file)).
 
 On `blocked` and `timeout`, tmuxlet writes `pane.log` and `error.txt` under the
 run directory for debugging.

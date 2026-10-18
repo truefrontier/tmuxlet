@@ -29,6 +29,21 @@ const ACQUIRE_POLL_MS: u64 = 250;
 const REAP_GRACE_SECS: u64 = EXECUTION_STALL_SECS;
 const SEND_ALL_DEFAULT_INTERVAL_SECS: u64 = 1;
 const DEFAULT_MEMORY_MIN_FREE_PCT: u8 = 15;
+// --file/--attach: text inlined into the prompt is capped in raw bytes. The total stays under macOS's 1 MiB
+// ARG_MAX because claude/codex/grok/cursor/agy get the whole prompt as one launch argument.
+// ponytail: Linux caps one argument at 128 KiB (MAX_ARG_STRLEN); lower INLINE_TOTAL_MAX_BYTES there if needed.
+const INLINE_FILE_MAX_BYTES: u64 = 256 * 1024;
+const INLINE_TOTAL_MAX_BYTES: u64 = 768 * 1024;
+// Bytes read to tell text from images, PDFs, and other binary files.
+const SNIFF_BYTES: u64 = 8 * 1024;
+// Exit code for a --file the target can't take: a non-text file it has no native way to attach, or inlined
+// text over the caps. 1 stays "error or run not completed", 6 "rate limited".
+const EXIT_ATTACHMENT_REFUSED: u8 = 7;
+// Characters an @-mention path may hold; other paths are inlined (text) or refused.
+const MENTION_SAFE: &str = "-_./+,@%~=";
+// tmux refuses a command over ~16 KiB ("command too long"), so a longer launch line reads its last argument
+// (the prompt) from a file in the run dir instead.
+const LAUNCH_LINE_MAX: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputFormat {
@@ -49,6 +64,46 @@ impl OutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Text,
+    Image,
+    Pdf,
+    Binary,
+}
+
+impl FileKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Pdf => "PDF",
+            Self::Binary => "binary",
+        }
+    }
+}
+
+/// How a target gets one --file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// A launch argument: codex `--image`, gweb `--file`, pi `@path`.
+    Flag,
+    /// A reference in the prompt that the target expands: claude `@path`, hermes `@file:path`.
+    Mention,
+    /// The file's text, framed in the prompt.
+    Inline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attachment {
+    // Absolute and canonical.
+    path: String,
+    kind: FileKind,
+    delivery: Delivery,
+    // The file's text, for Delivery::Inline only.
+    text: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Options {
     print: bool,
@@ -61,6 +116,12 @@ struct Options {
     thinking: Option<String>,
     // gweb only: where gweb saves the reply's images (a directory or a file path).
     image_out: Option<String>,
+    // gweb only: turn on Gemini's Canvas tool, and where to save the doc's markdown.
+    canvas: bool,
+    canvas_out: Option<String>,
+    // --file/--attach values as given, and what plan_attachments made of them.
+    files: Vec<String>,
+    attachments: Vec<Attachment>,
     resume: Option<Option<String>>,
     continue_latest: bool,
     session: Option<String>,
@@ -100,6 +161,10 @@ impl Default for Options {
             model: None,
             thinking: None,
             image_out: None,
+            canvas: false,
+            canvas_out: None,
+            files: Vec::new(),
+            attachments: Vec::new(),
             resume: None,
             continue_latest: false,
             session: None,
@@ -155,6 +220,8 @@ struct RunResult {
     output: String,
     // gweb --image-out: gweb's list of saved images, passed through to the JSON result.
     images: Option<serde_json::Value>,
+    // gweb --canvas: gweb's Canvas doc {title, markdown, chars, path}, passed through likewise.
+    canvas: Option<serde_json::Value>,
     output_format: OutputFormat,
     cwd: PathBuf,
     tmux_session: String,
@@ -237,8 +304,17 @@ fn run() -> Result<u8, String> {
         "reap" => handle_reap(&args[1..]),
         "send-all" => handle_send_all(&args[1..]),
         _ => {
-            let opts = parse_options(&mut args)?;
+            let mut opts = parse_options(&mut args)?;
             if opts.print {
+                // Every --file is checked before a run dir or tmux session exists.
+                match plan_attachments(&opts.target, &opts.files, &opts.cwd) {
+                    Ok(planned) => opts.attachments = planned,
+                    Err((code, message)) if code == EXIT_ATTACHMENT_REFUSED => {
+                        eprintln!("tmuxlet: {message}");
+                        return Ok(code);
+                    }
+                    Err((_, message)) => return Err(message),
+                }
                 let result = run_print(opts)?;
                 if result.status == "rate_limited" {
                     emit_result(&result)?;
@@ -398,6 +474,9 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
             "-m" | "--model" => opts.model = Some(take_value(args, &mut i, arg)?),
             "--thinking" => opts.thinking = Some(take_value(args, &mut i, arg)?),
             "--image-out" => opts.image_out = Some(take_value(args, &mut i, arg)?),
+            "--canvas" => opts.canvas = true,
+            "--canvas-out" => opts.canvas_out = Some(take_value(args, &mut i, arg)?),
+            "--file" | "--attach" => opts.files.push(take_value(args, &mut i, arg)?),
             "-c" | "--continue" => opts.continue_latest = true,
             "-r" | "--resume" => {
                 let value = optional_value(args, &mut i);
@@ -635,7 +714,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         exe: tmuxlet_exe(),
     });
 
-    let prompt = prompt_from(&opts)?;
+    let prompt = prompt_with_attachments(&prompt_from(&opts)?, &opts.target, &opts.attachments);
     fs::write(&paths.prompt, &prompt).map_err(|e| format!("failed to write prompt: {e}"))?;
     let base_command = target_command(&opts)?;
     let chat = is_chat_target(&opts.target);
@@ -657,7 +736,8 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         return Err(e);
     }
     start_tmux_session(&tmux_session, &opts.cwd)?;
-    send_launch_command(&tmux_session, &launch_command)?;
+    let line = launch_line(&launch_command, &paths.root.join("launch-prompt.txt"))?;
+    send_launch_command(&tmux_session, &line)?;
     if let Some(text) = paste {
         paste_text(&tmux_session, &text)?;
     }
@@ -676,10 +756,10 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         if paths.complete.exists() {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
-            let (output, images) = if chat && opts.image_out.is_some() {
-                gweb_image_result(&output)
+            let (output, images, canvas) = if chat && gweb_json(&opts) {
+                gweb_result(&output, opts.image_out.is_some(), gweb_canvas(&opts))
             } else {
-                (output, None)
+                (output, None, None)
             };
             capture_pane_to_file(&tmux_session, &paths.pane_log).ok();
             let _ = run_tmux([
@@ -693,6 +773,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 status: "completed".into(),
                 output,
                 images,
+                canvas,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -746,6 +827,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     status: "blocked".into(),
                     output: pane,
                     images: None,
+                    canvas: None,
                     output_format: opts.output_format,
                     cwd: opts.cwd,
                     tmux_session,
@@ -766,6 +848,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 status: "timeout".into(),
                 output: pane,
                 images: None,
+                canvas: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -788,6 +871,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 status,
                 output: pane,
                 images: None,
+                canvas: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -943,6 +1027,14 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     if opts.image_out.is_some() && !matches!(target, "gweb" | "gemini-web") {
         unsupported(target, "--image-out", "only gweb saves images")?;
+    }
+    if !matches!(target, "gweb" | "gemini-web") {
+        if opts.canvas {
+            unsupported(target, "--canvas", "only gweb has Gemini's Canvas")?;
+        }
+        if opts.canvas_out.is_some() {
+            unsupported(target, "--canvas-out", "only gweb has Gemini's Canvas")?;
+        }
     }
     let mut cmd = match target {
         "claude" => claude_command(opts)?,
@@ -1184,6 +1276,9 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     push_opt(&mut args, "--model", &opts.model);
     args.extend(["--cd".into(), opts.cwd.display().to_string()]);
+    for path in flag_files(opts) {
+        args.extend(["--image".into(), path.into()]);
+    }
     for value in &opts.add_dirs {
         args.extend(["--add-dir".into(), value.clone()]);
     }
@@ -1302,6 +1397,8 @@ fn pi_command(opts: &Options) -> Result<TargetCommand, String> {
     }
     // pi auto-approves tool use by default, so the completion contract needs no
     // extra grant — opts.contract_grant requires no injection here.
+    // `pi [options] [@files...]`: each @path joins the first prompt (text or image).
+    args.extend(flag_files(opts).map(|path| format!("@{path}")));
     Ok(TargetCommand {
         program: "pi".into(),
         args,
@@ -1511,17 +1608,225 @@ fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
     let mut cmd = chat_command(opts, "gweb", "TMUXLET_GWEB_BIN", "gweb")?;
     push_opt(&mut cmd.args, "--model", &opts.model);
     push_opt(&mut cmd.args, "--thinking", &opts.thinking);
+    for path in flag_files(opts) {
+        cmd.args.extend(["--file".into(), path.into()]);
+    }
     if let Some(out) = &opts.image_out {
-        // gweb then writes its JSON result to answer.txt, saved paths included;
-        // gweb_image_result turns it back into the answer text plus `images`.
-        cmd.args.extend([
-            "--image-out".into(),
-            absolute_from(out, &opts.cwd),
-            "--output-format".into(),
-            "json".into(),
-        ]);
+        cmd.args
+            .extend(["--image-out".into(), absolute_from(out, &opts.cwd)]);
+    }
+    if let Some(out) = &opts.canvas_out {
+        cmd.args
+            .extend(["--canvas-out".into(), absolute_from(out, &opts.cwd)]);
+    } else if opts.canvas {
+        cmd.args.push("--canvas".into());
+    }
+    if gweb_json(opts) {
+        // gweb then writes its JSON result to answer.txt; gweb_result turns it
+        // back into the text output plus `images` / `canvas`.
+        cmd.args.extend(["--output-format".into(), "json".into()]);
     }
     Ok(cmd)
+}
+
+fn gweb_canvas(opts: &Options) -> bool {
+    opts.canvas || opts.canvas_out.is_some()
+}
+
+/// gweb runs whose JSON result tmuxlet reads back: --image-out and --canvas.
+fn gweb_json(opts: &Options) -> bool {
+    opts.image_out.is_some() || gweb_canvas(opts)
+}
+
+/// The --file paths a target takes as launch arguments.
+fn flag_files(opts: &Options) -> impl Iterator<Item = &str> {
+    opts.attachments
+        .iter()
+        .filter(|a| a.delivery == Delivery::Flag)
+        .map(|a| a.path.as_str())
+}
+
+/// How `target` takes a `kind` of file: its native mechanism, else inlining for
+/// text, else None (refused). Verified from each CLI's --help and docs:
+/// claude expands `@path` mentions (its Read tool takes images and PDFs too);
+/// codex has `-i/--image`; pi takes `@file` launch arguments (text or image);
+/// hermes expands `@file:path` in REPL messages; gweb has `--file` for every
+/// type. cursor-agent and muse have no file input; opencode's `-f` is only on
+/// `opencode run`, not the TUI tmuxlet drives; grok's and agy's `@` file pickers
+/// are interactive, so their launch prompts get text inlined instead.
+fn delivery_for(target: &str, kind: FileKind) -> Option<Delivery> {
+    use FileKind::{Image, Pdf, Text};
+    match (target, kind) {
+        ("gweb" | "gemini-web", _) => Some(Delivery::Flag),
+        ("claude", Text | Image | Pdf) => Some(Delivery::Mention),
+        ("codex", Image) | ("pi", Text | Image) => Some(Delivery::Flag),
+        ("hermes" | "hermes-agent", Text) => Some(Delivery::Mention),
+        (_, Text) => Some(Delivery::Inline),
+        _ => None,
+    }
+}
+
+const ATTACH_TARGETS: &[&str] = &[
+    "claude", "codex", "cursor", "agy", "opencode", "grok", "hermes", "pi", "muse", "gweb",
+];
+
+/// Resolve each --file against `cwd`, classify it, and pick its delivery for
+/// `target`, before anything starts. Err is (exit code, message): 1 for a path
+/// that isn't a regular file, EXIT_ATTACHMENT_REFUSED for a file the target
+/// can't take.
+fn plan_attachments(
+    target: &str,
+    files: &[String],
+    cwd: &Path,
+) -> Result<Vec<Attachment>, (u8, String)> {
+    let mut planned = Vec::new();
+    let mut inlined = 0u64;
+    for value in files {
+        let bad = |e: io::Error| (1, format!("--file {value}: {e}"));
+        let path = fs::canonicalize(absolute_from(value, cwd)).map_err(bad)?;
+        let meta = fs::metadata(&path).map_err(bad)?;
+        if !meta.is_file() {
+            return Err((1, format!("--file {value}: not a regular file")));
+        }
+        let shown = path.display().to_string();
+        let refuse = |why: String| (EXIT_ATTACHMENT_REFUSED, format!("--file {shown}: {why}"));
+        let mut head = Vec::new();
+        fs::File::open(&path)
+            .and_then(|file| file.take(SNIFF_BYTES).read_to_end(&mut head))
+            .map_err(bad)?;
+        let mut kind = file_kind(&head, head.len() as u64 == meta.len());
+        let mut delivery = delivery_for(target, kind);
+        if delivery == Some(Delivery::Mention) && !mention_safe(&shown) {
+            if kind != FileKind::Text {
+                return Err(refuse(format!(
+                    "{target} attaches {} files by @-mention, which can't carry this path; use a path of \
+letters, digits, and {MENTION_SAFE}",
+                    kind.name()
+                )));
+            }
+            delivery = Some(Delivery::Inline);
+        }
+        let mut text = None;
+        if delivery == Some(Delivery::Inline) {
+            let kib = |bytes: u64| bytes.div_ceil(1024);
+            if meta.len() > INLINE_FILE_MAX_BYTES {
+                return Err(refuse(format!(
+                    "{target} gets text files inlined into the prompt, at most {} KiB each; this one is {} KiB",
+                    kib(INLINE_FILE_MAX_BYTES),
+                    kib(meta.len())
+                )));
+            }
+            inlined += meta.len();
+            if inlined > INLINE_TOTAL_MAX_BYTES {
+                return Err(refuse(format!(
+                    "inlined --file text would total {} KiB; the cap is {} KiB",
+                    kib(inlined),
+                    kib(INLINE_TOTAL_MAX_BYTES)
+                )));
+            }
+            match fs::read(&path).map_err(bad)?.try_into() {
+                Ok(content) if is_text(String::as_bytes(&content), true) => text = Some(content),
+                _ => (kind, delivery) = (FileKind::Binary, None), // not text past the sniffed head
+            }
+        }
+        let Some(delivery) = delivery else {
+            let takers: Vec<&str> = ATTACH_TARGETS
+                .iter()
+                .copied()
+                .filter(|t| delivery_for(t, kind).is_some_and(|d| d != Delivery::Inline))
+                .collect();
+            return Err(refuse(format!(
+                "{target} can't take {} files: it has no native way to attach one, and only text is inlined \
+(targets that take {} files: {})",
+                kind.name(),
+                kind.name(),
+                takers.join(", ")
+            )));
+        };
+        planned.push(Attachment {
+            path: shown,
+            kind,
+            delivery,
+            text,
+        });
+    }
+    Ok(planned)
+}
+
+/// Images by magic number (PNG, JPEG, GIF, WebP), PDFs by `%PDF-`, text when
+/// the bytes are UTF-8 without control characters, else binary. `complete` says
+/// `head` is the whole file, so a UTF-8 sequence cut at its end is an error.
+fn file_kind(head: &[u8], complete: bool) -> FileKind {
+    let webp = head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP";
+    if webp
+        || [
+            &b"\x89PNG\r\n\x1a\n"[..],
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+        ]
+        .iter()
+        .any(|magic| head.starts_with(magic))
+    {
+        FileKind::Image
+    } else if head.starts_with(b"%PDF-") {
+        FileKind::Pdf
+    } else if is_text(head, complete) {
+        FileKind::Text
+    } else {
+        FileKind::Binary
+    }
+}
+
+/// UTF-8 with no NUL or other C0 controls besides tab, newlines, form feed, and escape.
+fn is_text(bytes: &[u8], complete: bool) -> bool {
+    let utf8 = match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(e) => !complete && e.error_len().is_none(),
+    };
+    utf8 && !bytes
+        .iter()
+        .any(|b| matches!(b, 0..=8 | 0x0e..=0x1a | 0x1c..=0x1f))
+}
+
+fn mention_safe(path: &str) -> bool {
+    path.chars()
+        .all(|c| c.is_ascii_alphanumeric() || MENTION_SAFE.contains(c))
+}
+
+/// The prompt with its @-mentions and inlined files appended, ahead of any
+/// completion contract. Unchanged when there are none.
+fn prompt_with_attachments(prompt: &str, target: &str, attachments: &[Attachment]) -> String {
+    let mut out = prompt.to_string();
+    let mentions: Vec<String> = attachments
+        .iter()
+        .filter(|a| a.delivery == Delivery::Mention)
+        .map(|a| match target {
+            "hermes" | "hermes-agent" => format!("@file:{}", a.path),
+            _ => format!("@{}", a.path),
+        })
+        .collect();
+    if !mentions.is_empty() {
+        out.push_str("\n\nAttached files:\n");
+        out.push_str(&mentions.join("\n"));
+    }
+    for attachment in attachments {
+        if let Some(text) = &attachment.text {
+            // bytes= is exact, so a reader can find the end even if the text
+            // itself contains the closing marker.
+            let newline = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            out.push_str(&format!(
+                "\n\n<<<FILE path={} bytes={}>>>\n{text}{newline}<<<END FILE>>>",
+                serde_json::Value::from(attachment.path.as_str()),
+                text.len()
+            ));
+        }
+    }
+    out
 }
 
 /// `value` with `~` expanded and a relative path joined to `cwd`. A trailing `/`
@@ -1541,17 +1846,29 @@ fn absolute_from(value: &str, cwd: &Path) -> String {
     text
 }
 
-/// gweb `--image-out` runs complete with gweb's JSON result. The run's output is
-/// gweb's text form (the answer, then one saved path per line) and `images` is its
-/// list of {path, width, height, bytes, mime, source_url_kind}. Output that isn't
-/// that JSON passes through unchanged.
-fn gweb_image_result(output: &str) -> (String, Option<serde_json::Value>) {
+type GwebResult = (String, Option<serde_json::Value>, Option<serde_json::Value>);
+
+/// gweb `--image-out` / `--canvas` runs complete with gweb's JSON result. The
+/// run's output is gweb's text form: the answer, then one saved image path per
+/// line, then the Canvas doc's saved path (or its markdown when unsaved).
+/// `images` is gweb's list of {path, width, height, bytes, mime, source_url_kind}
+/// and `canvas` its {title, markdown, chars, path}, each returned only when
+/// asked for. Output that isn't gweb's JSON passes through unchanged.
+fn gweb_result(output: &str, want_images: bool, want_canvas: bool) -> GwebResult {
+    let unchanged = (output.to_string(), None, None);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
-        return (output.to_string(), None);
+        return unchanged;
     };
-    let Some(images) = value.get("images").filter(|v| v.is_array()).cloned() else {
-        return (output.to_string(), None);
-    };
+    let images = value.get("images").filter(|v| v.is_array()).cloned();
+    let canvas = value.get("canvas").cloned();
+    if !value["answer"].is_string()
+        || (want_images && images.is_none())
+        || (want_canvas && canvas.is_none())
+    {
+        return unchanged;
+    }
+    let images = images.filter(|_| want_images);
+    let canvas = canvas.filter(|_| want_canvas);
     let mut lines: Vec<&str> = value["answer"]
         .as_str()
         .filter(|answer| !answer.is_empty())
@@ -1559,12 +1876,14 @@ fn gweb_image_result(output: &str) -> (String, Option<serde_json::Value>) {
         .collect();
     lines.extend(
         images
-            .as_array()
-            .into_iter()
-            .flatten()
+            .iter()
+            .flat_map(|list| list.as_array().into_iter().flatten())
             .filter_map(|image| image["path"].as_str()),
     );
-    (format!("{}\n", lines.join("\n")), Some(images))
+    if let Some(doc) = canvas.as_ref().filter(|doc| doc.is_object()) {
+        lines.extend(doc["path"].as_str().or(doc["markdown"].as_str()));
+    }
+    (format!("{}\n", lines.join("\n")), images, canvas)
 }
 
 fn chat_command(
@@ -1704,19 +2023,44 @@ fn tmux_pane_target(name: &str) -> String {
     format!("={name}:")
 }
 
-fn send_launch_command(tmux_session: &str, command: &TargetCommand) -> Result<(), String> {
-    let mut parts = Vec::with_capacity(command.args.len() + 1);
-    parts.push(shell_quote(&command.program));
-    for arg in &command.args {
-        parts.push(shell_quote(arg));
-    }
+/// The shell line that starts `command`. Over LAUNCH_LINE_MAX, the last
+/// argument (the prompt, for targets that take it at launch) is written to
+/// `prompt_file` and read back with `"$(cat ...)"`, because tmux refuses longer
+/// commands. The substitution drops trailing newlines, which a prompt doesn't
+/// need; the line still names the run dir, which codex_startup_state relies on.
+fn launch_line(command: &TargetCommand, prompt_file: &Path) -> Result<String, String> {
+    let mut parts: Vec<String> = std::iter::once(&command.program)
+        .chain(&command.args)
+        .map(|arg| shell_quote(arg))
+        .collect();
     let line = parts.join(" ");
+    let Some(last) = command.args.last().filter(|_| line.len() > LAUNCH_LINE_MAX) else {
+        return Ok(line);
+    };
+    fs::write(prompt_file, last).map_err(|e| format!("failed to stage prompt: {e}"))?;
+    parts.pop();
+    parts.push(format!(
+        "\"$(cat {})\"",
+        shell_quote(&prompt_file.display().to_string())
+    ));
+    let line = parts.join(" ");
+    if line.len() > LAUNCH_LINE_MAX {
+        return Err(format!(
+            "the {} launch command is too long for tmux ({} bytes)",
+            command.program,
+            line.len()
+        ));
+    }
+    Ok(line)
+}
+
+fn send_launch_command(tmux_session: &str, line: &str) -> Result<(), String> {
     let target = tmux_pane_target(tmux_session);
     run_tmux([
         OsStr::new("send-keys"),
         OsStr::new("-t"),
         OsStr::new(&target),
-        OsStr::new(&line),
+        OsStr::new(line),
         OsStr::new("Enter"),
     ])
     .map(|_| ())
@@ -3124,10 +3468,16 @@ fn result_json(result: &RunResult) -> String {
             value[key] = field.clone();
         }
         value.to_string()
-    } else if let Some(images) = &result.images {
-        format!("{},\"images\":{images}}}", &base[..base.len() - 1])
     } else {
-        base
+        // Appended as text so the base fields keep their order.
+        let mut extra = String::new();
+        if let Some(images) = &result.images {
+            extra.push_str(&format!(",\"images\":{images}"));
+        }
+        if let Some(canvas) = &result.canvas {
+            extra.push_str(&format!(",\"canvas\":{canvas}"));
+        }
+        format!("{}{extra}}}", &base[..base.len() - 1])
     }
 }
 
@@ -3250,6 +3600,10 @@ Print-mode options:
   -m, --model <model>                      Model pass-through where supported
       --thinking <level>                   gweb Thinking level: low, medium, high (or l, m, h)
       --image-out <dir|path>               gweb: save the reply's images there; JSON result gets `images`
+      --canvas                             gweb: turn on Gemini's Canvas; JSON result gets `canvas`
+      --canvas-out <path>                  gweb: also save the Canvas doc's markdown there (implies --canvas)
+      --file, --attach <path>              Attach a file (repeatable) by the target's native mechanism, else
+                                           inline text (256 KiB each, 768 KiB total); exit 7 if refused
   -c, --continue                           Continue latest target session where supported
   -r, --resume [id]                        Resume session (optional id) where supported
       --session <id>                       Target-native session selector where supported
@@ -3273,6 +3627,9 @@ Print-mode options:
   --                                       End options; remaining args are the prompt
 
 Unsupported target combinations fail fast. See README for per-target mapping.
+
+Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb),
+7 --file refused (a file the target can't take, or inlined text over the caps).
 
 Subcommands:
   status                                   List run meta.json lines
@@ -3315,6 +3672,8 @@ Examples:
   tmuxlet -p --target muse \"Reply with exactly: pong\"
   tmuxlet -p --target gweb -m \"3.8 Flash\" \"Reply with exactly: pong\"
   tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json \"blue stars\"
+  tmuxlet -p --target gweb --file notes.md --file chart.png \"Summarize both\"
+  tmuxlet -p --target gweb --canvas-out ./scene.md --output-format json \"Write a scene in Canvas\"
   tmuxlet bridge complete --run <id> --file answer.txt"
     )
 }
@@ -3362,6 +3721,9 @@ mod tests {
             "--model",
             "--thinking",
             "--image-out",
+            "--canvas",
+            "--canvas-out",
+            "--attach",
             "-c",
             "--continue",
             "-r",
@@ -4043,13 +4405,13 @@ mod tests {
             "bytes": 3098113, "mime": "image/png", "source_url_kind": "full_size"});
         let gweb = serde_json::json!({"chatId": "16047677facb5f88", "answer": "", "imageCount": 1,
             "images": [image.clone()]});
-        let (output, images) = gweb_image_result(&format!("{gweb}\n"));
+        let (output, images, _) = gweb_result(&format!("{gweb}\n"), true, false);
         assert_eq!(output, "/tmp/tm/blue-stars-1.png\n");
         assert_eq!(images, Some(serde_json::json!([image])));
 
         let with_text =
             serde_json::json!({"answer": "Here you go.", "images": [image.clone(), image]});
-        let (output, _) = gweb_image_result(&with_text.to_string());
+        let (output, _, _) = gweb_result(&with_text.to_string(), true, false);
         assert_eq!(
             output,
             "Here you go.\n/tmp/tm/blue-stars-1.png\n/tmp/tm/blue-stars-1.png\n"
@@ -4060,7 +4422,11 @@ mod tests {
             "{\"answer\": \"no images field\"}",
             "[1, 2]",
         ] {
-            assert_eq!(gweb_image_result(raw), (raw.to_string(), None), "{raw}");
+            assert_eq!(
+                gweb_result(raw, true, false),
+                (raw.to_string(), None, None),
+                "{raw}"
+            );
         }
     }
 
@@ -4074,6 +4440,7 @@ mod tests {
             status: "completed".into(),
             output: "/tmp/tm/a-1.png\n".into(),
             images: Some(images.clone()),
+            canvas: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-img".into(),
@@ -4206,6 +4573,7 @@ mod tests {
                 status: "rate_limited".into(),
                 output: format!("{}\n", payload),
                 images: None,
+                canvas: None,
                 output_format: OutputFormat::Json,
                 cwd: PathBuf::from("/tmp"),
                 tmux_session: "test".into(),
@@ -5391,5 +5759,438 @@ quote> Do not wait for the user after the final response is written.'\n";
         assert!(meta["startedAt"].as_u64().unwrap() >= before);
         assert!(meta["startedAt"].as_u64().unwrap() <= epoch_secs());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    /// A fresh dir holding notes.md (text), pic.png, doc.pdf, and blob.bin.
+    fn attach_dir() -> PathBuf {
+        let dir = fs::canonicalize(env::temp_dir())
+            .unwrap()
+            .join(format!("tmuxlet-attach-{}", make_run_id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.md"), "# Notes\nline two").unwrap();
+        fs::write(dir.join("pic.png"), PNG).unwrap();
+        fs::write(dir.join("doc.pdf"), b"%PDF-1.7\n%\xe2\xe3\n").unwrap();
+        fs::write(dir.join("blob.bin"), b"\x00\x01\x02binary").unwrap();
+        dir
+    }
+
+    fn plan(target: &str, files: &[&str], cwd: &Path) -> Result<Vec<Attachment>, (u8, String)> {
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        plan_attachments(target, &files, cwd)
+    }
+
+    fn routes(target: &str, dir: &Path) -> Vec<Option<Delivery>> {
+        ["notes.md", "pic.png", "doc.pdf", "blob.bin"]
+            .iter()
+            .map(|f| plan(target, &[f], dir).ok().map(|p| p[0].delivery))
+            .collect()
+    }
+
+    #[test]
+    fn file_and_attach_are_repeatable_and_canvas_flags_parse() {
+        let opts = parse(&[
+            "-p",
+            "--file",
+            "a.md",
+            "--attach",
+            "b.png",
+            "--file",
+            "c.txt",
+            "--canvas",
+            "--canvas-out",
+            "out/s.md",
+            "x",
+        ]);
+        assert_eq!(opts.files, ["a.md", "b.png", "c.txt"]);
+        assert!(opts.canvas);
+        assert_eq!(opts.canvas_out.as_deref(), Some("out/s.md"));
+        assert_eq!(opts.prompt_parts, ["x"]);
+    }
+
+    #[test]
+    fn file_kinds_by_content() {
+        assert_eq!(file_kind(PNG, true), FileKind::Image);
+        assert_eq!(
+            file_kind(b"\xff\xd8\xff\xe0\0\x10JFIF", true),
+            FileKind::Image
+        );
+        assert_eq!(file_kind(b"GIF89a\x01\0", true), FileKind::Image);
+        assert_eq!(file_kind(b"RIFF\x24\0\0\0WEBPVP8 ", true), FileKind::Image);
+        assert_eq!(file_kind(b"%PDF-1.4\n", true), FileKind::Pdf);
+        assert_eq!(
+            file_kind("caf\u{e9}\ttab\r\n\x0c\x1b[0m".as_bytes(), true),
+            FileKind::Text
+        );
+        assert_eq!(file_kind(b"", true), FileKind::Text);
+        assert_eq!(file_kind(b"text\0nul", true), FileKind::Binary);
+        assert_eq!(file_kind(b"text\x01ctl", true), FileKind::Binary);
+        assert_eq!(file_kind(b"\xff\xfe latin junk", true), FileKind::Binary);
+        let cut = &"caf\u{e9}".as_bytes()[..4]; // a UTF-8 sequence cut off by the sniff window
+        assert_eq!(file_kind(cut, false), FileKind::Text);
+        assert_eq!(file_kind(cut, true), FileKind::Binary);
+    }
+
+    #[test]
+    fn each_target_takes_files_by_its_native_mechanism_or_inlines_text() {
+        use Delivery::{Flag, Inline, Mention};
+        let dir = attach_dir();
+        let cases: &[(&str, [Option<Delivery>; 4])] = &[
+            // target            text            image          pdf            binary
+            (
+                "claude",
+                [Some(Mention), Some(Mention), Some(Mention), None],
+            ),
+            ("codex", [Some(Inline), Some(Flag), None, None]),
+            ("pi", [Some(Flag), Some(Flag), None, None]),
+            ("hermes", [Some(Mention), None, None, None]),
+            ("gweb", [Some(Flag), Some(Flag), Some(Flag), Some(Flag)]),
+            (
+                "gemini-web",
+                [Some(Flag), Some(Flag), Some(Flag), Some(Flag)],
+            ),
+            ("cursor", [Some(Inline), None, None, None]),
+            ("agy", [Some(Inline), None, None, None]),
+            ("opencode", [Some(Inline), None, None, None]),
+            ("grok", [Some(Inline), None, None, None]),
+            ("muse", [Some(Inline), None, None, None]),
+        ];
+        for (target, want) in cases {
+            assert_eq!(routes(target, &dir), want.to_vec(), "{target}");
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn refused_files_exit_7_and_say_which_targets_take_them() {
+        let dir = attach_dir();
+        let pic = dir.join("pic.png").display().to_string();
+        let (code, message) = plan("cursor", &["pic.png"], &dir).unwrap_err();
+        assert_eq!(code, EXIT_ATTACHMENT_REFUSED);
+        assert_eq!(
+            message,
+            format!(
+                "--file {pic}: cursor can't take image files: it has no native way to attach one, and only \
+text is inlined (targets that take image files: claude, codex, pi, gweb)"
+            )
+        );
+        let (_, message) = plan("codex", &["doc.pdf"], &dir).unwrap_err();
+        assert!(
+            message.ends_with("(targets that take PDF files: claude, gweb)"),
+            "{message}"
+        );
+        let (_, message) = plan("claude", &["blob.bin"], &dir).unwrap_err();
+        assert!(
+            message.ends_with("(targets that take binary files: gweb)"),
+            "{message}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn file_paths_resolve_against_cwd_and_must_be_regular_files() {
+        let dir = attach_dir();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let planned = plan("gweb", &["notes.md", "sub/../pic.png"], &dir).unwrap();
+        assert_eq!(
+            planned.iter().map(|a| a.path.clone()).collect::<Vec<_>>(),
+            [
+                dir.join("notes.md").display().to_string(),
+                dir.join("pic.png").display().to_string()
+            ]
+        );
+        assert_eq!(planned[0].kind, FileKind::Text);
+        let absolute = dir.join("notes.md").display().to_string();
+        assert_eq!(plan("gweb", &[&absolute], Path::new("/")).unwrap().len(), 1);
+        let (code, message) = plan("gweb", &["missing.md"], &dir).unwrap_err();
+        assert_eq!(code, 1);
+        assert!(message.starts_with("--file missing.md: "), "{message}");
+        assert_eq!(
+            plan("gweb", &["sub"], &dir).unwrap_err(),
+            (1, "--file sub: not a regular file".to_string())
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn inline_caps_are_raw_bytes_per_file_and_in_total() {
+        let dir = attach_dir();
+        let max = INLINE_FILE_MAX_BYTES as usize;
+        fs::write(dir.join("max.txt"), "a".repeat(max)).unwrap();
+        fs::write(dir.join("over.txt"), "a".repeat(max + 1)).unwrap();
+        assert_eq!(
+            plan("codex", &["max.txt"], &dir).unwrap()[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .len(),
+            max
+        );
+        let (code, message) = plan("codex", &["over.txt"], &dir).unwrap_err();
+        assert_eq!(code, EXIT_ATTACHMENT_REFUSED);
+        assert!(
+            message.ends_with("codex gets text files inlined into the prompt, at most 256 KiB each; this one is 257 KiB"),
+            "{message}"
+        );
+        assert!(plan("gweb", &["over.txt"], &dir).is_ok()); // native: no inline cap
+        assert!(plan("claude", &["over.txt"], &dir).is_ok()); // @-mention: no inline cap
+        let (code, message) =
+            plan("muse", &["max.txt", "max.txt", "max.txt", "notes.md"], &dir).unwrap_err();
+        assert_eq!(code, EXIT_ATTACHMENT_REFUSED);
+        assert!(message.ends_with("the cap is 768 KiB"), "{message}");
+        // UTF-8 in the sniffed head but not after it: refused, not inlined half-read.
+        let mut tricky = vec![b'a'; SNIFF_BYTES as usize + 10];
+        tricky.extend(b"\xff\xfe");
+        fs::write(dir.join("tricky.txt"), tricky).unwrap();
+        let (code, message) = plan("grok", &["tricky.txt"], &dir).unwrap_err();
+        assert_eq!(code, EXIT_ATTACHMENT_REFUSED);
+        assert!(
+            message.contains("grok can't take binary files"),
+            "{message}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mention_paths_with_odd_characters_inline_text_or_refuse() {
+        let dir = attach_dir();
+        fs::write(dir.join("my notes.md"), "spaced").unwrap();
+        fs::write(dir.join("my pic.png"), PNG).unwrap();
+        for target in ["claude", "hermes"] {
+            let planned = plan(target, &["my notes.md"], &dir).unwrap();
+            assert_eq!(planned[0].delivery, Delivery::Inline, "{target}");
+            assert_eq!(planned[0].text.as_deref(), Some("spaced"));
+        }
+        let (code, message) = plan("claude", &["my pic.png"], &dir).unwrap_err();
+        assert_eq!(code, EXIT_ATTACHMENT_REFUSED);
+        assert!(
+            message
+                .contains("claude attaches image files by @-mention, which can't carry this path")
+        );
+        assert_eq!(
+            plan("pi", &["my pic.png"], &dir).unwrap()[0].delivery,
+            Delivery::Flag
+        ); // argv: any path
+        assert!(mention_safe("/Users/kk/a-b_c.d/e+f,g@h%i~j=k.md"));
+        assert!(
+            !mention_safe("/a b")
+                && !mention_safe("/a\"b")
+                && !mention_safe("/a:b")
+                && !mention_safe("/a#b")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_prompt_gets_mentions_then_framed_inline_files() {
+        let attachment = |path: &str, delivery, text: Option<&str>| Attachment {
+            path: path.into(),
+            kind: FileKind::Text,
+            delivery,
+            text: text.map(Into::into),
+        };
+        let files = [
+            attachment("/w/a.md", Delivery::Mention, None),
+            attachment("/w/b.png", Delivery::Mention, None),
+            attachment("/w/c.txt", Delivery::Inline, Some("one\ntwo")),
+            attachment("/w/d e.txt", Delivery::Inline, Some("done\n")),
+            attachment("/w/f.png", Delivery::Flag, None),
+        ];
+        assert_eq!(
+            prompt_with_attachments("Compare them.", "claude", &files),
+            "Compare them.\n\nAttached files:\n@/w/a.md\n@/w/b.png\
+\n\n<<<FILE path=\"/w/c.txt\" bytes=7>>>\none\ntwo\n<<<END FILE>>>\
+\n\n<<<FILE path=\"/w/d e.txt\" bytes=5>>>\ndone\n<<<END FILE>>>"
+        );
+        assert_eq!(
+            prompt_with_attachments("Read it.", "hermes", &files[..1]),
+            "Read it.\n\nAttached files:\n@file:/w/a.md"
+        );
+        assert_eq!(
+            prompt_with_attachments("Just this.", "codex", &files[4..]),
+            "Just this."
+        );
+        assert_eq!(prompt_with_attachments("Plain.", "claude", &[]), "Plain.");
+    }
+
+    #[test]
+    fn flag_files_become_each_targets_launch_arguments() {
+        let dir = attach_dir();
+        let with_files = |target: &str, files: &[&str]| {
+            let mut opts = parse(&["--target", target, "-C", dir.to_str().unwrap(), "-p", "x"]);
+            opts.attachments = plan(target, files, &dir).unwrap();
+            target_command(&opts).unwrap()
+        };
+        let pic = dir.join("pic.png").display().to_string();
+        let notes = dir.join("notes.md").display().to_string();
+        let pdf = dir.join("doc.pdf").display().to_string();
+
+        let codex = with_files("codex", &["pic.png", "notes.md"]);
+        assert!(has_pair(&codex.args, "--image", &pic), "{:?}", codex.args);
+        assert!(!codex.args.contains(&notes)); // inlined into the prompt instead
+        let (launch, _) = command_with_prompt(codex, "codex", "prompt");
+        let dash = launch.args.iter().position(|a| a == "--").unwrap();
+        assert!(launch.args.iter().position(|a| *a == pic).unwrap() < dash); // -i can't swallow the prompt
+        assert_eq!(launch.args[dash + 1..], ["prompt"]);
+
+        let gweb = with_files("gweb", &["notes.md", "pic.png", "doc.pdf"]);
+        for path in [&notes, &pic, &pdf] {
+            assert!(has_pair(&gweb.args, "--file", path), "{:?}", gweb.args);
+        }
+        assert!(!gweb.args.contains(&"--output-format".to_string())); // files alone keep text answers
+
+        let pi = with_files("pi", &["notes.md", "pic.png"]);
+        assert!(
+            pi.args.ends_with(&[format!("@{notes}"), format!("@{pic}")]),
+            "{:?}",
+            pi.args
+        );
+
+        for target in [
+            "claude", "hermes", "muse", "cursor", "opencode", "grok", "agy",
+        ] {
+            let cmd = with_files(target, &["notes.md"]);
+            assert!(
+                !cmd.args.iter().any(|a| a.contains("notes.md")),
+                "{target}: {:?}",
+                cmd.args
+            );
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_long_launch_line_reads_its_prompt_from_a_file() {
+        let dir = attach_dir();
+        let file = dir.join("launch-prompt.txt");
+        let short = TargetCommand {
+            program: "claude".into(),
+            args: vec!["--".into(), "say ready".into()],
+        };
+        assert_eq!(launch_line(&short, &file).unwrap(), "claude -- 'say ready'");
+        assert!(!file.exists());
+        let prompt = format!("{}\nit's done", "x".repeat(LAUNCH_LINE_MAX));
+        let long = TargetCommand {
+            program: "claude".into(),
+            args: vec!["--model".into(), "opus".into(), "--".into(), prompt.clone()],
+        };
+        assert_eq!(
+            launch_line(&long, &file).unwrap(),
+            format!(
+                "claude --model opus -- \"$(cat {})\"",
+                shell_quote(&file.display().to_string())
+            )
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), prompt);
+        let huge = TargetCommand {
+            program: "claude".into(),
+            args: vec!["x".repeat(LAUNCH_LINE_MAX), "--".into(), prompt],
+        };
+        assert!(
+            launch_line(&huge, &file)
+                .unwrap_err()
+                .contains("too long for tmux")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gweb_forwards_canvas_with_json_output() {
+        let cmd = target_command(&parse(&chat_argv("gweb", &["--canvas"]))).unwrap();
+        assert!(cmd.args.contains(&"--canvas".to_string()));
+        assert!(has_pair(&cmd.args, "--output-format", "json"));
+        let argv = chat_argv("gweb", &["-C", "/work", "--canvas-out", "out/scene.md"]);
+        let cmd = target_command(&parse(&argv)).unwrap();
+        assert!(
+            has_pair(&cmd.args, "--canvas-out", "/work/out/scene.md"),
+            "{:?}",
+            cmd.args
+        );
+        assert!(!cmd.args.contains(&"--canvas".to_string())); // --canvas-out implies it
+        let argv = chat_argv("gweb", &["--canvas", "--image-out", "/tmp/i/"]);
+        let cmd = target_command(&parse(&argv)).unwrap();
+        assert_eq!(
+            cmd.args.iter().filter(|a| *a == "--output-format").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn canvas_flags_are_rejected_for_other_targets() {
+        for target in [
+            "muse", "claude", "codex", "agy", "opencode", "pi", "grok", "hermes", "cursor",
+        ] {
+            for flags in [&["--canvas"][..], &["--canvas-out", "/tmp/s.md"][..]] {
+                let err = target_command(&parse(&chat_argv(target, flags))).unwrap_err();
+                assert!(
+                    err.ends_with(&format!(
+                        "normalized flag {} (only gweb has Gemini's Canvas)",
+                        flags[0]
+                    )),
+                    "{target}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gweb_result_passes_canvas_through_and_prints_its_path_or_markdown() {
+        let doc = serde_json::json!({"title": "Rain", "markdown": "# Rain\n\nOn tin.", "chars": 15,
+            "path": "/tmp/gweb-canvas-test/scene.md"});
+        let gweb = serde_json::json!({"answer": "Here is your scene.", "images": [], "canvas": doc.clone()});
+        let (output, images, canvas) = gweb_result(&gweb.to_string(), false, true);
+        assert_eq!(
+            output,
+            "Here is your scene.\n/tmp/gweb-canvas-test/scene.md\n"
+        );
+        assert_eq!((images, canvas), (None, Some(doc.clone())));
+        let mut unsaved = gweb.clone();
+        unsaved["canvas"]["path"] = serde_json::Value::Null;
+        assert_eq!(
+            gweb_result(&unsaved.to_string(), false, true).0,
+            "Here is your scene.\n# Rain\n\nOn tin.\n"
+        );
+        let mut none = gweb.clone();
+        none["canvas"] = serde_json::Value::Null;
+        assert_eq!(
+            gweb_result(&none.to_string(), false, true),
+            (
+                "Here is your scene.\n".to_string(),
+                None,
+                Some(serde_json::Value::Null)
+            )
+        );
+        let old = serde_json::json!({"answer": "x", "images": []}).to_string();
+        assert_eq!(gweb_result(&old, false, true), (old.clone(), None, None)); // no canvas field: unchanged
+    }
+
+    #[test]
+    fn result_json_carries_gweb_canvas_after_images() {
+        let canvas =
+            serde_json::json!({"title": "Rain", "markdown": "# Rain", "chars": 6, "path": null});
+        let result = RunResult {
+            id: "cv".into(),
+            target: "gweb".into(),
+            status: "completed".into(),
+            output: "ok\n# Rain\n".into(),
+            images: Some(serde_json::json!([])),
+            canvas: Some(canvas.clone()),
+            output_format: OutputFormat::Json,
+            cwd: PathBuf::from("/tmp"),
+            tmux_session: "tmuxlet-cv".into(),
+            completion_source: "explicit".into(),
+            elapsed_ms: 5,
+        };
+        let text = result_json(&result);
+        assert!(
+            text.starts_with("{\"id\":\"cv\",\"target\":\"gweb\""),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            (json["canvas"].clone(), json["images"].clone()),
+            (canvas, serde_json::json!([]))
+        );
     }
 }
