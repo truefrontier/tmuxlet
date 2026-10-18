@@ -223,6 +223,8 @@ struct RunResult {
     images: Option<serde_json::Value>,
     // gweb --canvas: gweb's Canvas doc {title, markdown, chars, path}, passed through likewise.
     canvas: Option<serde_json::Value>,
+    // gweb JSON runs: gweb's citations ({n, label, file} or {n, label, title, url} per footnote).
+    citations: Option<serde_json::Value>,
     output_format: OutputFormat,
     cwd: PathBuf,
     tmux_session: String,
@@ -757,7 +759,10 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         if paths.complete.exists() {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
-            let (output, images, canvas) = if chat && gweb_json(&opts) {
+            // Only gweb's JSON result is read back; muse's output stays as it is.
+            let gweb = matches!(opts.target.as_str(), "gweb" | "gemini-web") && gweb_json(&opts);
+            let citations = gweb.then(|| gweb_citations(&output)).flatten();
+            let (output, images, canvas) = if gweb {
                 gweb_result(&output, opts.image_out.is_some(), gweb_canvas(&opts))
             } else {
                 (output, None, None)
@@ -775,6 +780,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 output,
                 images,
                 canvas,
+                citations,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -829,6 +835,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     output: pane,
                     images: None,
                     canvas: None,
+                    citations: None,
                     output_format: opts.output_format,
                     cwd: opts.cwd,
                     tmux_session,
@@ -850,6 +857,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 output: pane,
                 images: None,
                 canvas: None,
+                citations: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -873,6 +881,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 output: pane,
                 images: None,
                 canvas: None,
+                citations: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -1634,9 +1643,10 @@ fn gweb_canvas(opts: &Options) -> bool {
     opts.canvas || opts.canvas_out.is_some()
 }
 
-/// gweb runs whose JSON result tmuxlet reads back: --image-out and --canvas.
+/// gweb runs whose JSON result tmuxlet reads back: --image-out, --canvas, and
+/// any run whose own result is JSON (for gweb's `citations`).
 fn gweb_json(opts: &Options) -> bool {
-    opts.image_out.is_some() || gweb_canvas(opts)
+    opts.image_out.is_some() || gweb_canvas(opts) || opts.output_format == OutputFormat::Json
 }
 
 /// The --file paths a target takes as launch arguments.
@@ -1885,6 +1895,16 @@ fn gweb_result(output: &str, want_images: bool, want_canvas: bool) -> GwebResult
         lines.extend(doc["path"].as_str().or(doc["markdown"].as_str()));
     }
     (format!("{}\n", lines.join("\n")), images, canvas)
+}
+
+/// gweb's `citations` list from its JSON result (gweb 0.4.1 and later), when it
+/// has one: the sources behind the answer's [^n] footnotes.
+fn gweb_citations(output: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(output.trim())
+        .ok()?
+        .get("citations")
+        .filter(|v| v.is_array())
+        .cloned()
 }
 
 fn chat_command(
@@ -3466,6 +3486,9 @@ fn result_json(result: &RunResult) -> String {
         if let Some(canvas) = &result.canvas {
             extra.push_str(&format!(",\"canvas\":{canvas}"));
         }
+        if let Some(citations) = &result.citations {
+            extra.push_str(&format!(",\"citations\":{citations}"));
+        }
         format!("{}{extra}}}", &base[..base.len() - 1])
     }
 }
@@ -4430,6 +4453,7 @@ mod tests {
             output: "/tmp/tm/a-1.png\n".into(),
             images: Some(images.clone()),
             canvas: None,
+            citations: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-img".into(),
@@ -4563,6 +4587,7 @@ mod tests {
                 output: format!("{}\n", payload),
                 images: None,
                 canvas: None,
+                citations: None,
                 output_format: OutputFormat::Json,
                 cwd: PathBuf::from("/tmp"),
                 tmux_session: "test".into(),
@@ -6146,6 +6171,62 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
     }
 
     #[test]
+    fn gweb_json_runs_ask_gweb_for_json_to_carry_its_citations() {
+        let cmd = target_command(&parse(&chat_argv("gweb", &["--output-format", "json"]))).unwrap();
+        assert!(
+            has_pair(&cmd.args, "--output-format", "json"),
+            "{:?}",
+            cmd.args
+        );
+        let cmd = target_command(&parse(&chat_argv("gweb", &[]))).unwrap();
+        assert!(!cmd.args.contains(&"--output-format".to_string())); // text runs keep gweb's text
+        let cmd = target_command(&parse(&chat_argv("muse", &["--output-format", "json"]))).unwrap();
+        assert!(
+            !cmd.args.contains(&"--output-format".to_string()),
+            "{:?}",
+            cmd.args
+        );
+
+        let citations = serde_json::json!([{"n": 1, "label": "MD", "file": "outline.md"},
+            {"n": 2, "label": "Wikipedia", "title": "Reykjavík - Wikipedia", "url": "https://en.wikipedia.org/wiki/Reykjav%C3%ADk"}]);
+        let answer = "Mara runs[^1]. Reykjavík[^2].\n\n[^1]: outline.md\n[^2]: Reykjavík - Wikipedia, https://en.wikipedia.org/wiki/Reykjav%C3%ADk";
+        let gweb =
+            serde_json::json!({"answer": answer, "citations": citations.clone(), "images": []})
+                .to_string();
+        assert_eq!(
+            gweb_citations(&format!("{gweb}\n")),
+            Some(citations.clone())
+        );
+        assert_eq!(gweb_result(&gweb, false, false).0, format!("{answer}\n")); // the footnoted answer
+        for old in [
+            "plain answer\n",
+            "{\"answer\": \"x\"}",
+            "{\"citations\": null}",
+        ] {
+            assert_eq!(gweb_citations(old), None, "{old}");
+        }
+        let result = RunResult {
+            id: "ct".into(),
+            target: "gweb".into(),
+            status: "completed".into(),
+            output: format!("{answer}\n"),
+            images: None,
+            canvas: None,
+            citations: Some(citations.clone()),
+            output_format: OutputFormat::Json,
+            cwd: PathBuf::from("/tmp"),
+            tmux_session: "tmuxlet-ct".into(),
+            completion_source: "explicit".into(),
+            elapsed_ms: 5,
+        };
+        let json: serde_json::Value = serde_json::from_str(&result_json(&result)).unwrap();
+        assert_eq!(
+            (json["citations"].clone(), json["output"].clone()),
+            (citations, serde_json::json!(format!("{answer}\n")))
+        );
+    }
+
+    #[test]
     fn canvas_flags_are_rejected_for_other_targets() {
         for target in [
             "muse", "claude", "codex", "agy", "opencode", "pi", "grok", "hermes", "cursor",
@@ -6205,6 +6286,7 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
             output: "ok\n# Rain\n".into(),
             images: Some(serde_json::json!([])),
             canvas: Some(canvas.clone()),
+            citations: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-cv".into(),

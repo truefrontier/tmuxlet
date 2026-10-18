@@ -451,6 +451,16 @@ contract. tmuxlet completes the run itself:
   tmuxlet -p --target gweb -m Argon --canvas-out ./scene.md --output-format json "Write a 3-sentence scene into a Canvas doc"
   ```
 - `--file <path>` becomes gweb `--file <absolute path>`; see [Attachments](#attachments---file).
+- A cited gweb answer (gweb 0.4.1: Gemini's source chips for attached files or
+  web pages) arrives with `[^n]` footnotes and a footnote block in the run's
+  output. With `--output-format json`, tmuxlet also passes gweb `--output-format
+  json` and adds gweb's `citations` list (`{n, label, file}` or `{n, label,
+  title, url}` per footnote) to its result:
+
+  ```json
+  {"id":"…","target":"gweb","status":"completed","output":"… the attached outline[^1].\n\n[^1]: outline.md\n",
+   "…":"…","citations":[{"n":1,"label":"MD","file":"outline.md"}]}
+  ```
 
 Flag mapping:
 
@@ -462,6 +472,7 @@ Flag mapping:
 | `--canvas` | rejected | `--canvas --output-format json` |
 | `--canvas-out <path>` | rejected | `--canvas-out <absolute path> --output-format json` |
 | `--file <path>` | text inlined into `prompt.txt`; other files refused (exit 7) | `--file <absolute path>` |
+| `--output-format json` | — | also `--output-format json` (for `citations`) |
 | `--continue`, value-less `--resume` | `-c` | `-c` |
 | `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
 | `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |

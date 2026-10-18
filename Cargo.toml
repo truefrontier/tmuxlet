@@ -1,6 +1,6 @@
 [package]
 name = "tmuxlet"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 description = "Run interactive coding CLIs through tmux with a claude -p style interface"
 license = "MIT"
