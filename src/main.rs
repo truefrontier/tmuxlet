@@ -41,9 +41,11 @@ const SNIFF_BYTES: u64 = 8 * 1024;
 const EXIT_ATTACHMENT_REFUSED: u8 = 7;
 // Characters an @-mention path may hold; other paths are inlined (text) or refused.
 const MENTION_SAFE: &str = "-_./+,@%~=";
-// tmux refuses a command over ~16 KiB ("command too long"), so a longer launch line reads its last argument
-// (the prompt) from a file in the run dir instead.
-const LAUNCH_LINE_MAX: usize = 8 * 1024;
+// The launch line is typed into the pane's shell, maybe before the shell reads it: the tty then keeps at most
+// 1024 bytes (macOS MAX_CANON) and drops the rest. A longer line reads its last argument (the prompt, or a chat
+// backend's wrapper script) from a file in the run dir instead. tmux itself refuses commands over ~16 KiB.
+const LAUNCH_LINE_MAX: usize = 1000;
+const TMUX_COMMAND_MAX: usize = 15 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputFormat {
@@ -736,7 +738,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         return Err(e);
     }
     start_tmux_session(&tmux_session, &opts.cwd)?;
-    let line = launch_line(&launch_command, &paths.root.join("launch-prompt.txt"))?;
+    let line = launch_line(&launch_command, &paths.root.join("launch-arg.txt"))?;
     send_launch_command(&tmux_session, &line)?;
     if let Some(text) = paste {
         paste_text(&tmux_session, &text)?;
@@ -2024,11 +2026,12 @@ fn tmux_pane_target(name: &str) -> String {
 }
 
 /// The shell line that starts `command`. Over LAUNCH_LINE_MAX, the last
-/// argument (the prompt, for targets that take it at launch) is written to
-/// `prompt_file` and read back with `"$(cat ...)"`, because tmux refuses longer
-/// commands. The substitution drops trailing newlines, which a prompt doesn't
-/// need; the line still names the run dir, which codex_startup_state relies on.
-fn launch_line(command: &TargetCommand, prompt_file: &Path) -> Result<String, String> {
+/// argument (the prompt for targets that take it at launch, or a chat backend's
+/// `sh -c` script) is written to `arg_file` and read back with
+/// `"$(command cat ...)"` (`command` skips any alias). The substitution drops
+/// trailing newlines, which neither needs; the line still names the run dir,
+/// which codex_startup_state relies on.
+fn launch_line(command: &TargetCommand, arg_file: &Path) -> Result<String, String> {
     let mut parts: Vec<String> = std::iter::once(&command.program)
         .chain(&command.args)
         .map(|arg| shell_quote(arg))
@@ -2037,14 +2040,14 @@ fn launch_line(command: &TargetCommand, prompt_file: &Path) -> Result<String, St
     let Some(last) = command.args.last().filter(|_| line.len() > LAUNCH_LINE_MAX) else {
         return Ok(line);
     };
-    fs::write(prompt_file, last).map_err(|e| format!("failed to stage prompt: {e}"))?;
+    fs::write(arg_file, last).map_err(|e| format!("failed to stage launch argument: {e}"))?;
     parts.pop();
     parts.push(format!(
-        "\"$(cat {})\"",
-        shell_quote(&prompt_file.display().to_string())
+        "\"$(command cat {})\"",
+        shell_quote(&arg_file.display().to_string())
     ));
     let line = parts.join(" ");
-    if line.len() > LAUNCH_LINE_MAX {
+    if line.len() > TMUX_COMMAND_MAX {
         return Err(format!(
             "the {} launch command is too long for tmux ({} bytes)",
             command.program,
@@ -6063,7 +6066,7 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
     #[test]
     fn a_long_launch_line_reads_its_prompt_from_a_file() {
         let dir = attach_dir();
-        let file = dir.join("launch-prompt.txt");
+        let file = dir.join("launch-arg.txt");
         let short = TargetCommand {
             program: "claude".into(),
             args: vec!["--".into(), "say ready".into()],
@@ -6078,20 +6081,59 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
         assert_eq!(
             launch_line(&long, &file).unwrap(),
             format!(
-                "claude --model opus -- \"$(cat {})\"",
+                "claude --model opus -- \"$(command cat {})\"",
                 shell_quote(&file.display().to_string())
             )
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), prompt);
+        // Flags alone over the line limit still launch (a ready shell reads them);
+        // only tmux's own limit fails.
+        let flags = TargetCommand {
+            program: "claude".into(),
+            args: vec!["x".repeat(LAUNCH_LINE_MAX), "--".into(), prompt.clone()],
+        };
+        let substituted = format!(
+            "\"$(command cat {})\"",
+            shell_quote(&file.display().to_string())
+        );
+        assert!(launch_line(&flags, &file).unwrap().ends_with(&substituted));
         let huge = TargetCommand {
             program: "claude".into(),
-            args: vec!["x".repeat(LAUNCH_LINE_MAX), "--".into(), prompt],
+            args: vec!["x".repeat(TMUX_COMMAND_MAX), "--".into(), prompt],
         };
         assert!(
             launch_line(&huge, &file)
                 .unwrap_err()
                 .contains("too long for tmux")
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_chat_launch_with_many_files_stays_under_the_tty_limit() {
+        let dir = attach_dir();
+        let argv = chat_argv("gweb", &["-C", dir.to_str().unwrap(), "--timeout", "600"]);
+        let mut opts = parse(&argv);
+        opts.attachments = plan("gweb", &["notes.md"; 10], &dir).unwrap();
+        let base = target_command(&opts).unwrap();
+        let paths = RunPaths {
+            root: dir.clone(),
+            ..fixed_paths()
+        };
+        let (launch, _) = launch_plan("gweb", base, &paths, "run-1", "/bin/tmuxlet", "p");
+        let file = dir.join("launch-arg.txt");
+        let line = launch_line(&launch, &file).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "exec sh -c \"$(command cat {})\"",
+                shell_quote(&file.display().to_string())
+            )
+        );
+        assert!(line.len() <= LAUNCH_LINE_MAX);
+        let script = fs::read_to_string(&file).unwrap();
+        assert_eq!(script, launch.args[2]);
+        assert_eq!(script.matches(" --file ").count(), 11); // 10 attachments + bridge complete's
         fs::remove_dir_all(dir).ok();
     }
 

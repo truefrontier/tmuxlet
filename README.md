@@ -373,10 +373,13 @@ Limits and refusals:
   attach one, and only text is inlined (targets that take image files: claude,
   codex, pi, gweb)`. A missing path or a directory is exit 1, like other bad
   arguments.
-- tmux refuses commands over about 16 KiB. When the launch line would pass
-  8 KiB, tmuxlet writes the prompt argument to `<run>/launch-prompt.txt` and
-  launches with `"$(cat <run>/launch-prompt.txt)"` in its place. This also fixes
-  long prompts without attachments, which used to fail with "command too long".
+- The launch line is typed into the pane's shell, sometimes before the shell
+  is reading: the tty then keeps only 1024 bytes and drops the rest (macOS), and
+  tmux refuses any command over about 16 KiB. So when the line would pass 1000
+  bytes, tmuxlet writes its last argument (the prompt, or a chat backend's
+  wrapper script) to `<run>/launch-arg.txt` and launches with
+  `"$(command cat <run>/launch-arg.txt)"` in its place. Many `--file` paths fit this
+  way, and long prompts no longer fail with "command too long".
 
 ```bash
 tmuxlet -p --target gweb --file README.md --file chart.png "Summarize both"
@@ -585,7 +588,7 @@ Runtime files live in:
   pane.log
   error.txt
   stderr.txt   # chat backends: the CLI's stderr
-  launch-prompt.txt  # only when the launch line would be too long for tmux
+  launch-arg.txt  # the prompt or wrapper script, when the launch line would pass 1000 bytes
 ```
 
 Set `TMUXLET_HOME` to override the state directory.
