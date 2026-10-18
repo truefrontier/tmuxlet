@@ -104,8 +104,9 @@ Initial adapters:
 - `cursor` / `cursor-agent`
 - `grok` (xAI Grok Build CLI)
 - `hermes` / `hermes-agent` (Nous Research Hermes Agent CLI)
-- `muse` / `musecli` (Meta Muse via [musecli](https://github.com/truefrontier/muse-cli); a chat backend, see [Chat backends](#chat-backends-muse-gweb))
+- `muse` / `musecli` (Meta Muse via [musecli](https://github.com/truefrontier/muse-cli); a chat backend, see [Chat backends](#chat-backends-muse-gweb-chatgpt))
 - `gweb` / `gemini-web` (Gemini on the web via [gweb](https://github.com/truefrontier/gemini-web-cli); a chat backend)
+- `chatgpt` / `cgpt` (ChatGPT on the web via [cgpt](https://github.com/truefrontier/chatgpt-web-cli); a chat backend)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -165,12 +166,12 @@ for a given `--target` fail fast instead of being silently dropped. See
 | Flag / aliases | Value | Default | Purpose |
 | --- | --- | --- | --- |
 | `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
-| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli`, `gweb` / `gemini-web`. |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli`, `gweb` / `gemini-web`, `chatgpt` / `cgpt`. |
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
 | `--thinking` | `<level>` | unset | Gemini's Thinking level for `gweb`: `low`, `medium`, `high` (or `l`, `m`, `h`). Other targets reject it. |
-| `--image-out` | `<dir\|path>` | unset | `gweb` only: save the reply's images there (gweb `--image-out`; relative paths are taken from `--cwd`). The JSON result gets `images`. Other targets reject it. See [Chat backends](#chat-backends-muse-gweb). |
+| `--image-out` | `<dir\|path>` | unset | `gweb` and `chatgpt`: save the reply's images there (the CLI's `--image-out`; relative paths are taken from `--cwd`). The JSON result gets `images`. Other targets reject it. See [Chat backends](#chat-backends-muse-gweb-chatgpt). |
 | `--canvas` | flag | off | `gweb` only: turn on Gemini's Canvas tool. The JSON result gets `canvas`. Other targets reject it. |
 | `--canvas-out` | `<path>` | unset | `gweb` only: also write the Canvas doc's markdown to this path (relative paths are taken from `--cwd`; implies `--canvas`). Other targets reject it. |
 | `--file`, `--attach` | `<path>` (repeatable) | unset | Attach a file with the target's own mechanism, or inline it if it's text. Relative paths are taken from `--cwd`. Exit 7 if the target can't take it. See [Attachments](#attachments---file). |
@@ -257,6 +258,7 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
 | `TMUXLET_MUSECLI_BIN` | `musecli` | Program run for `--target muse`. |
 | `TMUXLET_GWEB_BIN` | `gweb` | Program run for `--target gweb`. |
+| `TMUXLET_CGPT_BIN` | `cgpt` | Program run for `--target chatgpt`. |
 
 ## Resuming Target Sessions
 
@@ -292,6 +294,7 @@ Target mappings:
 | `hermes` / `hermes-agent` | `--continue` or value-less `--resume` | `--resume <id>` | `--session` is not supported. `--session-id` maps to `--resume <id>` (resume that session; hermes has no create-with-id flag). |
 | `muse` / `musecli` | `--continue` or value-less `--resume` map to `-c` (the CLI's last chat) | `--resume <id>`, `--session <id>`, or `--session-id <id>` map to `--chat <id>` | Chat ids are musecli chat ids; `main` is the main chat. |
 | `gweb` / `gemini-web` | `--continue` or value-less `--resume` map to `-c` (the CLI's last chat) | `--resume <id>`, `--session <id>`, or `--session-id <id>` map to `--chat <id>` | Chat ids are Gemini chat ids. |
+| `chatgpt` / `cgpt` | `--continue` or value-less `--resume` map to `-c` (the CLI's last chat) | `--resume <id>`, `--session <id>`, or `--session-id <id>` map to `--chat <id>` | Chat ids are the UUID in chatgpt.com/c/<id>. |
 
 When running through Cargo during development, Cargo's build/status lines are
 separate from tmuxlet output:
@@ -318,7 +321,7 @@ TMUXLET COMPLETION CONTRACT:
 The completion contract tells the target CLI to write its final response to
 `answer.txt` and then run `tmuxlet bridge complete`. Other targets currently use
 a paste fallback when tmuxlet cannot safely assume positional prompt support.
-Chat backends (`muse`, `gweb`) never see the contract; see below.
+Chat backends (`muse`, `gweb`, `chatgpt`) never see the contract; see below.
 
 ## Attachments (`--file`)
 
@@ -339,6 +342,7 @@ against the installed CLI's `--help` and docs (2026-10-18):
 | `pi` | `@path` arg | `@path` arg | refused | refused | `@<abs path>` launch arguments: `pi [options] [@files...]` includes "a text file or image in the first prompt". Not live-checked: pi isn't installed here. |
 | `hermes` | `@file:` | refused | refused | refused | `@file:/abs/path` lines in the REPL message, which Hermes expands. Its `--image` exists only on `hermes chat -q`, not the `--cli` REPL tmuxlet drives. |
 | `gweb` | `--file` | `--file` | `--file` | `--file` | `--file <abs path>` per file. gweb enforces Gemini's own limits (10 files per prompt, 100 MB per file, 2 GB per video) and exits 2 past them, so the run ends `exited` with gweb's error. |
+| `chatgpt` | `--file` | `--file` | `--file` | `--file` | `--file <abs path>` per file, through ChatGPT's own composer file input. cgpt checks ChatGPT's limits (512 MB per file, 20 MB per image) and exits 2 past them, so the run ends `exited` with cgpt's error. |
 | `cursor` | inlined | refused | refused | refused | No file flag. |
 | `agy` / `gemini` | inlined | refused | refused | refused | No file flag. Its `@` file picker is interactive, so the `--prompt-interactive` launch prompt gets the text inlined. |
 | `opencode` | inlined | refused | refused | refused | `-f/--file` exists only on `opencode run`, not the TUI that tmuxlet drives. |
@@ -371,7 +375,7 @@ Limits and refusals:
   caps. The message names the file and the targets that can take it, for example
   `--file /abs/pic.png: cursor can't take image files: it has no native way to
   attach one, and only text is inlined (targets that take image files: claude,
-  codex, pi, gweb)`. A missing path or a directory is exit 1, like other bad
+  codex, pi, gweb, chatgpt)`. A missing path or a directory is exit 1, like other bad
   arguments.
 - The launch line is typed into the pane's shell, sometimes before the shell
   is reading: the tty then keeps only 1024 bytes and drops the rest (macOS), and
@@ -387,11 +391,11 @@ tmuxlet -p --target codex --file screenshot.png --file notes.md "Fix what the sc
 tmuxlet -p --target claude --file src/main.rs "Review this file"
 ```
 
-## Chat backends (muse, gweb)
+## Chat backends (muse, gweb, chatgpt)
 
-`muse` sends the prompt to Meta Muse through `musecli`, and `gweb` sends it to
-Gemini on the web through `gweb`. They return the answer exactly like any other
-target:
+`muse` sends the prompt to Meta Muse through `musecli`, `gweb` sends it to
+Gemini on the web through `gweb`, and `chatgpt` sends it to ChatGPT on the web
+through `cgpt`. They return the answer exactly like any other target:
 
 ```bash
 tmuxlet -p --target muse "Reply with exactly: pong"
@@ -400,6 +404,8 @@ tmuxlet -p --target gweb -m pro --thinking high "Prove it step by step"
 tmuxlet -p --target gweb --resume <chatId> "and again"
 tmuxlet -p --target muse --continue "follow-up"
 tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json "a seamless tileable pattern of small blue stars on white"
+tmuxlet -p --target chatgpt -m gpt-6-thinking "Reply with exactly: pong"
+TMUXLET_OWNER=Press tmuxlet -p --target chatgpt --image-out ./out --output-format json --timeout 900 "Create a square image: seamless tileable pattern of small blue stars on white"
 ```
 
 These are chat CLIs, not coding agents, so they cannot follow the completion
@@ -414,14 +420,17 @@ contract. tmuxlet completes the run itself:
 - On failure (not signed in, profile lock busy, the CLI's own timeout, or Gemini
   answering with its own error message, which `gweb` exits 5 on) the pane
   exits, the run ends `exited`, and the output is the CLI's error message.
-- For `gweb` / `gemini-web`, gweb exit **6** becomes tmuxlet exit **6**, with
-  status `rate_limited`. The wrapper forces `GWEB_FORMAT=json` for reliable error
-  capture. stderr contains `{"error":"rate_limited","code":6,"message":<original
+- For `gweb` / `gemini-web` and `chatgpt` / `cgpt`, the CLI's exit **6**
+  becomes tmuxlet exit **6**, with status `rate_limited`. The wrapper forces
+  `GWEB_FORMAT=json` / `CGPT_FORMAT=json` for reliable error capture. stderr contains `{"error":"rate_limited","code":6,"message":<original
   notice>,"resets_at":<ISO 8601 timestamp or null>}`. `--output-format json` adds
   the same four fields to the normal run object on stdout. Text mode emits the
   error on stderr and no answer on stdout. Reset timestamps retain gweb's
   `America/Chicago` offset. tmuxlet does not retry the prompt. Other backend
-  failures retain status `exited` and tmuxlet exit 1 (including gweb exit 5).
+  failures retain status `exited` and tmuxlet exit 1 (including gweb and cgpt
+  exit 5). cgpt `--strict-model` (via `--target-arg`) also exits 6 when ChatGPT
+  answers with another model; that run is `rate_limited` too, and its error stays
+  `{"error":"model_fallback","code":6,"message":…,"requestedModel":…,"servedModel":…}`.
 - The startup auto-Enter and `blocked` detection are skipped.
 - `gweb --image-out <dir|path>` (needs gweb 0.3.0) turns on Gemini's Create image
   tool and saves the reply's images at full size. tmuxlet forwards it as an
@@ -451,6 +460,28 @@ contract. tmuxlet completes the run itself:
   tmuxlet -p --target gweb -m Argon --canvas-out ./scene.md --output-format json "Write a 3-sentence scene into a Canvas doc"
   ```
 - `--file <path>` becomes gweb `--file <absolute path>`; see [Attachments](#attachments---file).
+- `chatgpt` (cgpt 0.1.0) works the same way. `--image-out <dir|path>` becomes
+  cgpt `--image-out <absolute path> --output-format json`; cgpt saves each image
+  as ChatGPT stores it (the original file, not a preview), and its `images`
+  entries are `{path, width, height, bytes, mime, original, sourceWidth,
+  sourceHeight, source}`. A reply without an image is a cgpt exit 5. cgpt's own
+  default timeout is 600s with `--image-out`. `-m` takes a cgpt slug
+  (`cgpt models`; e.g. `gpt-6-thinking`, `gpt-6-instant`).
+- Model fields: with `--output-format json` or `--image-out`, tmuxlet reads the
+  CLI's JSON result and copies its model fields into the run object, after
+  `citations`: cgpt's `requestedModel` (the slug `-m` asked for, or null),
+  `servedModel` (the slug that wrote the reply, from the chat's record),
+  `servedModelDisplay`, `fallback`, `fallbackFrom`, `fallbackTo`, and gweb's
+  `servedModel` / `servedModelId` when gweb reports them. A field the CLI
+  doesn't report is left out.
+
+  ```json
+  {"id":"…","target":"chatgpt","status":"completed","output":"/abs/out/create-a-square-image-seamless-tileable-pattern-1.png\n",
+   "…":"…","images":[{"path":"/abs/out/create-a-square-image-seamless-tileable-pattern-1.png","width":1254,"height":1254,
+   "bytes":1200158,"mime":"image/png","original":true,"sourceWidth":1254,"sourceHeight":1254,"source":"original"}],
+   "citations":[],"requestedModel":null,"servedModel":"gpt-5-4-thinking","servedModelDisplay":null,"fallback":false,
+   "fallbackFrom":null,"fallbackTo":null}
+  ```
 - A cited gweb answer (gweb 0.4.1: Gemini's source chips for attached files or
   web pages) arrives with `[^n]` footnotes and a footnote block in the run's
   output. With `--output-format json`, tmuxlet also passes gweb `--output-format
@@ -464,20 +495,20 @@ contract. tmuxlet completes the run itself:
 
 Flag mapping:
 
-| tmuxlet flag | `muse` | `gweb` |
-| --- | --- | --- |
-| `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` |
-| `--thinking <level>` | rejected | `--thinking <level>` |
-| `--image-out <dir\|path>` | rejected | `--image-out <absolute path> --output-format json` |
-| `--canvas` | rejected | `--canvas --output-format json` |
-| `--canvas-out <path>` | rejected | `--canvas-out <absolute path> --output-format json` |
-| `--file <path>` | text inlined into `prompt.txt`; other files refused (exit 7) | `--file <absolute path>` |
-| `--output-format json` | — | also `--output-format json` (for `citations`) |
-| `--continue`, value-less `--resume` | `-c` | `-c` |
-| `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` |
-| `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |
-| `--target-arg <arg>` | passed through | passed through |
-| `--system-prompt`, `--append-system-prompt`, tools flags, `--permission-mode`, `--add-dir`, `--mcp-config`, `--settings`, `--dangerously-skip-permissions` | rejected | rejected |
+| tmuxlet flag | `muse` | `gweb` | `chatgpt` |
+| --- | --- | --- | --- |
+| `-m`, `--model` | rejected (Muse has no model picker) | `--model <name>` | `--model <slug>` |
+| `--thinking <level>` | rejected | `--thinking <level>` | rejected |
+| `--image-out <dir\|path>` | rejected | `--image-out <absolute path> --output-format json` | `--image-out <absolute path> --output-format json` |
+| `--canvas` | rejected | `--canvas --output-format json` | rejected |
+| `--canvas-out <path>` | rejected | `--canvas-out <absolute path> --output-format json` | rejected |
+| `--file <path>` | text inlined into `prompt.txt`; other files refused (exit 7) | `--file <absolute path>` | `--file <absolute path>` |
+| `--output-format json` | — | also `--output-format json` (for `citations`) | also `--output-format json` (for `citations` and the model fields) |
+| `--continue`, value-less `--resume` | `-c` | `-c` | `-c` |
+| `--resume <id>`, `--session-id <id>`, `--session <id>` | `--chat <id>` | `--chat <id>` | `--chat <id>` |
+| `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` | also `--timeout <secs>` |
+| `--target-arg <arg>` | passed through | passed through | passed through (e.g. `--strict-model`) |
+| `--system-prompt`, `--append-system-prompt`, tools flags, `--permission-mode`, `--add-dir`, `--mcp-config`, `--settings`, `--dangerously-skip-permissions` | rejected | rejected | rejected |
 
 Each CLI drives one Chrome profile, so runs on the same backend queue on that
 CLI's profile lock. tmuxlet passes `--lock-wait <timeout>` so a queued run waits
@@ -485,9 +516,10 @@ up to its run timeout instead of failing after the CLI's 30s default. The CLI's
 answer timeout starts only after it gets the lock, so a long queue can still end
 in tmuxlet's own `timeout`.
 
-You need `musecli` / `gweb` with print mode (`-p`) on the `PATH` of your login
-shell, already signed in (`musecli login` / `gweb login`). Point
-`TMUXLET_MUSECLI_BIN` / `TMUXLET_GWEB_BIN` at another program to override.
+You need `musecli` / `gweb` / `cgpt` with print mode (`-p`) on the `PATH` of
+your login shell, already signed in (`musecli login` / `gweb login` / `cgpt
+login`). Point `TMUXLET_MUSECLI_BIN` / `TMUXLET_GWEB_BIN` / `TMUXLET_CGPT_BIN`
+at another program to override.
 
 ## Permissions
 
@@ -512,7 +544,7 @@ Each target gets the narrowest grant it supports:
 | `cursor` | `--force` (enables print-mode writes) |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; hermes has no scoped allow/deny tier) |
 | `pi` | none — auto-approves tool use by default |
-| `muse` / `gweb` | none — chat backends run no tools and no completion contract |
+| `muse` / `gweb` / `chatgpt` | none — chat backends run no tools and no completion contract |
 
 Policy: if a target has an auto-classifier (only `claude`'s `auto`), use it **and**
 still pin the exact contract operations with explicit allow-rules rather than
@@ -677,7 +709,7 @@ Nonzero statuses:
   output is the CLI's error message.
 
 Exit codes: **0** completed; **1** an error, or a run that ended `blocked`,
-`timeout`, or `exited`; **6** gweb rate limited (`rate_limited`); **7** a
+`timeout`, or `exited`; **6** gweb or chatgpt rate limited (`rate_limited`); **7** a
 `--file` the target can't take (see [Attachments](#attachments---file)).
 
 On `blocked` and `timeout`, tmuxlet writes `pane.log` and `error.txt` under the

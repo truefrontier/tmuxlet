@@ -115,7 +115,7 @@ struct Options {
     model: Option<String>,
     // gweb only: Gemini's Thinking level (low/medium/high; gweb validates the value).
     thinking: Option<String>,
-    // gweb only: where gweb saves the reply's images (a directory or a file path).
+    // gweb and chatgpt: where the CLI saves the reply's images (a directory or a file path).
     image_out: Option<String>,
     // gweb only: turn on Gemini's Canvas tool, and where to save the doc's markdown.
     canvas: bool,
@@ -225,6 +225,8 @@ struct RunResult {
     canvas: Option<serde_json::Value>,
     // gweb JSON runs: gweb's citations ({n, label, file} or {n, label, title, url} per footnote).
     citations: Option<serde_json::Value>,
+    // gweb / chatgpt JSON runs: which model was asked for and which answered (MODEL_FIELDS).
+    models: Option<Vec<(String, serde_json::Value)>>,
     output_format: OutputFormat,
     cwd: PathBuf,
     tmux_session: String,
@@ -759,10 +761,11 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         if paths.complete.exists() {
             let output = fs::read_to_string(&paths.complete)
                 .map_err(|e| format!("failed to read completion file: {e}"))?;
-            // Only gweb's JSON result is read back; muse's output stays as it is.
-            let gweb = matches!(opts.target.as_str(), "gweb" | "gemini-web") && gweb_json(&opts);
-            let citations = gweb.then(|| gweb_citations(&output)).flatten();
-            let (output, images, canvas) = if gweb {
+            // Only gweb's and cgpt's JSON results are read back; muse's output stays as it is.
+            let json_result = chat_json(&opts);
+            let citations = json_result.then(|| gweb_citations(&output)).flatten();
+            let models = json_result.then(|| model_fields(&output)).flatten();
+            let (output, images, canvas) = if json_result {
                 gweb_result(&output, opts.image_out.is_some(), gweb_canvas(&opts))
             } else {
                 (output, None, None)
@@ -781,6 +784,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 images,
                 canvas,
                 citations,
+                models,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -836,6 +840,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     images: None,
                     canvas: None,
                     citations: None,
+                    models: None,
                     output_format: opts.output_format,
                     cwd: opts.cwd,
                     tmux_session,
@@ -858,6 +863,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 images: None,
                 canvas: None,
                 citations: None,
+                models: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -882,6 +888,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                 images: None,
                 canvas: None,
                 citations: None,
+                models: None,
                 output_format: opts.output_format,
                 cwd: opts.cwd,
                 tmux_session,
@@ -907,13 +914,7 @@ fn launch_plan(
 ) -> (TargetCommand, Option<String>) {
     if is_chat_target(target) {
         return (
-            chat_launch_command(
-                &base,
-                paths,
-                run_id,
-                exe,
-                matches!(target, "gweb" | "gemini-web"),
-            ),
+            chat_launch_command(&base, paths, run_id, exe, chat_format_env(target)),
             None,
         );
     }
@@ -923,7 +924,19 @@ fn launch_plan(
 }
 
 fn is_chat_target(target: &str) -> bool {
-    matches!(target, "muse" | "musecli" | "gweb" | "gemini-web")
+    matches!(
+        target,
+        "muse" | "musecli" | "gweb" | "gemini-web" | "chatgpt" | "cgpt"
+    )
+}
+
+/// The env var that makes a chat CLI print JSON errors (gweb, cgpt); muse has none.
+fn chat_format_env(target: &str) -> Option<&'static str> {
+    match target {
+        "gweb" | "gemini-web" => Some("GWEB_FORMAT"),
+        "chatgpt" | "cgpt" => Some("CGPT_FORMAT"),
+        _ => None,
+    }
 }
 
 /// Chat backends can't follow the completion contract, so tmuxlet completes the
@@ -941,7 +954,7 @@ fn chat_launch_command(
     paths: &RunPaths,
     run_id: &str,
     exe: &str,
-    gweb: bool,
+    format_env: Option<&str>,
 ) -> TargetCommand {
     let mut cli_line = vec![shell_quote(&cli.program)];
     cli_line.extend(cli.args.iter().map(|arg| shell_quote(arg)));
@@ -949,7 +962,9 @@ fn chat_launch_command(
         "r={root}; {env}{cli} --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" \
 2> \"$r/stderr.txt\" && TMUXLET_HOME=\"$r/../..\" {exe} bridge complete --run {run} --file \"$r/answer.txt\" \
 2>> \"$r/stderr.txt\" || {{ c=$?; cp \"$r/stderr.txt\" \"$r/pane.log\"; printf '%s\\n' \"$c\" > \"$r/exit-code.txt\"; exit \"$c\"; }}",
-        env = if gweb { "GWEB_FORMAT=json " } else { "" },
+        env = format_env
+            .map(|var| format!("{var}=json "))
+            .unwrap_or_default(),
         root = shell_quote(&paths.root.display().to_string()),
         cli = cli_line.join(" "),
         exe = shell_quote(exe),
@@ -962,7 +977,7 @@ fn chat_launch_command(
 }
 
 fn chat_failure_status(target: &str, root: &Path) -> &'static str {
-    if matches!(target, "gweb" | "gemini-web")
+    if matches!(target, "gweb" | "gemini-web" | "chatgpt" | "cgpt")
         && fs::read_to_string(root.join("exit-code.txt"))
             .unwrap_or_default()
             .trim()
@@ -974,15 +989,27 @@ fn chat_failure_status(target: &str, root: &Path) -> &'static str {
     }
 }
 
-// gweb stderr is forced to JSON in the wrapper; preserve its original message
-// and timezone-aware reset timestamp, including null when no time was supplied.
+// gweb and cgpt stderr is forced to JSON in the wrapper; preserve the original
+// message and timezone-aware reset timestamp, including null when no time was
+// supplied. cgpt --strict-model also exits 6, with error "model_fallback" and
+// the requested and served models: that error is kept as it is.
 fn rate_limit_error(result: &RunResult) -> serde_json::Value {
     let payload = result.output.lines().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line)
             .ok()
-            .filter(|v| v["error"] == "rate_limited" && v["code"] == 6 && v["message"].is_string())
+            .filter(|v| {
+                matches!(v["error"].as_str(), Some("rate_limited" | "model_fallback"))
+                    && v["code"] == 6
+                    && v["message"].is_string()
+            })
     });
     let payload = payload.unwrap_or_else(|| serde_json::json!({"message": result.output.trim()}));
+    if payload["error"] == "model_fallback" {
+        return serde_json::json!({
+            "error": "model_fallback", "code": 6, "message": payload["message"],
+            "requestedModel": payload["requestedModel"], "servedModel": payload["servedModel"]
+        });
+    }
     serde_json::json!({
         "error": "rate_limited", "code": 6,
         "message": payload["message"], "resets_at": payload["resets_at"]
@@ -1035,8 +1062,8 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.thinking.is_some() && !matches!(target, "gweb" | "gemini-web") {
         unsupported(target, "--thinking", "only gweb has a thinking level")?;
     }
-    if opts.image_out.is_some() && !matches!(target, "gweb" | "gemini-web") {
-        unsupported(target, "--image-out", "only gweb saves images")?;
+    if opts.image_out.is_some() && !matches!(target, "gweb" | "gemini-web" | "chatgpt" | "cgpt") {
+        unsupported(target, "--image-out", "only gweb and chatgpt save images")?;
     }
     if !matches!(target, "gweb" | "gemini-web") {
         if opts.canvas {
@@ -1057,6 +1084,7 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "hermes" | "hermes-agent" => hermes_command(opts)?,
         "muse" | "musecli" => muse_command(opts)?,
         "gweb" | "gemini-web" => gweb_command(opts)?,
+        "chatgpt" | "cgpt" => chatgpt_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
     cmd.args.extend(opts.target_args.iter().cloned());
@@ -1597,8 +1625,9 @@ fn hermes_command(opts: &Options) -> Result<TargetCommand, String> {
     })
 }
 
-// Chat backends: Meta Muse via `musecli` and Gemini web via `gweb` (programs
-// overridable with TMUXLET_MUSECLI_BIN / TMUXLET_GWEB_BIN). They are print-mode
+// Chat backends: Meta Muse via `musecli`, Gemini web via `gweb`, and ChatGPT web
+// via `cgpt` (programs overridable with TMUXLET_MUSECLI_BIN / TMUXLET_GWEB_BIN /
+// TMUXLET_CGPT_BIN). They are print-mode
 // chat CLIs, not agent TUIs, so they get the raw prompt and tmuxlet completes the
 // run itself (see chat_launch_command). Sessions are the CLI's chat ids: an
 // explicit id (`--resume <id>`, `--session-id`, `--session`) maps to `--chat
@@ -1639,6 +1668,39 @@ fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
     Ok(cmd)
 }
 
+fn chatgpt_command(opts: &Options) -> Result<TargetCommand, String> {
+    let mut cmd = chat_command(opts, "chatgpt", "TMUXLET_CGPT_BIN", "cgpt")?;
+    push_opt(&mut cmd.args, "--model", &opts.model);
+    for path in flag_files(opts) {
+        cmd.args.extend(["--file".into(), path.into()]);
+    }
+    if let Some(out) = &opts.image_out {
+        cmd.args
+            .extend(["--image-out".into(), absolute_from(out, &opts.cwd)]);
+    }
+    if chatgpt_json(opts) {
+        // cgpt then writes its JSON result to answer.txt; gweb_result turns it back
+        // into the text output plus `images` (the shapes match gweb's).
+        cmd.args.extend(["--output-format".into(), "json".into()]);
+    }
+    Ok(cmd)
+}
+
+/// cgpt runs whose JSON result tmuxlet reads back: --image-out, and any run whose
+/// own result is JSON (for `citations` and the model fields).
+fn chatgpt_json(opts: &Options) -> bool {
+    opts.image_out.is_some() || opts.output_format == OutputFormat::Json
+}
+
+/// Whether this run's chat CLI writes its JSON result to answer.txt.
+fn chat_json(opts: &Options) -> bool {
+    match opts.target.as_str() {
+        "gweb" | "gemini-web" => gweb_json(opts),
+        "chatgpt" | "cgpt" => chatgpt_json(opts),
+        _ => false,
+    }
+}
+
 fn gweb_canvas(opts: &Options) -> bool {
     opts.canvas || opts.canvas_out.is_some()
 }
@@ -1661,14 +1723,14 @@ fn flag_files(opts: &Options) -> impl Iterator<Item = &str> {
 /// text, else None (refused). Verified from each CLI's --help and docs:
 /// claude expands `@path` mentions (its Read tool takes images and PDFs too);
 /// codex has `-i/--image`; pi takes `@file` launch arguments (text or image);
-/// hermes expands `@file:path` in REPL messages; gweb has `--file` for every
-/// type. cursor-agent and muse have no file input; opencode's `-f` is only on
+/// hermes expands `@file:path` in REPL messages; gweb and cgpt have `--file` for
+/// every type. cursor-agent and muse have no file input; opencode's `-f` is only on
 /// `opencode run`, not the TUI tmuxlet drives; grok's and agy's `@` file pickers
 /// are interactive, so their launch prompts get text inlined instead.
 fn delivery_for(target: &str, kind: FileKind) -> Option<Delivery> {
     use FileKind::{Image, Pdf, Text};
     match (target, kind) {
-        ("gweb" | "gemini-web", _) => Some(Delivery::Flag),
+        ("gweb" | "gemini-web" | "chatgpt" | "cgpt", _) => Some(Delivery::Flag),
         ("claude", Text | Image | Pdf) => Some(Delivery::Mention),
         ("codex", Image) | ("pi", Text | Image) => Some(Delivery::Flag),
         ("hermes" | "hermes-agent", Text) => Some(Delivery::Mention),
@@ -1679,6 +1741,7 @@ fn delivery_for(target: &str, kind: FileKind) -> Option<Delivery> {
 
 const ATTACH_TARGETS: &[&str] = &[
     "claude", "codex", "cursor", "agy", "opencode", "grok", "hermes", "pi", "muse", "gweb",
+    "chatgpt",
 ];
 
 /// Resolve each --file against `cwd`, classify it, and pick its delivery for
@@ -1905,6 +1968,30 @@ fn gweb_citations(output: &str) -> Option<serde_json::Value> {
         .get("citations")
         .filter(|v| v.is_array())
         .cloned()
+}
+
+/// The model fields a chat CLI's JSON result may carry, in run-JSON order: cgpt's
+/// requested and served model plus its fallback flag, and gweb's served-model
+/// fields when it has them.
+const MODEL_FIELDS: &[&str] = &[
+    "requestedModel",
+    "servedModel",
+    "servedModelId",
+    "servedModelDisplay",
+    "fallback",
+    "fallbackFrom",
+    "fallbackTo",
+];
+
+/// The MODEL_FIELDS present in a chat CLI's JSON result, in MODEL_FIELDS order, or
+/// None when it has none.
+fn model_fields(output: &str) -> Option<Vec<(String, serde_json::Value)>> {
+    let value = serde_json::from_str::<serde_json::Value>(output.trim()).ok()?;
+    let fields: Vec<(String, serde_json::Value)> = MODEL_FIELDS
+        .iter()
+        .filter_map(|key| value.get(*key).map(|v| (key.to_string(), v.clone())))
+        .collect();
+    (!fields.is_empty()).then_some(fields)
 }
 
 fn chat_command(
@@ -3489,6 +3576,9 @@ fn result_json(result: &RunResult) -> String {
         if let Some(citations) = &result.citations {
             extra.push_str(&format!(",\"citations\":{citations}"));
         }
+        for (key, value) in result.models.iter().flatten() {
+            extra.push_str(&format!(",\"{}\":{value}", json_escape(key)));
+        }
         format!("{}{extra}}}", &base[..base.len() - 1])
     }
 }
@@ -3606,12 +3696,12 @@ Usage:
 Print-mode options:
   -p, --print                              Blocking programmatic mode (required for runs)
       --target <name>                      Target CLI: claude, agy, codex, opencode, pi, cursor, grok, hermes,
-                                           or chat backends muse, gweb (default: claude)
+                                           or chat backends muse, gweb, chatgpt (default: claude)
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
       --thinking <level>                   gweb Thinking level: low, medium, high (or l, m, h)
-      --image-out <dir|path>               gweb: save the reply's images there; JSON result gets `images`
+      --image-out <dir|path>               gweb, chatgpt: save the reply's images there; JSON result gets `images`
       --canvas                             gweb: turn on Gemini's Canvas; JSON result gets `canvas`
       --canvas-out <path>                  gweb: also save the Canvas doc's markdown there (implies --canvas)
       --file, --attach <path>              Attach a file (repeatable) by the target's native mechanism, else
@@ -3640,7 +3730,7 @@ Print-mode options:
 
 Unsupported target combinations fail fast. See README for per-target mapping.
 
-Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb),
+Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, chatgpt),
 7 --file refused (a file the target can't take, or inlined text over the caps).
 
 Subcommands:
@@ -3675,6 +3765,7 @@ Environment:
   TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
   TMUXLET_MUSECLI_BIN=<path>               musecli program for --target muse (default: musecli)
   TMUXLET_GWEB_BIN=<path>                  gweb program for --target gweb (default: gweb)
+  TMUXLET_CGPT_BIN=<path>                  cgpt program for --target chatgpt (default: cgpt)
 
 Examples:
   tmuxlet -p \"say ready\"
@@ -3686,6 +3777,7 @@ Examples:
   tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json \"blue stars\"
   tmuxlet -p --target gweb --file notes.md --file chart.png \"Summarize both\"
   tmuxlet -p --target gweb --canvas-out ./scene.md --output-format json \"Write a scene in Canvas\"
+  tmuxlet -p --target chatgpt --image-out ./out --output-format json --timeout 900 \"blue stars\"
   tmuxlet bridge complete --run <id> --file answer.txt"
     )
 }
@@ -4271,7 +4363,7 @@ mod tests {
 
     #[test]
     fn chat_targets_launch_print_mode_with_lock_wait() {
-        for target in ["muse", "musecli", "gweb", "gemini-web"] {
+        for target in ["muse", "musecli", "gweb", "gemini-web", "chatgpt", "cgpt"] {
             let opts = with_grant(parse(&["--target", target, "-p", "x"]));
             let cmd = target_command(&opts).unwrap();
             // Only print-mode flags: the contract grant adds nothing, and tmuxlet's
@@ -4289,17 +4381,21 @@ mod tests {
         };
         assert_eq!(program("muse"), program("musecli"));
         assert_eq!(program("gweb"), program("gemini-web"));
+        assert_eq!(program("chatgpt"), program("cgpt"));
         if env::var_os("TMUXLET_MUSECLI_BIN").is_none() {
             assert_eq!(program("muse"), "musecli");
         }
         if env::var_os("TMUXLET_GWEB_BIN").is_none() {
             assert_eq!(program("gweb"), "gweb");
         }
+        if env::var_os("TMUXLET_CGPT_BIN").is_none() {
+            assert_eq!(program("chatgpt"), "cgpt");
+        }
     }
 
     #[test]
     fn chat_targets_map_session_controls_to_chat() {
-        for target in ["muse", "gweb"] {
+        for target in ["muse", "gweb", "chatgpt", "cgpt"] {
             for flags in [
                 ["--resume", "c1"],
                 ["--session-id", "c1"],
@@ -4404,7 +4500,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "{target} does not support normalized flag --image-out (only gweb saves images)"
+                    "{target} does not support normalized flag --image-out (only gweb and chatgpt save images)"
                 ),
                 "{argv:?}"
             );
@@ -4454,6 +4550,7 @@ mod tests {
             images: Some(images.clone()),
             canvas: None,
             citations: None,
+            models: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-img".into(),
@@ -4483,7 +4580,7 @@ mod tests {
             &["--permission-mode", "auto"],
             &["--dangerously-skip-permissions"],
         ];
-        for target in ["muse", "gweb"] {
+        for target in ["muse", "gweb", "chatgpt"] {
             for flags in cases {
                 let argv = chat_argv(target, flags);
                 let err = target_command(&parse(&argv)).unwrap_err();
@@ -4548,7 +4645,13 @@ mod tests {
                     ),
                 ],
             };
-            let launch = chat_launch_command(&cli, &paths, "run", "/must-not-call-bridge", true);
+            let launch = chat_launch_command(
+                &cli,
+                &paths,
+                "run",
+                "/must-not-call-bridge",
+                Some("GWEB_FORMAT"),
+            );
             let status = Command::new("sh").args(&launch.args[1..]).status().unwrap();
             assert_eq!(status.code(), Some(code));
             assert_eq!(
@@ -4561,7 +4664,7 @@ mod tests {
                 fs::read_to_string(root.join("pane.log")).unwrap().trim(),
                 payload
             );
-            for target in ["gweb", "gemini-web"] {
+            for target in ["gweb", "gemini-web", "chatgpt", "cgpt"] {
                 assert_eq!(
                     chat_failure_status(target, &root),
                     if code == 6 { "rate_limited" } else { "exited" }
@@ -4588,6 +4691,7 @@ mod tests {
                 images: None,
                 canvas: None,
                 citations: None,
+                models: None,
                 output_format: OutputFormat::Json,
                 cwd: PathBuf::from("/tmp"),
                 tmux_session: "test".into(),
@@ -4603,6 +4707,177 @@ mod tests {
             assert_eq!(result_status_code(&result.status), 6);
             assert_eq!(result_status_code("exited"), 1);
         }
+    }
+
+    #[test]
+    fn chatgpt_passes_model_files_and_image_out_with_json_output() {
+        let dir = attach_dir();
+        let argv = [
+            "--target",
+            "chatgpt",
+            "-C",
+            dir.to_str().unwrap(),
+            "-m",
+            "gpt-6-thinking",
+            "--image-out",
+            "out/",
+            "-p",
+            "x",
+        ];
+        let mut opts = parse(&argv);
+        opts.attachments = plan("chatgpt", &["pic.png"], &dir).unwrap();
+        let cmd = target_command(&opts).unwrap();
+        let pic = dir.join("pic.png").canonicalize().unwrap();
+        assert_eq!(
+            cmd.args,
+            [
+                "--lock-wait".to_string(),
+                "1800".into(),
+                "-p".into(),
+                "--quiet".into(),
+                "--model".into(),
+                "gpt-6-thinking".into(),
+                "--file".into(),
+                pic.display().to_string(),
+                "--image-out".into(),
+                format!("{}/out/", dir.display()),
+                "--output-format".into(),
+                "json".into(),
+            ]
+        );
+        let cmd = target_command(&parse(&chat_argv("cgpt", &[]))).unwrap();
+        assert!(!cmd.args.contains(&"--output-format".to_string())); // plain runs keep text answers
+        let cmd = target_command(&parse(&chat_argv("cgpt", &["--output-format", "json"]))).unwrap();
+        assert!(has_pair(&cmd.args, "--output-format", "json")); // for citations and the model fields
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn chatgpt_rejects_thinking_and_canvas() {
+        for (flags, why) in [
+            (
+                &["--thinking", "high"][..],
+                "--thinking (only gweb has a thinking level)",
+            ),
+            (
+                &["--canvas"][..],
+                "--canvas (only gweb has Gemini's Canvas)",
+            ),
+            (
+                &["--canvas-out", "c.md"][..],
+                "--canvas-out (only gweb has Gemini's Canvas)",
+            ),
+        ] {
+            let err = target_command(&parse(&chat_argv("chatgpt", flags))).unwrap_err();
+            assert_eq!(
+                err,
+                format!("chatgpt does not support normalized flag {why}")
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_launch_forces_json_errors() {
+        let base = target_command(&parse(&chat_argv("chatgpt", &[]))).unwrap();
+        let (launch, paste) = launch_plan("cgpt", base, &fixed_paths(), "r", "/bin/t", "p");
+        assert!(paste.is_none());
+        assert!(
+            launch.args[2].contains("; CGPT_FORMAT=json "),
+            "{}",
+            launch.args[2]
+        );
+        let base = target_command(&parse(&chat_argv("muse", &[]))).unwrap();
+        let (launch, _) = launch_plan("muse", base, &fixed_paths(), "r", "/bin/t", "p");
+        assert!(!launch.args[2].contains("_FORMAT=json"));
+    }
+
+    #[test]
+    fn chat_json_results_carry_model_fields_in_order() {
+        let cgpt = serde_json::json!({"chatId": "c", "answer": "pong", "requestedModel": "gpt-6-thinking",
+            "servedModel": "gpt-6-t-mini", "servedModelDisplay": null, "fallback": true,
+            "fallbackFrom": "gpt-6-thinking", "fallbackTo": "gpt-6-t-mini", "imageCount": 0, "images": []});
+        let fields = model_fields(&cgpt.to_string()).unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "requestedModel",
+                "servedModel",
+                "servedModelDisplay",
+                "fallback",
+                "fallbackFrom",
+                "fallbackTo"
+            ]
+        );
+        // gweb's served-model fields pass through too; a result without any has none.
+        let gweb = serde_json::json!({"answer": "x", "servedModel": "gemini-4-argon", "servedModelId": "id"});
+        assert_eq!(model_fields(&gweb.to_string()).unwrap().len(), 2);
+        assert!(model_fields(r#"{"answer": "x"}"#).is_none());
+        assert!(model_fields("plain text").is_none());
+
+        let result = RunResult {
+            id: "m".into(),
+            target: "chatgpt".into(),
+            status: "completed".into(),
+            output: "pong\n".into(),
+            images: Some(serde_json::json!([])),
+            canvas: None,
+            citations: Some(serde_json::json!([])),
+            models: Some(fields),
+            output_format: OutputFormat::Json,
+            cwd: PathBuf::from("/tmp"),
+            tmux_session: "t".into(),
+            completion_source: "explicit".into(),
+            elapsed_ms: 1,
+        };
+        let text = result_json(&result);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["requestedModel"], "gpt-6-thinking");
+        assert_eq!(json["servedModel"], "gpt-6-t-mini");
+        assert_eq!(json["fallback"], true);
+        assert!(text.find("\"citations\"").unwrap() < text.find("\"requestedModel\"").unwrap());
+    }
+
+    #[test]
+    fn chatgpt_image_result_turns_cgpt_json_into_text_and_images() {
+        let image = serde_json::json!({"path": "/tmp/tm/stars-1.png", "width": 1254, "height": 1254,
+            "bytes": 1200158, "mime": "image/png", "original": true, "sourceWidth": 1254,
+            "sourceHeight": 1254, "source": "original"});
+        let cgpt = serde_json::json!({"chatId": "c", "answer": "", "imageCount": 1, "images": [image.clone()],
+            "servedModel": "gpt-5-4-thinking"});
+        let (output, images, canvas) = gweb_result(&format!("{cgpt}\n"), true, false);
+        assert_eq!(output, "/tmp/tm/stars-1.png\n");
+        assert_eq!(images, Some(serde_json::json!([image])));
+        assert!(canvas.is_none());
+    }
+
+    #[test]
+    fn strict_model_fallback_keeps_its_own_error() {
+        let payload = serde_json::json!({"error": "model_fallback", "code": 6,
+            "message": "Asked for gpt-6-thinking, but ChatGPT answered with gpt-6-t-mini.",
+            "requestedModel": "gpt-6-thinking", "servedModel": "gpt-6-t-mini", "hint": "h"});
+        let result = RunResult {
+            id: "f".into(),
+            target: "chatgpt".into(),
+            status: "rate_limited".into(),
+            output: format!("{payload}\n"),
+            images: None,
+            canvas: None,
+            citations: None,
+            models: None,
+            output_format: OutputFormat::Json,
+            cwd: PathBuf::from("/tmp"),
+            tmux_session: "t".into(),
+            completion_source: "fallback".into(),
+            elapsed_ms: 1,
+        };
+        let json: serde_json::Value = serde_json::from_str(&result_json(&result)).unwrap();
+        assert_eq!(json["error"], "model_fallback");
+        assert_eq!(json["code"], 6);
+        assert_eq!(json["servedModel"], "gpt-6-t-mini");
+        assert_eq!(json["requestedModel"], "gpt-6-thinking");
     }
 
     #[test]
@@ -5864,6 +6139,8 @@ quote> Do not wait for the user after the final response is written.'\n";
                 "gemini-web",
                 [Some(Flag), Some(Flag), Some(Flag), Some(Flag)],
             ),
+            ("chatgpt", [Some(Flag), Some(Flag), Some(Flag), Some(Flag)]),
+            ("cgpt", [Some(Flag), Some(Flag), Some(Flag), Some(Flag)]),
             ("cursor", [Some(Inline), None, None, None]),
             ("agy", [Some(Inline), None, None, None]),
             ("opencode", [Some(Inline), None, None, None]),
@@ -5886,17 +6163,17 @@ quote> Do not wait for the user after the final response is written.'\n";
             message,
             format!(
                 "--file {pic}: cursor can't take image files: it has no native way to attach one, and only \
-text is inlined (targets that take image files: claude, codex, pi, gweb)"
+text is inlined (targets that take image files: claude, codex, pi, gweb, chatgpt)"
             )
         );
         let (_, message) = plan("codex", &["doc.pdf"], &dir).unwrap_err();
         assert!(
-            message.ends_with("(targets that take PDF files: claude, gweb)"),
+            message.ends_with("(targets that take PDF files: claude, gweb, chatgpt)"),
             "{message}"
         );
         let (_, message) = plan("claude", &["blob.bin"], &dir).unwrap_err();
         assert!(
-            message.ends_with("(targets that take binary files: gweb)"),
+            message.ends_with("(targets that take binary files: gweb, chatgpt)"),
             "{message}"
         );
         fs::remove_dir_all(dir).ok();
@@ -6213,6 +6490,7 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
             images: None,
             canvas: None,
             citations: Some(citations.clone()),
+            models: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-ct".into(),
@@ -6287,6 +6565,7 @@ text is inlined (targets that take image files: claude, codex, pi, gweb)"
             images: Some(serde_json::json!([])),
             canvas: Some(canvas.clone()),
             citations: None,
+            models: None,
             output_format: OutputFormat::Json,
             cwd: PathBuf::from("/tmp"),
             tmux_session: "tmuxlet-cv".into(),
