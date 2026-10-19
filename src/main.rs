@@ -545,6 +545,17 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
         i += 1;
     }
 
+    // `llmcli:<site>` aliases for the chat backends, canonicalized so the rest
+    // of the code keeps matching the existing target names.
+    if let Some(canon) = match opts.target.as_str() {
+        "llmcli:gemini" => Some("gweb"),
+        "llmcli:chatgpt" => Some("chatgpt"),
+        "llmcli:muse" => Some("muse"),
+        _ => None,
+    } {
+        opts.target = canon.into();
+    }
+
     Ok(opts)
 }
 
@@ -1625,9 +1636,9 @@ fn hermes_command(opts: &Options) -> Result<TargetCommand, String> {
     })
 }
 
-// Chat backends: Meta Muse via `musecli`, Gemini web via `gweb`, and ChatGPT web
-// via `cgpt` (programs overridable with TMUXLET_MUSECLI_BIN / TMUXLET_GWEB_BIN /
-// TMUXLET_CGPT_BIN). They are print-mode
+// Chat backends: Meta Muse, Gemini web, and ChatGPT web, all run through the
+// shared `llmcli` binary as `llmcli <site> ...` (binary overridable with
+// TMUXLET_LLMCLI_BIN; default `llmcli`). They are print-mode
 // chat CLIs, not agent TUIs, so they get the raw prompt and tmuxlet completes the
 // run itself (see chat_launch_command). Sessions are the CLI's chat ids: an
 // explicit id (`--resume <id>`, `--session-id`, `--session`) maps to `--chat
@@ -1640,11 +1651,11 @@ fn muse_command(opts: &Options) -> Result<TargetCommand, String> {
     if opts.model.is_some() {
         unsupported("muse", "--model", "Muse has no model picker")?;
     }
-    chat_command(opts, "muse", "TMUXLET_MUSECLI_BIN", "musecli")
+    chat_command(opts, "muse")
 }
 
 fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
-    let mut cmd = chat_command(opts, "gweb", "TMUXLET_GWEB_BIN", "gweb")?;
+    let mut cmd = chat_command(opts, "gweb")?;
     push_opt(&mut cmd.args, "--model", &opts.model);
     push_opt(&mut cmd.args, "--thinking", &opts.thinking);
     for path in flag_files(opts) {
@@ -1669,7 +1680,7 @@ fn gweb_command(opts: &Options) -> Result<TargetCommand, String> {
 }
 
 fn chatgpt_command(opts: &Options) -> Result<TargetCommand, String> {
-    let mut cmd = chat_command(opts, "chatgpt", "TMUXLET_CGPT_BIN", "cgpt")?;
+    let mut cmd = chat_command(opts, "chatgpt")?;
     push_opt(&mut cmd.args, "--model", &opts.model);
     for path in flag_files(opts) {
         cmd.args.extend(["--file".into(), path.into()]);
@@ -1994,12 +2005,7 @@ fn model_fields(output: &str) -> Option<Vec<(String, serde_json::Value)>> {
     (!fields.is_empty()).then_some(fields)
 }
 
-fn chat_command(
-    opts: &Options,
-    target: &str,
-    bin_env: &str,
-    default_bin: &str,
-) -> Result<TargetCommand, String> {
+fn chat_command(opts: &Options, target: &str) -> Result<TargetCommand, String> {
     reject_any(target, "--system-prompt", &opts.system_prompt)?;
     reject_nonempty(
         target,
@@ -2017,7 +2023,17 @@ fn chat_command(
         unsupported(target, "--dangerously-skip-permissions", "")?;
     }
 
+    // Chat backends all run through the shared `llmcli` binary as
+    // `llmcli <site> --lock-wait N -p ...`; the print-mode flags match the
+    // old gweb/cgpt/musecli surface one-for-one.
+    let site = match target {
+        "muse" | "musecli" => "muse",
+        "gweb" | "gemini-web" => "gemini",
+        "chatgpt" | "cgpt" => "chatgpt",
+        _ => target,
+    };
     let mut args = vec![
+        site.into(),
         "--lock-wait".into(),
         opts.timeout.as_secs().to_string(),
         "-p".into(),
@@ -2036,10 +2052,10 @@ fn chat_command(
         args.extend(["--timeout".into(), opts.timeout.as_secs().to_string()]);
     }
     Ok(TargetCommand {
-        program: env::var(bin_env)
+        program: env::var("TMUXLET_LLMCLI_BIN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| default_bin.into()),
+            .unwrap_or_else(|| "llmcli".into()),
         args,
     })
 }
@@ -3763,9 +3779,7 @@ Environment:
   TMUXLET_MEMORY_GUARD=<truthy>            Enable memory-pressure guard
   TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
   TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
-  TMUXLET_MUSECLI_BIN=<path>               musecli program for --target muse (default: musecli)
-  TMUXLET_GWEB_BIN=<path>                  gweb program for --target gweb (default: gweb)
-  TMUXLET_CGPT_BIN=<path>                  cgpt program for --target chatgpt (default: cgpt)
+  TMUXLET_LLMCLI_BIN=<path>                llmcli program for chat backends muse/gweb/chatgpt (default: llmcli)
 
 Examples:
   tmuxlet -p \"say ready\"
@@ -3885,8 +3899,7 @@ mod tests {
             "TMUXLET_MEMORY_GUARD",
             "TMUXLET_MEMORY_MIN_FREE",
             "TMUXLET_CLAUDE_PERMISSION_MODE",
-            "TMUXLET_MUSECLI_BIN",
-            "TMUXLET_GWEB_BIN",
+            "TMUXLET_LLMCLI_BIN",
             "muse",
             "gweb",
         ];
@@ -4363,12 +4376,20 @@ mod tests {
 
     #[test]
     fn chat_targets_launch_print_mode_with_lock_wait() {
-        for target in ["muse", "musecli", "gweb", "gemini-web", "chatgpt", "cgpt"] {
+        // Chat backends run `llmcli <site> ...`; the site is the first arg.
+        for (target, site) in [
+            ("muse", "muse"),
+            ("musecli", "muse"),
+            ("gweb", "gemini"),
+            ("gemini-web", "gemini"),
+            ("chatgpt", "chatgpt"),
+            ("cgpt", "chatgpt"),
+        ] {
             let opts = with_grant(parse(&["--target", target, "-p", "x"]));
             let cmd = target_command(&opts).unwrap();
             // Only print-mode flags: the contract grant adds nothing, and tmuxlet's
             // default timeout is not forwarded (the CLI keeps its own).
-            assert_eq!(cmd.args, ["--lock-wait", "1800", "-p", "--quiet"]);
+            assert_eq!(cmd.args, [site, "--lock-wait", "1800", "-p", "--quiet"]);
         }
     }
 
@@ -4382,14 +4403,30 @@ mod tests {
         assert_eq!(program("muse"), program("musecli"));
         assert_eq!(program("gweb"), program("gemini-web"));
         assert_eq!(program("chatgpt"), program("cgpt"));
-        if env::var_os("TMUXLET_MUSECLI_BIN").is_none() {
-            assert_eq!(program("muse"), "musecli");
+        // Every chat backend now runs through the shared `llmcli` binary.
+        if env::var_os("TMUXLET_LLMCLI_BIN").is_none() {
+            for t in ["muse", "gweb", "chatgpt"] {
+                assert_eq!(program(t), "llmcli");
+            }
         }
-        if env::var_os("TMUXLET_GWEB_BIN").is_none() {
-            assert_eq!(program("gweb"), "gweb");
-        }
-        if env::var_os("TMUXLET_CGPT_BIN").is_none() {
-            assert_eq!(program("chatgpt"), "cgpt");
+    }
+
+    #[test]
+    fn llmcli_site_aliases_resolve_to_chat_backends() {
+        // `--target llmcli:<site>` is an alias for the matching chat backend and
+        // launches `llmcli <site> --lock-wait ... -p ...`.
+        for (alias, site) in [
+            ("llmcli:gemini", "gemini"),
+            ("llmcli:chatgpt", "chatgpt"),
+            ("llmcli:muse", "muse"),
+        ] {
+            let cmd = target_command(&parse(&["--target", alias, "-p", "x"])).unwrap();
+            assert_eq!(cmd.args[0], site, "{alias}");
+            assert_eq!(cmd.args[1], "--lock-wait", "{alias}");
+            assert!(cmd.args.contains(&"-p".to_string()), "{alias}");
+            if env::var_os("TMUXLET_LLMCLI_BIN").is_none() {
+                assert_eq!(cmd.program, "llmcli", "{alias}");
+            }
         }
     }
 
@@ -4612,7 +4649,7 @@ mod tests {
         assert_eq!(
             launch.args[2],
             format!(
-                "r=/home/u/.tmuxlet/runs/abc; {program} --lock-wait 1800 -p --quiet -c \
+                "r=/home/u/.tmuxlet/runs/abc; {program} muse --lock-wait 1800 -p --quiet -c \
 --prompt-file \"$r/prompt.txt\" --output-file \"$r/answer.txt\" 2> \"$r/stderr.txt\" \
 && TMUXLET_HOME=\"$r/../..\" /bin/tmuxlet bridge complete --run run-1 --file \"$r/answer.txt\" 2>> \"$r/stderr.txt\" \
 || {{ c=$?; cp \"$r/stderr.txt\" \"$r/pane.log\"; printf '%s\\n' \"$c\" > \"$r/exit-code.txt\"; exit \"$c\"; }}"
@@ -4731,7 +4768,8 @@ mod tests {
         assert_eq!(
             cmd.args,
             [
-                "--lock-wait".to_string(),
+                "chatgpt".to_string(),
+                "--lock-wait".into(),
                 "1800".into(),
                 "-p".into(),
                 "--quiet".into(),

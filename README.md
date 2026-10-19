@@ -104,9 +104,9 @@ Initial adapters:
 - `cursor` / `cursor-agent`
 - `grok` (xAI Grok Build CLI)
 - `hermes` / `hermes-agent` (Nous Research Hermes Agent CLI)
-- `muse` / `musecli` (Meta Muse via [musecli](https://github.com/truefrontier/muse-cli); a chat backend, see [Chat backends](#chat-backends-muse-gweb-chatgpt))
-- `gweb` / `gemini-web` (Gemini on the web via [gweb](https://github.com/truefrontier/gemini-web-cli); a chat backend)
-- `chatgpt` / `cgpt` (ChatGPT on the web via [cgpt](https://github.com/truefrontier/chatgpt-web-cli); a chat backend)
+- `muse` / `musecli` / `llmcli:muse` (Meta Muse via [llmcli](https://github.com/truefrontier/webcli) `llmcli muse`; a chat backend, see [Chat backends](#chat-backends-muse-gweb-chatgpt))
+- `gweb` / `gemini-web` / `llmcli:gemini` (Gemini on the web via `llmcli gemini`; a chat backend)
+- `chatgpt` / `cgpt` / `llmcli:chatgpt` (ChatGPT on the web via `llmcli chatgpt`; a chat backend)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -166,7 +166,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | Flag / aliases | Value | Default | Purpose |
 | --- | --- | --- | --- |
 | `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
-| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli`, `gweb` / `gemini-web`, `chatgpt` / `cgpt`. |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli` / `llmcli:muse`, `gweb` / `gemini-web` / `llmcli:gemini`, `chatgpt` / `cgpt` / `llmcli:chatgpt`. |
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
@@ -256,9 +256,7 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
-| `TMUXLET_MUSECLI_BIN` | `musecli` | Program run for `--target muse`. |
-| `TMUXLET_GWEB_BIN` | `gweb` | Program run for `--target gweb`. |
-| `TMUXLET_CGPT_BIN` | `cgpt` | Program run for `--target chatgpt`. |
+| `TMUXLET_LLMCLI_BIN` | `llmcli` | Program run for the chat backends `muse` / `gweb` / `chatgpt` (as `llmcli <site>`). |
 
 ## Resuming Target Sessions
 
@@ -393,9 +391,11 @@ tmuxlet -p --target claude --file src/main.rs "Review this file"
 
 ## Chat backends (muse, gweb, chatgpt)
 
-`muse` sends the prompt to Meta Muse through `musecli`, `gweb` sends it to
-Gemini on the web through `gweb`, and `chatgpt` sends it to ChatGPT on the web
-through `cgpt`. They return the answer exactly like any other target:
+`muse` sends the prompt to Meta Muse, `gweb` to Gemini on the web, and
+`chatgpt` to ChatGPT on the web, all through the shared `llmcli` binary
+(`llmcli muse` / `llmcli gemini` / `llmcli chatgpt`). The `llmcli:<site>`
+target names are aliases for the same backends. They return the answer exactly
+like any other target:
 
 ```bash
 tmuxlet -p --target muse "Reply with exactly: pong"
@@ -516,9 +516,9 @@ up to its run timeout instead of failing after the CLI's 30s default. The CLI's
 answer timeout starts only after it gets the lock, so a long queue can still end
 in tmuxlet's own `timeout`.
 
-You need `musecli` / `gweb` / `cgpt` with print mode (`-p`) on the `PATH` of
-your login shell, already signed in (`musecli login` / `gweb login` / `cgpt
-login`). Point `TMUXLET_MUSECLI_BIN` / `TMUXLET_GWEB_BIN` / `TMUXLET_CGPT_BIN`
+You need `llmcli` with print mode (`-p`) on the `PATH` of your login shell, with
+each backend's identity already signed in (`llmcli muse login` /
+`llmcli gemini login` / `llmcli chatgpt login`). Point `TMUXLET_LLMCLI_BIN`
 at another program to override.
 
 ## Permissions
