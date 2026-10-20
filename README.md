@@ -99,7 +99,7 @@ Initial adapters:
 - `claude` (default)
 - `agy` / `gemini` (Google Antigravity CLI; `gemini` is a deprecated alias)
 - `codex`
-- `opencode`
+- `opencode` (opencode 1.18+ TUI, launched as `opencode <cwd> [--model provider/model] --auto --prompt <prompt>`)
 - `pi`
 - `cursor` / `cursor-agent`
 - `grok` (xAI Grok Build CLI)
@@ -190,6 +190,8 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--mcp-config` | `<path>` (repeatable) | unset | MCP config path pass-through where supported. |
 | `--settings` | `<path>` | unset | Settings file pass-through where supported. |
 | `--target-arg` | `<arg>` (repeatable) | unset | Raw escape hatch appended to the target launch command. |
+| `--env` | `KEY=VALUE` (repeatable) | unset | Set an environment variable for the target CLI. It goes on the run's own tmux session (`tmux new-session -e`), never the tmux server's global env and never the typed launch line. `KEY=` sets an empty value. Values of keys containing `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, or `AUTH` show as `<redacted>` in `meta.json` / `status`. Any target. |
+| `--ollama` | `<model>` | unset | `claude` and `codex` only: run the CLI against a model served by local Ollama (sets `--model`; see [Local models through Ollama](#local-models-through-ollama)). Conflicts with a different `--model`. |
 | `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. Chat backends also get it as the CLI's `--timeout` when given explicitly. |
 | `--owner` | `<name>` | `TMUXLET_OWNER` or parent-process-name@caller-cwd | Record the run's owner. |
 | `--reap-min-age` | `<minutes>` | `10` (or `TMUXLET_REAP_MIN_AGE_MIN`) | Minimum run age for automatic self-healing; non-negative integer. |
@@ -208,7 +210,41 @@ tmuxlet -p --target codex --session-id 01984d2f-... "continue the fix"
 tmuxlet -p --target opencode --resume ses_abc123 "check status"
 tmuxlet -p --system-prompt "be terse" --model sonnet "say ready"
 printf "say ready" | tmuxlet -p -
+tmuxlet -p --ollama minimax-m3.1-flash:cloud "say ready"
+tmuxlet -p --target codex --ollama minimax-m3.1-flash:cloud "say ready"
+tmuxlet -p --env MY_FLAG=1 --env FOO_TOKEN=... "say ready"
 ```
+
+### Local models through Ollama
+
+`--ollama <model>` runs Claude Code or Codex against a model served by the local
+Ollama server (`ollama serve`, default `http://localhost:11434`), including
+Ollama Cloud models such as `minimax-m3.1-flash:cloud`. It follows Ollama's
+documented setup (docs.ollama.com/integrations/claude-code and /codex, and what
+`ollama launch claude|codex` does):
+
+| Target | What tmuxlet does |
+| --- | --- |
+| `claude` | `claude --model <model>` with session env `ANTHROPIC_BASE_URL=http://localhost:11434`, `ANTHROPIC_AUTH_TOKEN=ollama`, `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL=<model>`, `CLAUDE_CODE_SUBAGENT_MODEL=<model>`, `CLAUDE_CODE_AUTO_MODE_SERVER=0` (Ollama has no server-side auto-mode checks; skipped if you set it yourself), plus `ollama launch`'s telemetry/feedback switches. Claude Code shows "API Usage Billing", not your Claude subscription. |
+| `codex` | `codex --oss --local-provider ollama --model <model>` (Ollama's manual setup). Nothing is written to `~/.codex`. |
+
+```bash
+TMUXLET_OWNER=me tmuxlet -p --ollama minimax-m3.1-flash:cloud "reply with the word pong"
+TMUXLET_OWNER=me tmuxlet -p --target codex --ollama minimax-m3.1-flash:cloud "reply with the word pong"
+```
+
+The env rides on the run's tmux session (`new-session -e`), so it works no matter
+what the tmux server inherited, and an `ANTHROPIC_BASE_URL` exported in the
+caller's shell is **not** needed (and not used: tmux panes don't inherit the
+caller's env). `--env` entries win over the preset, e.g.
+`--env ANTHROPIC_BASE_URL=http://gpu-box:11434`; `TMUXLET_OLLAMA_HOST` changes
+the default claude base URL. For other targets use their own config, e.g.
+`--target opencode -m ollama/<model>` with an `ollama` provider in
+`opencode.json`. Without `--ollama`, claude and codex launch exactly as before.
+To check what served a run: Claude Code's header in `pane.log` shows the model and
+"API Usage Billing", and its session transcript records the served model; Codex
+shows the model in its status line and records `model_provider: ollama` in its
+session file; `ollama ps` lists the model as recently used.
 
 ### Subcommands
 
@@ -216,7 +252,7 @@ printf "say ready" | tmuxlet -p -
 | --- | --- | --- |
 | `status` | (none) | Print `meta.json` for each run under the state dir (one JSON object per line when present). |
 | `read <id>` | `--lines <N>` (default **80**) | Capture and print the live tmux pane for that run. |
-| `send <id> <message>` | message required | Paste a message into the run’s pane (as if typed). |
+| `send <id> <message>` | message required | Paste a message into the run’s pane (as if typed). Refused when the pane is back at a bare shell. |
 | `send-all [message]` | `--interval <secs>` (default **1**), `--enter` | Deliver a message (or just Enter) to every live tmuxlet session, paced so sessions are not herded. Empty message implies Enter. |
 | `attach <id>` | (none) | Attach to the run’s tmux session interactively. |
 | `stop <id>` | (none) | Try a graceful `/exit`, then kill the session if it remains; prints `Stopped <id>`. |
@@ -257,6 +293,7 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
 | `TMUXLET_LLMCLI_BIN` | `llmcli` | Program run for the chat backends `muse` / `gweb` / `chatgpt` (as `llmcli <site>`). |
+| `TMUXLET_OLLAMA_HOST` | `http://localhost:11434` | `ANTHROPIC_BASE_URL` that `--ollama` gives claude. |
 
 ## Resuming Target Sessions
 
@@ -306,7 +343,8 @@ come from Cargo.
 
 ## How Print Mode Works
 
-For Claude, Codex, and Grok, tmuxlet passes one full prompt in the launch command. The
+For Claude, Codex, Grok, Cursor, opencode (`--prompt`), and agy
+(`--prompt-interactive`), tmuxlet passes one full prompt in the launch command. The
 target-visible prompt is ordered as:
 
 ```text
@@ -317,9 +355,27 @@ TMUXLET COMPLETION CONTRACT:
 ```
 
 The completion contract tells the target CLI to write its final response to
-`answer.txt` and then run `tmuxlet bridge complete`. Other targets currently use
-a paste fallback when tmuxlet cannot safely assume positional prompt support.
-Chat backends (`muse`, `gweb`, `chatgpt`) never see the contract; see below.
+`answer.txt` and then run `tmuxlet bridge complete`. `pi` and `hermes` use a
+paste fallback. Chat backends (`muse`, `gweb`, `chatgpt`) never see the contract;
+see below.
+
+### Shell guard (0.12.0)
+
+tmuxlet never types the prompt into a bare shell. It watches the pane's
+foreground process (tmux `pane_current_command`):
+
+- Paste targets (`pi`, `hermes`) are pasted into only after the CLI has held
+  the pane's foreground for 2.5s, re-checked right before the paste. If the CLI
+  never starts (missing binary, bad flags, a CLI that prints help and exits)
+  within 30s, the run aborts with exit 1:
+  `tmuxlet: hermes did not start (the pane is still at zsh); ... the prompt was not sent; see pane.log`.
+- Every agent target: if the pane falls back to a shell for 3s before the
+  completion contract is met (the CLI crashed, quit, or rejected its
+  arguments), the run aborts with exit 1:
+  `tmuxlet: opencode exited before completing (the pane fell back to zsh); the run was aborted so nothing is typed into the shell; see pane.log`.
+  The session is killed; `pane.log` and `error.txt` stay in the run dir.
+- The startup auto-`Enter` is never sent to a bare shell, and `send` /
+  `send-all` refuse to paste into one.
 
 ## Attachments (`--file`)
 
@@ -540,7 +596,7 @@ Each target gets the narrowest grant it supports:
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with the run dir carved in as a `writable_root` — scoped |
 | `grok` | explicit Claude-compatible allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` via `--allow` — scoped (sandbox off by default; no `--add-dir`) |
 | `agy` | `--dangerously-skip-permissions` (no graded CLI mode; scoped allowlist lives in settings.json, not a flag) |
-| `opencode` | `--dangerously-skip-permissions` (no confirmed headless allow-list flag) |
+| `opencode` | `--auto` (auto-approve permissions not explicitly denied; no confirmed headless allow-list flag) |
 | `cursor` | `--force` (enables print-mode writes) |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; hermes has no scoped allow/deny tier) |
 | `pi` | none — auto-approves tool use by default |
@@ -707,6 +763,9 @@ Nonzero statuses:
   `--timeout`.
 - `exited`: the tmux session ended before completion. For chat backends the
   output is the CLI's error message.
+
+If an agent CLI fails to start or exits before completing, tmuxlet prints the
+reason to stderr and exits 1 (see [Shell guard](#shell-guard-0120)).
 
 Exit codes: **0** completed; **1** an error, or a run that ended `blocked`,
 `timeout`, or `exited`; **6** gweb or chatgpt rate limited (`rate_limited`); **7** a

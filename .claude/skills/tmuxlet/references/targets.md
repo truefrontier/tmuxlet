@@ -44,7 +44,7 @@ it supports:
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with run dir as `writable_root` | yes |
 | `grok` | Claude-compatible allow-rules via `--allow` (sandbox off; no `--add-dir`) | yes |
 | `agy` | `--dangerously-skip-permissions` (no graded mode available) | no — broad |
-| `opencode` | `--dangerously-skip-permissions` | no — broad |
+| `opencode` | `--auto` | no — broad |
 | `cursor` | `--force` | no — broad |
 | `hermes` | `--yolo` (bypasses dangerous-command approval; no scoped tier) | no — broad |
 | `pi` | none needed — auto-approves tool use by default | n/a |
