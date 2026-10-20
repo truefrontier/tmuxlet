@@ -45,6 +45,13 @@ const MENTION_SAFE: &str = "-_./+,@%~=";
 // 1024 bytes (macOS MAX_CANON) and drops the rest, and tmux refuses commands over ~16 KiB. A longer line goes
 // into <run>/launch.sh, which the pane's shell sources instead.
 const LAUNCH_LINE_MAX: usize = 1000;
+// How long the target CLI gets to take over the pane's foreground after the
+// launch line is typed, and how long it must hold it before tmuxlet pastes.
+const TARGET_START_SECS: u64 = 30;
+const TARGET_STABLE_MS: u64 = 2500;
+// How long the pane may sit back at a bare shell before the run is aborted.
+const TARGET_EXIT_GRACE_MS: u64 = 3000;
+const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputFormat {
@@ -149,6 +156,10 @@ struct Options {
     memory_guard: bool,
     owner: Option<String>,
     reap_min_age: Option<u64>,
+    // --env KEY=VALUE pairs, set on the run's tmux session (never the server env).
+    env: Vec<(String, String)>,
+    // --ollama MODEL: route claude/codex through the local Ollama server.
+    ollama: Option<String>,
 }
 
 impl Default for Options {
@@ -188,6 +199,8 @@ impl Default for Options {
             memory_guard: false,
             owner: None,
             reap_min_age: None,
+            env: Vec::new(),
+            ollama: None,
         }
     }
 }
@@ -515,6 +528,10 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
             "--mcp-config" => opts.mcp_configs.push(take_value(args, &mut i, arg)?),
             "--settings" => opts.settings = Some(take_value(args, &mut i, arg)?),
             "--target-arg" => opts.target_args.push(take_value(args, &mut i, arg)?),
+            "--env" => opts
+                .env
+                .push(parse_env_pair(&take_value(args, &mut i, arg)?)?),
+            "--ollama" => opts.ollama = Some(take_value(args, &mut i, arg)?),
             "--timeout" => {
                 let seconds = take_value(args, &mut i, arg)?
                     .parse::<u64>()
@@ -556,7 +573,138 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
         opts.target = canon.into();
     }
 
+    if let Some(model) = &opts.ollama {
+        if model.trim().is_empty() {
+            return Err(
+                "--ollama requires a model name, e.g. --ollama minimax-m3.1-flash:cloud".into(),
+            );
+        }
+        match &opts.model {
+            Some(other) if other != model => {
+                return Err(format!(
+                    "--ollama {model} conflicts with --model {other}; --ollama sets the model"
+                ));
+            }
+            _ => opts.model = Some(model.clone()),
+        }
+    }
+
     Ok(opts)
+}
+
+/// `KEY=VALUE` from --env. The key must be a portable env var name; the value
+/// may be empty (`ANTHROPIC_API_KEY=`) and may contain `=`.
+fn parse_env_pair(value: &str) -> Result<(String, String), String> {
+    let (key, val) = value
+        .split_once('=')
+        .ok_or_else(|| format!("--env expects KEY=VALUE, got {}", redact_env_arg(value)))?;
+    let valid = !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(format!("--env: invalid variable name {key:?}"));
+    }
+    Ok((key.to_string(), val.to_string()))
+}
+
+// A malformed --env value has no key to judge, so never echo it whole.
+fn redact_env_arg(value: &str) -> String {
+    if value.is_empty() {
+        "an empty value".into()
+    } else {
+        "a value without '='".into()
+    }
+}
+
+/// Keys whose values tmuxlet never writes to meta.json, status, or errors.
+fn is_secret_env_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "KEY",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|word| key.contains(word))
+}
+
+fn display_env_value(key: &str, value: &str) -> String {
+    if is_secret_env_key(key) && !value.is_empty() {
+        "<redacted>".into()
+    } else {
+        value.to_string()
+    }
+}
+
+fn ollama_host() -> String {
+    env::var("TMUXLET_OLLAMA_HOST")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.to_string())
+}
+
+/// The env `ollama launch claude` sets (ollama cmd/launch/claude.go): Claude
+/// Code talks to Ollama's Anthropic-compatible API, every model tier and
+/// subagents use the chosen model, and auto mode uses the client classifier
+/// because Ollama has no server-side auto-mode checks.
+fn ollama_claude_env(model: &str, host: &str) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = [
+        ("ANTHROPIC_BASE_URL", host),
+        ("ANTHROPIC_AUTH_TOKEN", "ollama"),
+        ("ANTHROPIC_API_KEY", ""),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", model),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", model),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", model),
+        ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+        ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+        ("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off"),
+        ("DISABLE_ERROR_REPORTING", "1"),
+        ("DISABLE_FEEDBACK_COMMAND", "1"),
+        ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    if env::var_os("CLAUDE_CODE_AUTO_MODE_SERVER").is_none() {
+        env.push(("CLAUDE_CODE_AUTO_MODE_SERVER".into(), "0".into()));
+    }
+    env
+}
+
+/// Variables set on the run's tmux session (`new-session -e`): the --ollama
+/// preset first, then --env, a later key replacing an earlier one in place.
+fn session_env(opts: &Options) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(model) = &opts.ollama
+        && opts.target == "claude"
+    {
+        env.extend(ollama_claude_env(model, &ollama_host()));
+    }
+    for (key, value) in &opts.env {
+        match env.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => env.push((key.clone(), value.clone())),
+        }
+    }
+    env
+}
+
+/// The session env as recorded in meta.json and status, secrets redacted.
+fn redacted_env_json(env: &[(String, String)]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in env {
+        map.insert(
+            key.clone(),
+            serde_json::json!(display_env_value(key, value)),
+        );
+    }
+    serde_json::Value::Object(map)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -743,7 +891,8 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         &prompt,
     );
 
-    write_meta(&paths, &run_id, &tmux_session, &opts, &base_command)?;
+    let env = session_env(&opts);
+    write_meta(&paths, &run_id, &tmux_session, &opts, &base_command, &env)?;
     // Acquire a concurrency slot before the heavy TUI session exists. Blocks/queues
     // when at cap or (opt-in) under memory pressure; on a clean acquire-timeout we
     // drop the staged run dir so it doesn't linger as a phantom "exited" run.
@@ -751,12 +900,34 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
         fs::remove_dir_all(&paths.root).ok();
         return Err(e);
     }
-    start_tmux_session(&tmux_session, &opts.cwd)?;
+    start_tmux_session(&tmux_session, &opts.cwd, &env)?;
     let line = launch_line(&launch_command, &paths.root.join("launch.sh"))?;
     send_launch_command(&tmux_session, &line)?;
     if let Some(text) = paste {
+        // Never paste into a bare shell: wait for the CLI to own the pane, and
+        // re-check right before the paste.
+        let guard = wait_for_target_start(&tmux_session, &opts.target).and_then(|()| {
+            match pane_current_command(&tmux_session) {
+                Some(name) if !is_shell_command(&name) => Ok(()),
+                other => Err(target_not_running_message(
+                    &opts.target,
+                    other.as_deref(),
+                    true,
+                )),
+            }
+        });
+        if let Err(err) = guard {
+            return Err(abort_run(&paths, &tmux_session, err));
+        }
         paste_text(&tmux_session, &text)?;
     }
+    // Agent CLIs must own the pane's foreground; chat backends run under
+    // `exec sh -c` (a shell by name) and handle their own exits.
+    let guard_exit = !chat;
+    let mut shell_since: Option<Instant> = None;
+    let mut target_seen = false;
+    // Auto-Enter is for the target's own dialogs, never a bare shell.
+    let mut pane_at_shell = false;
 
     let startup_auto_enter_deadline =
         Instant::now() + Duration::from_secs(STARTUP_AUTO_ENTER_WINDOW_SECS);
@@ -806,6 +977,29 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
         // Chat backends never show confirmation prompts, so skip the auto-Enter
         // and blocked heuristics for them.
+        if guard_exit && Instant::now() >= next_pane_poll {
+            let foreground = pane_current_command(&tmux_session);
+            let at_shell = foreground.as_deref().is_none_or(is_shell_command);
+            pane_at_shell = at_shell;
+            if !at_shell {
+                target_seen = true;
+                shell_since = None;
+            } else if target_seen || started.elapsed() >= Duration::from_secs(TARGET_START_SECS) {
+                let since = *shell_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(TARGET_EXIT_GRACE_MS)
+                    && !paths.complete.exists()
+                    && tmux_session_exists(&tmux_session)
+                {
+                    let err = target_not_running_message(
+                        &opts.target,
+                        foreground.as_deref(),
+                        !target_seen,
+                    );
+                    return Err(abort_run(&paths, &tmux_session, err));
+                }
+            }
+        }
+
         if !chat && Instant::now() >= next_pane_poll {
             let pane = capture_pane(&tmux_session, 200).unwrap_or_default();
             if codex {
@@ -823,6 +1017,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     }
                 }
             } else if Instant::now() <= startup_auto_enter_deadline
+                && !pane_at_shell
                 && startup_enter_attempts < STARTUP_AUTO_ENTER_MAX_ATTEMPTS
                 && is_startup_auto_enter_prompt(&pane)
                 && send_enter(&tmux_session).is_ok()
@@ -910,6 +1105,15 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Ends a run whose target CLI is not running: keeps the pane text and the
+/// reason in the run dir, kills only this run's session, returns the error.
+fn abort_run(paths: &RunPaths, tmux_session: &str, err: String) -> String {
+    capture_pane_to_file(tmux_session, &paths.pane_log).ok();
+    fs::write(&paths.error, format!("{err}\n")).ok();
+    kill_session_exact(tmux_session);
+    err
 }
 
 /// The pane launch command plus any text to paste after startup. Agent targets
@@ -1041,6 +1245,12 @@ fn command_with_prompt(
         command.args.push("--".to_string());
         command.args.push(final_prompt.to_string());
         (command, true)
+    } else if target == "opencode" {
+        // opencode's TUI submits `--prompt <text>` on startup, so the prompt
+        // rides in the launch command and is never pasted.
+        command.args.push("--prompt".to_string());
+        command.args.push(final_prompt.to_string());
+        (command, true)
     } else if matches!(target, "agy" | "gemini") {
         // agy (Antigravity) has no positional prompt. Seed the initial prompt
         // into its interactive session via `--prompt-interactive` so it rides in
@@ -1083,6 +1293,13 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         if opts.canvas_out.is_some() {
             unsupported(target, "--canvas-out", "only gweb has Gemini's Canvas")?;
         }
+    }
+    if opts.ollama.is_some() && !matches!(target, "claude" | "codex") {
+        unsupported(
+            target,
+            "--ollama",
+            "only claude and codex; use --env or --target-arg for other targets",
+        )?;
     }
     let mut cmd = match target {
         "claude" => claude_command(opts)?,
@@ -1323,6 +1540,11 @@ fn codex_command(opts: &Options) -> Result<TargetCommand, String> {
             ),
         ]);
     }
+    if opts.ollama.is_some() {
+        // Ollama's documented manual setup: `codex --oss -m <model>`, pinned to
+        // the ollama local provider (not LM Studio) so no picker appears.
+        args.extend(["--oss".into(), "--local-provider".into(), "ollama".into()]);
+    }
     push_opt(&mut args, "--model", &opts.model);
     args.extend(["--cd".into(), opts.cwd.display().to_string()]);
     for path in flag_files(opts) {
@@ -1399,11 +1621,15 @@ fn opencode_command(opts: &Options) -> Result<TargetCommand, String> {
             );
         }
     }
-    args.extend(["--dir".into(), opts.cwd.display().to_string()]);
+    // opencode 1.18 TUI: `opencode [project] [options]`. It has no --dir or
+    // --dangerously-skip-permissions (those made it print its help and exit);
+    // the project is the positional path and --auto is its auto-approve.
+    args.insert(0, opts.cwd.display().to_string());
     // opencode has no graded auto mode and no confirmed headless allow-list flag,
-    // so its bypass flag is the only reliable non-interactive auto-approve path.
+    // so --auto ("auto-approve permissions that are not explicitly denied") is
+    // the only reliable non-interactive auto-approve path.
     if opts.dangerously_skip_permissions || opts.contract_grant.is_some() {
-        args.push("--dangerously-skip-permissions".into());
+        args.push("--auto".into());
     }
     Ok(TargetCommand {
         program: "opencode".into(),
@@ -2114,20 +2340,128 @@ Do not wait for the user after the final response is written.",
     )
 }
 
-fn start_tmux_session(name: &str, cwd: &Path) -> Result<(), String> {
+fn start_tmux_session(name: &str, cwd: &Path, env: &[(String, String)]) -> Result<(), String> {
+    run_tmux(new_session_args(name, cwd, env)).map(|_| ())
+}
+
+/// `tmux new-session` argv. --env pairs ride as `-e KEY=VALUE`: they land in
+/// this session's environment only (the pane's shell inherits them), never in
+/// the tmux server's global env, and are never typed into the pane.
+fn new_session_args(name: &str, cwd: &Path, env: &[(String, String)]) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        ["new-session", "-d", "-s", name, "-x", "220", "-y", "50"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+    args.push("-c".into());
+    args.push(cwd.as_os_str().to_owned());
+    for (key, value) in env {
+        args.push("-e".into());
+        args.push(format!("{key}={value}").into());
+    }
+    args
+}
+
+/// The process leading the pane's foreground process group (tmux
+/// `pane_current_command`), e.g. `zsh` at a bare prompt or `claude` once the
+/// target CLI runs.
+fn pane_current_command(tmux_session: &str) -> Option<String> {
     run_tmux([
-        OsStr::new("new-session"),
-        OsStr::new("-d"),
-        OsStr::new("-s"),
-        OsStr::new(name),
-        OsStr::new("-x"),
-        OsStr::new("220"),
-        OsStr::new("-y"),
-        OsStr::new("50"),
-        OsStr::new("-c"),
-        cwd.as_os_str(),
+        OsStr::new("display-message"),
+        OsStr::new("-p"),
+        OsStr::new("-t"),
+        OsStr::new(&tmux_pane_target(tmux_session)),
+        OsStr::new("#{pane_current_command}"),
     ])
-    .map(|_| ())
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// True when the pane's foreground is an interactive shell: anything typed or
+/// pasted now would run as shell commands.
+fn is_shell_command(name: &str) -> bool {
+    let base = name.trim().trim_start_matches('-');
+    let base = base.rsplit('/').next().unwrap_or(base);
+    matches!(
+        base,
+        "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "nu" | "login"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartWatch {
+    // Still waiting for the target to take over (or to hold the pane long enough).
+    Waiting,
+    // The target has held the foreground for TARGET_STABLE_MS.
+    Started,
+    // The pane is still (or again) a bare shell after the start window.
+    NeverStarted,
+}
+
+/// Pure start-guard step: `foreground` is the pane's current command,
+/// `held_ms` how long a non-shell has held it, `elapsed_ms` since launch.
+fn start_watch_step(foreground: Option<&str>, held_ms: u64, elapsed_ms: u64) -> StartWatch {
+    let running = foreground.is_some_and(|name| !is_shell_command(name));
+    if running && held_ms >= TARGET_STABLE_MS {
+        StartWatch::Started
+    } else if elapsed_ms >= TARGET_START_SECS * 1000 {
+        StartWatch::NeverStarted
+    } else {
+        StartWatch::Waiting
+    }
+}
+
+/// Blocks until the target CLI owns the pane's foreground and has held it for
+/// TARGET_STABLE_MS. Err when it never starts or exits right away (bad args,
+/// missing binary, auth failure), so nothing is ever pasted into the shell.
+fn wait_for_target_start(tmux_session: &str, target: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let mut held_since: Option<Instant> = None;
+    let mut last = None;
+    loop {
+        let foreground = pane_current_command(tmux_session);
+        let running = foreground
+            .as_deref()
+            .is_some_and(|name| !is_shell_command(name));
+        if running {
+            held_since.get_or_insert_with(Instant::now);
+        } else {
+            held_since = None;
+        }
+        let held_ms = held_since.map_or(0, |t| t.elapsed().as_millis() as u64);
+        match start_watch_step(
+            foreground.as_deref(),
+            held_ms,
+            started.elapsed().as_millis() as u64,
+        ) {
+            StartWatch::Started => return Ok(()),
+            StartWatch::NeverStarted => {
+                return Err(target_not_running_message(target, last.as_deref(), true));
+            }
+            StartWatch::Waiting => {}
+        }
+        if !tmux_session_exists(tmux_session) {
+            return Err(format!("{target} session ended before the CLI started"));
+        }
+        last = foreground;
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn target_not_running_message(target: &str, foreground: Option<&str>, at_start: bool) -> String {
+    let shell = foreground.unwrap_or("a shell");
+    if at_start {
+        format!(
+            "{target} did not start (the pane is still at {shell}); check the CLI is installed, \
+its flags, and its login; the prompt was not sent; see pane.log"
+        )
+    } else {
+        format!(
+            "{target} exited before completing (the pane fell back to {shell}); \
+the run was aborted so nothing is typed into the shell; see pane.log"
+        )
+    }
 }
 
 /// tmux target for an exact *session* name (has-session, kill-session,
@@ -3236,7 +3570,7 @@ fn handle_send_all(args: &[String]) -> Result<(), String> {
         let result = if enter {
             send_enter(session)
         } else {
-            paste_text(session, &message)
+            paste_into_agent(session, &message)
         };
         match result {
             Ok(()) => println!("  -> {} ({}/{})", short_id(id), idx + 1, total),
@@ -3332,7 +3666,19 @@ fn handle_send(args: &[String]) -> Result<(), String> {
     if message.is_empty() {
         return Err("usage: tmuxlet send <id> <message>".into());
     }
-    paste_text(&tmux_name_from_id(id), &message)
+    paste_into_agent(&tmux_name_from_id(id), &message)
+}
+
+/// `send`/`send-all` paste only while an agent CLI owns the pane; at a bare
+/// shell the text would run as commands.
+fn paste_into_agent(tmux_session: &str, text: &str) -> Result<(), String> {
+    match pane_current_command(tmux_session) {
+        Some(name) if !is_shell_command(&name) => paste_text(tmux_session, text),
+        Some(name) => Err(format!(
+            "refusing to paste: the pane is at a bare shell ({name}), not the agent CLI"
+        )),
+        None => Err("refusing to paste: cannot tell what the pane is running".into()),
+    }
 }
 
 fn handle_attach(args: &[String]) -> Result<(), String> {
@@ -3540,6 +3886,7 @@ fn write_meta(
     tmux_session: &str,
     opts: &Options,
     command: &TargetCommand,
+    env: &[(String, String)],
 ) -> Result<(), String> {
     let meta = format!(
         "{{\"id\":\"{}\",\"target\":\"{}\",\"tmuxSession\":\"{}\",\"cwd\":\"{}\",\"program\":\"{}\",\"args\":{},\"outputFormat\":\"{}\"}}\n",
@@ -3557,6 +3904,12 @@ fn write_meta(
     let mut meta: serde_json::Value = serde_json::from_str(&meta).expect("valid metadata JSON");
     meta["owner"] = serde_json::json!(caller_owner(opts.owner.as_deref()));
     meta["startedAt"] = serde_json::json!(epoch_secs());
+    if !env.is_empty() {
+        meta["env"] = redacted_env_json(env);
+    }
+    if let Some(model) = &opts.ollama {
+        meta["ollama"] = serde_json::json!(model);
+    }
     fs::write(&paths.meta, format!("{meta}\n"))
         .map_err(|e| format!("failed to write metadata: {e}"))?;
     Ok(())
@@ -3737,6 +4090,10 @@ Print-mode options:
       --mcp-config <path>                  MCP config path (repeatable) where supported
       --settings <path>                    Settings file where supported
       --target-arg <arg>                   Raw target CLI escape hatch (repeatable)
+      --env KEY=VALUE                      Env var for the target CLI (repeatable), set on the run's own tmux
+                                           session, not the server env; *TOKEN*/*KEY*/*SECRET* values redacted
+      --ollama <model>                     claude, codex: use a model served by local Ollama (sets --model;
+                                           claude gets ANTHROPIC_BASE_URL etc., codex gets --oss)
       --timeout <seconds>                  Print-mode timeout (default: 1800)
       --owner <name>                       Run owner (flag > TMUXLET_OWNER > parent-process-name@caller-cwd)
       --reap-min-age <minutes>             Auto-reap minimum run age (default 10; env TMUXLET_REAP_MIN_AGE_MIN)
@@ -3745,6 +4102,8 @@ Print-mode options:
   --                                       End options; remaining args are the prompt
 
 Unsupported target combinations fail fast. See README for per-target mapping.
+The prompt is never typed into a bare shell: if the target CLI fails to start or exits
+before completing, the run aborts with exit 1 and pane.log keeps the reason.
 
 Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, chatgpt),
 7 --file refused (a file the target can't take, or inlined text over the caps).
@@ -3780,12 +4139,15 @@ Environment:
   TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
   TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
   TMUXLET_LLMCLI_BIN=<path>                llmcli program for chat backends muse/gweb/chatgpt (default: llmcli)
+  TMUXLET_OLLAMA_HOST=<url>                Base URL --ollama gives claude (default: http://localhost:11434)
 
 Examples:
   tmuxlet -p \"say ready\"
   tmuxlet --target codex -p --cwd ~/Sites/app \"say ready\"
   printf 'say ready' | tmuxlet -p -
   TMUXLET_MAX_CONCURRENCY=4 tmuxlet -p \"say ready\"
+  tmuxlet -p --ollama minimax-m3.1-flash:cloud \"Reply with exactly: pong\"
+  tmuxlet -p --target codex --ollama minimax-m3.1-flash:cloud \"Reply with exactly: pong\"
   tmuxlet -p --target muse \"Reply with exactly: pong\"
   tmuxlet -p --target gweb -m \"3.8 Flash\" \"Reply with exactly: pong\"
   tmuxlet -p --target gweb -m Argon --image-out ./out --output-format json \"blue stars\"
@@ -4098,10 +4460,321 @@ mod tests {
     fn opencode_grant_uses_bypass_floor() {
         let opts = with_grant(parse(&["--target", "opencode", "-p", "x"]));
         let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--auto".to_string()));
+        // opencode 1.18 has neither flag; either one makes it print help and exit.
         assert!(
-            cmd.args
+            !cmd.args
                 .contains(&"--dangerously-skip-permissions".to_string())
         );
+        assert!(!cmd.args.contains(&"--dir".to_string()));
+    }
+
+    #[test]
+    fn opencode_launch_uses_project_positional_and_prompt_flag() {
+        let mut opts = with_grant(parse(&[
+            "--target",
+            "opencode",
+            "-m",
+            "ollama/minimax-m3.1-flash:cloud",
+            "-p",
+            "x",
+        ]));
+        opts.cwd = PathBuf::from("/work/app");
+        let (launch, paste) = launch_plan(
+            "opencode",
+            target_command(&opts).unwrap(),
+            &fixed_paths(),
+            "r",
+            "/bin/t",
+            "user prompt",
+        );
+        assert!(paste.is_none(), "opencode must never be pasted into");
+        assert_eq!(launch.program, "opencode");
+        assert_eq!(launch.args[0], "/work/app");
+        assert!(has_pair(
+            &launch.args,
+            "--model",
+            "ollama/minimax-m3.1-flash:cloud"
+        ));
+        let n = launch.args.len();
+        assert_eq!(launch.args[n - 2], "--prompt");
+        assert!(launch.args[n - 1].starts_with("user prompt\n\nTMUXLET COMPLETION CONTRACT:"));
+    }
+
+    #[test]
+    fn env_flag_parses_repeatable_pairs() {
+        let opts = parse(&[
+            "--env",
+            "A=1",
+            "--env",
+            "EMPTY=",
+            "--env",
+            "URL=http://x?a=b",
+            "-p",
+            "x",
+        ]);
+        assert_eq!(
+            opts.env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("URL".to_string(), "http://x?a=b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_flag_rejects_bad_pairs_without_echoing_values() {
+        for bad in ["NOEQUALS", "=v", "1A=v", "A-B=v", "A B=v"] {
+            let mut args = vec![
+                "--env".to_string(),
+                bad.to_string(),
+                "-p".into(),
+                "x".into(),
+            ];
+            let err = parse_options(&mut args).unwrap_err();
+            assert!(err.starts_with("--env"), "{bad}: {err}");
+        }
+        let mut args: Vec<String> = ["--env", "sk-supersecretvalue", "-p", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = parse_options(&mut args).unwrap_err();
+        assert!(!err.contains("supersecret"), "{err}");
+    }
+
+    #[test]
+    fn secret_env_values_are_redacted() {
+        for key in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "my_secret",
+            "DB_PASSWORD",
+        ] {
+            assert!(is_secret_env_key(key), "{key}");
+            assert_eq!(display_env_value(key, "v"), "<redacted>");
+        }
+        assert!(!is_secret_env_key("ANTHROPIC_BASE_URL"));
+        assert_eq!(
+            display_env_value("ANTHROPIC_BASE_URL", "http://h"),
+            "http://h"
+        );
+        // An empty secret is shown as empty: it leaks nothing and shows the unset.
+        assert_eq!(display_env_value("ANTHROPIC_API_KEY", ""), "");
+        let json = redacted_env_json(&[
+            ("ANTHROPIC_AUTH_TOKEN".into(), "abc123".into()),
+            ("MODE".into(), "x".into()),
+        ]);
+        assert_eq!(json["ANTHROPIC_AUTH_TOKEN"], "<redacted>");
+        assert_eq!(json["MODE"], "x");
+        assert!(!json.to_string().contains("abc123"));
+    }
+
+    #[test]
+    fn env_rides_on_new_session_not_the_launch_line() {
+        let env = vec![
+            ("K".to_string(), "v 1".to_string()),
+            ("E".to_string(), String::new()),
+        ];
+        let args: Vec<String> = new_session_args("tmuxlet-r", Path::new("/w"), &env)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(has_pair(&args, "-e", "K=v 1"));
+        assert!(has_pair(&args, "-e", "E="));
+        assert!(has_pair(&args, "-c", "/w"));
+        assert!(!args.iter().any(|a| a == "set-environment" || a == "-g"));
+
+        let mut opts = parse(&["--env", "SECRET_TOKEN=s3cr3t", "-p", "x"]);
+        opts.contract_grant = Some(ContractGrant {
+            run_root: PathBuf::from("/r"),
+            exe: "/bin/t".into(),
+        });
+        let (launch, _) = launch_plan(
+            "claude",
+            target_command(&opts).unwrap(),
+            &fixed_paths(),
+            "r",
+            "/bin/t",
+            "p",
+        );
+        assert!(!launch.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn write_meta_redacts_secret_env() {
+        let dir = env::temp_dir().join(format!("tmuxlet-env-meta-{}", make_run_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let paths = RunPaths {
+            root: dir.clone(),
+            meta: dir.join("meta.json"),
+            prompt: dir.join("prompt.txt"),
+            answer: dir.join("answer.txt"),
+            complete: dir.join("complete.txt"),
+            pane_log: dir.join("pane.log"),
+            error: dir.join("error.txt"),
+        };
+        let opts = parse(&["--ollama", "minimax-m3.1-flash:cloud", "-p", "x"]);
+        let env = session_env(&opts);
+        let cmd = target_command(&opts).unwrap();
+        write_meta(&paths, "id", "session", &opts, &cmd, &env).unwrap();
+        let text = fs::read_to_string(&paths.meta).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(meta["env"]["ANTHROPIC_AUTH_TOKEN"], "<redacted>");
+        assert_eq!(meta["env"]["ANTHROPIC_API_KEY"], "");
+        assert_eq!(meta["ollama"], "minimax-m3.1-flash:cloud");
+        assert!(!text.contains("\"ANTHROPIC_AUTH_TOKEN\":\"ollama\""));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ollama_claude_sets_documented_env_and_model() {
+        let opts = parse(&["--ollama", "minimax-m3.1-flash:cloud", "-p", "x"]);
+        assert_eq!(opts.model.as_deref(), Some("minimax-m3.1-flash:cloud"));
+        let cmd = target_command(&opts).unwrap();
+        assert_eq!(cmd.program, "claude");
+        assert!(has_pair(&cmd.args, "--model", "minimax-m3.1-flash:cloud"));
+        let env = session_env(&opts);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert!(get("ANTHROPIC_BASE_URL").is_some_and(|v| v.starts_with("http")));
+        assert_eq!(get("ANTHROPIC_AUTH_TOKEN"), Some("ollama"));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some(""));
+        assert_eq!(
+            get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some("minimax-m3.1-flash:cloud")
+        );
+        assert_eq!(
+            get("CLAUDE_CODE_SUBAGENT_MODEL"),
+            Some("minimax-m3.1-flash:cloud")
+        );
+    }
+
+    #[test]
+    fn ollama_claude_env_uses_given_host() {
+        let env = ollama_claude_env("m", "http://h:1");
+        assert!(env.contains(&("ANTHROPIC_BASE_URL".into(), "http://h:1".into())));
+    }
+
+    #[test]
+    fn explicit_env_overrides_ollama_preset_in_place() {
+        let opts = parse(&[
+            "--ollama",
+            "m",
+            "--env",
+            "ANTHROPIC_BASE_URL=http://other:1",
+            "--env",
+            "X=1",
+            "-p",
+            "p",
+        ]);
+        let env = session_env(&opts);
+        assert_eq!(
+            env[0],
+            ("ANTHROPIC_BASE_URL".into(), "http://other:1".into())
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k == "ANTHROPIC_BASE_URL")
+                .count(),
+            1
+        );
+        assert_eq!(env.last().unwrap(), &("X".to_string(), "1".to_string()));
+    }
+
+    #[test]
+    fn ollama_codex_uses_oss_ollama_provider() {
+        let opts = parse(&[
+            "--target",
+            "codex",
+            "--ollama",
+            "minimax-m3.1-flash:cloud",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(cmd.args.contains(&"--oss".to_string()));
+        assert!(has_pair(&cmd.args, "--local-provider", "ollama"));
+        assert!(has_pair(&cmd.args, "--model", "minimax-m3.1-flash:cloud"));
+        // codex needs no session env for its OSS provider.
+        assert!(session_env(&opts).is_empty());
+    }
+
+    #[test]
+    fn plain_claude_and_codex_are_unchanged_without_ollama() {
+        let opts = parse(&["-p", "x"]);
+        assert!(session_env(&opts).is_empty());
+        let cmd = target_command(&opts).unwrap();
+        assert!(!cmd.args.iter().any(|a| a.contains("ollama")));
+        let opts = parse(&["--target", "codex", "-m", "gpt-5", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(!cmd.args.contains(&"--oss".to_string()));
+        assert!(!cmd.args.contains(&"--local-provider".to_string()));
+        assert!(session_env(&opts).is_empty());
+    }
+
+    #[test]
+    fn ollama_rejects_other_targets_and_conflicting_model() {
+        let opts = parse(&["--target", "opencode", "--ollama", "m", "-p", "x"]);
+        assert!(target_command(&opts).unwrap_err().contains("--ollama"));
+        let mut args: Vec<String> = ["--ollama", "a", "--model", "b", "-p", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_options(&mut args).unwrap_err().contains("conflicts"));
+        // The same model given twice is fine.
+        let opts = parse(&["--ollama", "a", "--model", "a", "-p", "x"]);
+        assert_eq!(opts.model.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn shell_detection_covers_login_and_paths() {
+        for name in ["zsh", "-zsh", "bash", "/bin/sh", "fish", "login"] {
+            assert!(is_shell_command(name), "{name}");
+        }
+        for name in [
+            "claude",
+            "codex",
+            "opencode",
+            "node",
+            "infisical",
+            "2.1.304",
+            "pi",
+        ] {
+            assert!(!is_shell_command(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn start_guard_waits_for_a_stable_target_then_gives_up() {
+        assert_eq!(start_watch_step(Some("zsh"), 0, 500), StartWatch::Waiting);
+        assert_eq!(
+            start_watch_step(Some("opencode"), 300, 800),
+            StartWatch::Waiting
+        );
+        assert_eq!(
+            start_watch_step(Some("opencode"), TARGET_STABLE_MS, 4000),
+            StartWatch::Started
+        );
+        assert_eq!(
+            start_watch_step(Some("zsh"), 0, TARGET_START_SECS * 1000),
+            StartWatch::NeverStarted
+        );
+        assert_eq!(
+            start_watch_step(None, 0, TARGET_START_SECS * 1000),
+            StartWatch::NeverStarted
+        );
+    }
+
+    #[test]
+    fn not_running_messages_say_the_prompt_was_withheld() {
+        let start = target_not_running_message("opencode", Some("zsh"), true);
+        assert!(start.contains("did not start") && start.contains("prompt was not sent"));
+        let exit = target_not_running_message("claude", Some("zsh"), false);
+        assert!(exit.contains("exited before completing") && exit.contains("aborted"));
     }
 
     #[test]
@@ -4927,15 +5600,8 @@ mod tests {
         assert!(paste.is_none());
         assert!(launch.args.last().unwrap().starts_with(contract));
 
-        let base = target_command(&parse(&["--target", "opencode", "-p", "x"])).unwrap();
-        let (_, paste) = launch_plan(
-            "opencode",
-            base,
-            &fixed_paths(),
-            "r",
-            "/bin/t",
-            "user prompt",
-        );
+        let base = target_command(&parse(&["--target", "pi", "-p", "x"])).unwrap();
+        let (_, paste) = launch_plan("pi", base, &fixed_paths(), "r", "/bin/t", "user prompt");
         assert!(paste.unwrap().starts_with(contract));
     }
 
@@ -5202,7 +5868,7 @@ quote> Do not wait for the user after the final response is written.'\n";
 
     #[test]
     fn unsupported_prompt_argument_targets_use_paste_fallback() {
-        let opts = parse(&["--target", "opencode", "-p", "x"]);
+        let opts = parse(&["--target", "pi", "-p", "x"]);
         let (cmd, prompt_in_launch) =
             command_with_prompt(target_command(&opts).unwrap(), &opts.target, "final prompt");
         assert!(!prompt_in_launch);
@@ -6078,6 +6744,7 @@ quote> Do not wait for the user after the final response is written.'\n";
                 program: "codex".into(),
                 args: vec![],
             },
+            &[],
         )
         .unwrap();
         let meta: serde_json::Value =
