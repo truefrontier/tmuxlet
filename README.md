@@ -182,8 +182,8 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--system-prompt` | `<text>` | unset | System prompt pass-through where supported. |
 | `--append-system-prompt` | `<text>` (repeatable) | unset | Append system-prompt text where supported. |
 | `--add-dir`, `--include-directories` | `<path>` or CSV (repeatable) | unset | Extra directories the target may access where supported. |
-| `--dangerously-skip-permissions`, `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox` | flag | off | Full permission bypass; replaces the scoped completion-contract grant. Mapping is target-specific. |
-| `--permission-mode` | `<mode>` | unset (Claude builder defaults to `auto`) | Permission mode pass-through where supported (`default`, `acceptEdits`, `plan`, `auto`, `dontAsk`, `bypassPermissions` on Claude/Grok). |
+| `--dangerously-skip-permissions`, `--yolo`, `--force`, `--dangerously-bypass-approvals-and-sandbox` | flag | off (Claude is already bypass by default) | Full permission bypass; replaces the scoped completion-contract grant. Mapping is target-specific; on Claude it is `--permission-mode bypassPermissions`. |
+| `--permission-mode` | `<mode>` | unset (Claude: `bypassPermissions`) | Permission mode where supported. Claude accepts only `bypassPermissions` or `auto`: `default`, `manual`, `acceptEdits`, `plan`, `dontAsk` are raised to `auto` with a warning. Grok passes any mode through. |
 | `--allowed-tools`, `--allowedTools` | `<rule>` (repeatable) | unset | Allow-list / allow-rule pass-through where supported. |
 | `--disallowed-tools`, `--disallowedTools` | `<rule>` (repeatable) | unset | Deny-list / deny-rule pass-through where supported. |
 | `--tools` | `<tools>` (repeatable) | unset | Tools allow-list pass-through where supported. |
@@ -291,7 +291,7 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free concurrency slot; `0` = wait forever. |
 | `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
-| `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` when neither `--permission-mode` nor full bypass is set. |
+| `TMUXLET_CLAUDE_PERMISSION_MODE` | `bypassPermissions` | Claude mode when neither `--permission-mode` nor full bypass is set. Only `bypassPermissions` or `auto`; lower modes clamp to `auto`, unknown values to `bypassPermissions`. |
 | `TMUXLET_LLMCLI_BIN` | `llmcli` | Program run for the chat backends `muse` / `gweb` / `chatgpt` (as `llmcli <site>`). |
 | `TMUXLET_OLLAMA_HOST` | `http://localhost:11434` | `ANTHROPIC_BASE_URL` that `--ollama` gives claude. |
 
@@ -592,7 +592,7 @@ Each target gets the narrowest grant it supports:
 
 | Target | Default grant |
 | --- | --- |
-| `claude` | `--permission-mode auto` (classifier) **plus** explicit allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` + `--add-dir <run-dir>` — scoped |
+| `claude` | `--permission-mode bypassPermissions` (default). In `auto` (opt-in, or the fallback) it gets explicit allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` + `--add-dir <run-dir>` — scoped |
 | `codex` | `--ask-for-approval never --sandbox workspace-write` with the run dir carved in as a `writable_root` — scoped |
 | `grok` | explicit Claude-compatible allow-rules `Write(//<run-dir>/**)`, `Edit(//<run-dir>/**)`, `Bash(<tmuxlet> bridge complete:*)` via `--allow` — scoped (sandbox off by default; no `--add-dir`) |
 | `agy` | `--dangerously-skip-permissions` (no graded CLI mode; scoped allowlist lives in settings.json, not a flag) |
@@ -610,13 +610,47 @@ trusting the classifier; otherwise use that target's yolo/bypass. `claude`,
 permission tier. If pinning the contract ops under a classifier is ever not
 possible or stops working, the bypass flag is the documented fallback.
 
+### Claude permission floor
+
+Every claude launch (default, `--ollama`, `--continue`, `--resume`,
+`--session-id`) gets exactly one `--permission-mode`: `bypassPermissions` by
+default, or `auto` when asked for. Nothing lower ever reaches claude. Precedence:
+`--dangerously-skip-permissions` > `--permission-mode` > a `--target-arg
+--permission-mode` (stripped from the pass-through) > `TMUXLET_CLAUDE_PERMISSION_MODE`
+> `bypassPermissions`. Modes below `auto` (`default`, `manual`, `acceptEdits`,
+`plan`, `dontAsk`) are raised to `auto`; unknown values fall back to
+`bypassPermissions`. Both print `tmuxlet: warning: ...` on stderr and append to
+`<run-dir>/warnings.txt`.
+
+If claude refuses bypass in the first 60 seconds (it exits, e.g. `bypassPermissions
+not supported in restricted mode` or root; or its status line shows `accept edits` /
+`plan`), tmuxlet logs a warning, keeps the refused pane as
+`<run-dir>/pane-bypass-refused.log`, and relaunches the run once with
+`--permission-mode auto`. If settings or policy (`disableBypassPermissionsMode`)
+turn bypass into `auto` mode, the run continues in `auto` with a warning.
+
+claude's first-run "Bypass Permissions mode" warning defaults to "No, exit", so
+tmuxlet never answers it with Enter: it selects "Yes, I accept" (Down, Enter) and
+logs a warning. To skip the prompt entirely, pre-accept it once in
+`~/.claude/settings.json`:
+
+```json
+{ "skipDangerousModePermissionPrompt": true }
+```
+
+claude's "trust this folder?" gate (shown on the first launch in a folder it has
+not seen, e.g. a repo) also starts with the cursor on "No, exit". tmuxlet never
+answers it with a bare Enter either: it moves the cursor to "Yes, I trust this
+folder", confirms it, and logs a warning naming the folder. claude then records
+the folder as trusted in `~/.claude.json`, so later runs there skip the prompt.
+
 Overrides:
 
 - `--permission-mode <mode>` (Claude and Grok): set the mode explicitly. On Claude
-  this overrides the `auto` default; on Grok it is passed through as
+  only `bypassPermissions` or `auto` (see above); on Grok it is passed through as
   `--permission-mode`.
 - `TMUXLET_CLAUDE_PERMISSION_MODE`: change the Claude default mode globally
-  without passing the flag each time.
+  without passing the flag each time (`auto` to opt down to the floor).
 - `--dangerously-skip-permissions` (aliases `--yolo`, `--force`,
   `--dangerously-bypass-approvals-and-sandbox`): full bypass. Takes precedence
   over and replaces the scoped grant. On Grok this maps to `--always-approve`; on Hermes to `--yolo`; on agy to `--dangerously-skip-permissions`.

@@ -51,6 +51,23 @@ Pull requests should include a concise summary, the commands run for
 verification, and notes about behavior visible to users, especially changes to
 CLI flags, output status, runtime files, or target-specific mappings.
 
+## Change Notes
+
+- 0.13.0, Claude permission floor. Before: claude launches defaulted to
+  `--permission-mode auto` but passed any caller mode through verbatim
+  (`acceptEdits`, `plan`, `default`, or extra `--target-arg` flags), and
+  `--dangerously-skip-permissions` used a different flag, so sessions came up in
+  bypass, auto, accept-edits, or plan depending on the caller. After: every
+  claude launch gets exactly one `--permission-mode`, `bypassPermissions` by
+  default or `auto` on request (`--permission-mode`, `TMUXLET_CLAUDE_PERMISSION_MODE`);
+  lower modes clamp to `auto` with a warning, `--target-arg` permission flags are
+  folded in, a refused bypass relaunches once in `auto`, and the first-run bypass
+  prompt is accepted instead of Enter-ing "No, exit". The same applies to the
+  "trust this folder?" gate: before, the generic startup auto-Enter picked "No,
+  exit" and claude quit within seconds in any untrusted folder (seen in
+  ai-usage-tracker); after, tmuxlet selects "Yes, I trust this folder". Keep these invariants when
+  touching `claude_command` or the run loop.
+
 ## Agent-Specific Instructions
 
 Do not rewrite unrelated files. Preserve uncommitted user changes. When changing

@@ -52,6 +52,13 @@ const TARGET_STABLE_MS: u64 = 2500;
 // How long the pane may sit back at a bare shell before the run is aborted.
 const TARGET_EXIT_GRACE_MS: u64 = 3000;
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
+// Claude permission floor: every claude launch runs in bypassPermissions unless
+// asked for auto, and never in anything lower than auto.
+const CLAUDE_MODE_BYPASS: &str = "bypassPermissions";
+const CLAUDE_MODE_AUTO: &str = "auto";
+// How long after launch a refused bypass (claude exits or shows a lower mode)
+// triggers the one-time relaunch in auto mode.
+const CLAUDE_BYPASS_FALLBACK_WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputFormat {
@@ -881,6 +888,19 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     let prompt = prompt_with_attachments(&prompt_from(&opts)?, &opts.target, &opts.attachments);
     fs::write(&paths.prompt, &prompt).map_err(|e| format!("failed to write prompt: {e}"))?;
     let base_command = target_command(&opts)?;
+    // Claude always launches in bypassPermissions or auto (never lower). While a
+    // bypass launch is unconfirmed, a refusal triggers one relaunch in auto.
+    let mut claude_bypass_pending = false;
+    if opts.target == "claude" {
+        let (mode, warnings) = resolve_claude_permission_mode(&opts);
+        for warning in &warnings {
+            warn_run(&paths, warning);
+        }
+        claude_bypass_pending = mode == CLAUDE_MODE_BYPASS;
+    }
+    let mut claude_dialog_attempts = 0usize;
+    let mut claude_dialog_sent_at: Option<Instant> = None;
+    let mut relaunch_reason: Option<String> = None;
     let chat = is_chat_target(&opts.target);
     let (launch_command, paste) = launch_plan(
         &opts.target,
@@ -903,6 +923,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     start_tmux_session(&tmux_session, &opts.cwd, &env)?;
     let line = launch_line(&launch_command, &paths.root.join("launch.sh"))?;
     send_launch_command(&tmux_session, &line)?;
+    let mut launch_at = Instant::now();
     if let Some(text) = paste {
         // Never paste into a bare shell: wait for the CLI to own the pane, and
         // re-check right before the paste.
@@ -929,7 +950,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
     // Auto-Enter is for the target's own dialogs, never a bare shell.
     let mut pane_at_shell = false;
 
-    let startup_auto_enter_deadline =
+    let mut startup_auto_enter_deadline =
         Instant::now() + Duration::from_secs(STARTUP_AUTO_ENTER_WINDOW_SECS);
     let mut startup_enter_attempts = 0usize;
     let codex = opts.target == "codex";
@@ -975,6 +996,26 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             });
         }
 
+        if let Some(reason) = relaunch_reason.take() {
+            warn_run(
+                &paths,
+                &format!("{reason}; relaunching claude with --permission-mode auto"),
+            );
+            relaunch_claude_in_auto(&mut opts, &paths, &run_id, &tmux_session, &env, &prompt)?;
+            claude_bypass_pending = false;
+            target_seen = false;
+            shell_since = None;
+            pane_at_shell = false;
+            launch_at = Instant::now();
+            startup_auto_enter_deadline =
+                Instant::now() + Duration::from_secs(STARTUP_AUTO_ENTER_WINDOW_SECS);
+            startup_enter_attempts = 0;
+            last_pane.clear();
+            last_pane_changed_at = Instant::now();
+            next_pane_poll = Instant::now() + Duration::from_secs(PANE_POLL_SECS);
+            continue;
+        }
+
         // Chat backends never show confirmation prompts, so skip the auto-Enter
         // and blocked heuristics for them.
         if guard_exit && Instant::now() >= next_pane_poll {
@@ -984,9 +1025,27 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             if !at_shell {
                 target_seen = true;
                 shell_since = None;
-            } else if target_seen || started.elapsed() >= Duration::from_secs(TARGET_START_SECS) {
+            } else if target_seen || launch_at.elapsed() >= Duration::from_secs(TARGET_START_SECS) {
                 let since = *shell_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(TARGET_EXIT_GRACE_MS)
+                    && !paths.complete.exists()
+                    && tmux_session_exists(&tmux_session)
+                    && claude_bypass_pending
+                    && launch_at.elapsed() < Duration::from_secs(CLAUDE_BYPASS_FALLBACK_WINDOW_SECS)
+                {
+                    // claude quit right after a bypassPermissions launch (e.g.
+                    // "bypassPermissions not supported", root, or a declined
+                    // first-run prompt): retry once in auto instead of failing.
+                    relaunch_reason = Some(
+                        claude_bypass_refusal(
+                            &capture_pane(&tmux_session, 200).unwrap_or_default(),
+                        )
+                        .unwrap_or_else(|| {
+                            "claude exited right after a bypassPermissions launch".into()
+                        }),
+                    );
+                    continue;
+                } else if since.elapsed() >= Duration::from_millis(TARGET_EXIT_GRACE_MS)
                     && !paths.complete.exists()
                     && tmux_session_exists(&tmux_session)
                 {
@@ -1002,6 +1061,60 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
 
         if !chat && Instant::now() >= next_pane_poll {
             let pane = capture_pane(&tmux_session, 200).unwrap_or_default();
+            // claude's first-run bypass warning and its "trust this folder?"
+            // gate both put the cursor on "No, exit": a bare Enter quits claude.
+            // Move the cursor to the yes option and confirm it instead.
+            let is_claude = opts.target == "claude";
+            let bypass_dialog = is_claude && is_claude_bypass_accept_dialog(&pane);
+            let trust_dialog = is_claude && !bypass_dialog && is_claude_trust_dialog(&pane);
+            let claude_dialog = bypass_dialog || trust_dialog;
+            if claude_dialog {
+                let cooled =
+                    claude_dialog_sent_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
+                let option = if bypass_dialog {
+                    "yes, i accept"
+                } else {
+                    "yes, i trust this folder"
+                };
+                if cooled
+                    && claude_dialog_attempts < 4
+                    && !pane_at_shell
+                    && let Some(keys) = menu_keys_to_select(&pane, option)
+                    && send_keys(&tmux_session, &keys).is_ok()
+                {
+                    claude_dialog_attempts += 1;
+                    claude_dialog_sent_at = Some(Instant::now());
+                    let note = if bypass_dialog {
+                        "accepted claude's bypass permissions first-run prompt (pre-accept with skipDangerousModePermissionPrompt: true in ~/.claude/settings.json)".to_string()
+                    } else {
+                        format!(
+                            "answered claude's \"trust this folder?\" prompt with \"Yes, I trust this folder\" for {}",
+                            opts.cwd.display()
+                        )
+                    };
+                    warn_run(&paths, &note);
+                }
+            } else if claude_bypass_pending {
+                let mode_line = claude_mode_line(&pane);
+                if mode_line.contains("bypass permissions on") {
+                    claude_bypass_pending = false;
+                } else if launch_at.elapsed()
+                    < Duration::from_secs(CLAUDE_BYPASS_FALLBACK_WINDOW_SECS)
+                {
+                    if let Some(reason) = claude_bypass_refusal(&pane) {
+                        relaunch_reason = Some(reason);
+                        next_pane_poll = Instant::now();
+                        continue;
+                    } else if mode_line.contains("auto mode on") {
+                        // Settings/policy turned bypass into auto: at the floor, keep it.
+                        warn_run(
+                            &paths,
+                            "claude refused bypassPermissions and started in auto mode; continuing in auto",
+                        );
+                        claude_bypass_pending = false;
+                    }
+                }
+            }
             if codex {
                 // Never auto-Enter codex: fail fast on its startup dialogs instead.
                 if !codex_ready && Instant::now() <= codex_startup_deadline {
@@ -1017,6 +1130,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                     }
                 }
             } else if Instant::now() <= startup_auto_enter_deadline
+                && !claude_dialog
                 && !pane_at_shell
                 && startup_enter_attempts < STARTUP_AUTO_ENTER_MAX_ATTEMPTS
                 && is_startup_auto_enter_prompt(&pane)
@@ -1114,6 +1228,144 @@ fn abort_run(paths: &RunPaths, tmux_session: &str, err: String) -> String {
     fs::write(&paths.error, format!("{err}\n")).ok();
     kill_session_exact(tmux_session);
     err
+}
+
+/// Prints a run warning to stderr and appends it to <run>/warnings.txt.
+fn warn_run(paths: &RunPaths, message: &str) {
+    eprintln!("tmuxlet: warning: {message}");
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.root.join("warnings.txt"))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// Replaces a claude run whose bypassPermissions launch was refused with a fresh
+/// pane in the same tmux session name, launched with --permission-mode auto.
+/// The refused pane is kept as <run>/pane-bypass-refused.log.
+fn relaunch_claude_in_auto(
+    opts: &mut Options,
+    paths: &RunPaths,
+    run_id: &str,
+    tmux_session: &str,
+    env: &[(String, String)],
+    prompt: &str,
+) -> Result<(), String> {
+    capture_pane_to_file(tmux_session, &paths.root.join("pane-bypass-refused.log")).ok();
+    kill_session_exact(tmux_session);
+    opts.dangerously_skip_permissions = false;
+    opts.permission_mode = Some(CLAUDE_MODE_AUTO.into());
+    opts.target_args = split_claude_permission_target_args(&opts.target_args).0;
+    let base = target_command(opts)?;
+    let (launch, _) = launch_plan(
+        &opts.target,
+        base.clone(),
+        paths,
+        run_id,
+        &tmuxlet_exe(),
+        prompt,
+    );
+    let started_at = fs::read_to_string(&paths.meta)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map(|meta| meta["startedAt"].clone());
+    write_meta(paths, run_id, tmux_session, opts, &base, env)?;
+    if let Some(started_at) = started_at.filter(|v| !v.is_null())
+        && let Ok(text) = fs::read_to_string(&paths.meta)
+        && let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        meta["startedAt"] = started_at;
+        fs::write(&paths.meta, format!("{meta}\n")).ok();
+    }
+    start_tmux_session(tmux_session, &opts.cwd, env)?;
+    let line = launch_line(&launch, &paths.root.join("launch.sh"))?;
+    send_launch_command(tmux_session, &line)
+}
+
+/// claude's first-run "Bypass Permissions mode" warning (options "No, exit" /
+/// "Yes, I accept"). Shown once unless skipDangerousModePermissionPrompt is set.
+fn is_claude_bypass_accept_dialog(pane: &str) -> bool {
+    let text = confirmation_scan_text(pane);
+    text.contains("bypass permissions mode") && text.contains("yes, i accept")
+}
+
+/// claude's workspace trust gate ("Quick safety check ... Yes, I trust this folder").
+fn is_claude_trust_dialog(pane: &str) -> bool {
+    pane_tail(pane, 15)
+        .to_ascii_lowercase()
+        .contains("yes, i trust this folder")
+}
+
+/// Keys that move a claude select menu's cursor (`❯`) onto the option
+/// containing `option` (lowercase) and confirm it, judged from the bottom of
+/// the pane. None when the cursor or option line cannot be found.
+fn menu_keys_to_select(pane: &str, option: &str) -> Option<Vec<&'static str>> {
+    let tail = pane_tail(pane, 15);
+    let lines: Vec<String> = tail.lines().map(str::to_ascii_lowercase).collect();
+    let target = lines.iter().rposition(|line| line.contains(option))?;
+    let cursor = lines.iter().rposition(|line| line.contains('❯'))?;
+    if target.abs_diff(cursor) > 6 {
+        return None;
+    }
+    let step = if target > cursor { "Down" } else { "Up" };
+    let mut keys = vec![step; target.abs_diff(cursor)];
+    keys.push("Enter");
+    Some(keys)
+}
+
+/// Why a bypassPermissions launch did not take, if the pane says so: claude's
+/// own refusal text, or a status line showing a mode below auto.
+fn claude_bypass_refusal(pane: &str) -> Option<String> {
+    // Only the bottom of the pane: the echoed launch line carries the prompt,
+    // which may mention any of these words.
+    let tail = pane_tail(pane, 10);
+    let text = confirmation_scan_text(&tail);
+    for marker in [
+        "bypasspermissions not supported",
+        "bypass permissions mode is disabled",
+        "bypasspermissions mode is disabled",
+        "bypass permissions is disabled",
+        "cannot be used with root",
+        "with root/sudo privileges",
+    ] {
+        if text.contains(marker) {
+            return Some(format!("claude refused bypassPermissions ({marker})"));
+        }
+    }
+    let mode_line = claude_mode_line(pane);
+    for marker in ["accept edits on", "plan mode on"] {
+        if mode_line.contains(marker) {
+            return Some(format!(
+                "claude started in a mode below auto ({marker}) instead of bypassPermissions"
+            ));
+        }
+    }
+    None
+}
+
+/// The last `n` non-empty lines of a pane, oldest first.
+fn pane_tail(pane: &str, n: usize) -> String {
+    let mut lines: Vec<&str> = pane
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(n)
+        .collect();
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// claude's lowercased permission-mode status line ("⏵⏵ bypass permissions on
+/// (shift+tab to cycle)"), or "" when none is drawn yet. Default mode draws none.
+fn claude_mode_line(pane: &str) -> String {
+    pane_tail(pane, 10)
+        .lines()
+        .rev()
+        .map(str::to_ascii_lowercase)
+        .find(|line| line.contains("shift+tab to cycle"))
+        .unwrap_or_default()
 }
 
 /// The pane launch command plus any text to paste after startup. Agent targets
@@ -1315,7 +1567,12 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "chatgpt" | "cgpt" => chatgpt_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
-    cmd.args.extend(opts.target_args.iter().cloned());
+    if matches!(target, "claude") {
+        cmd.args
+            .extend(split_claude_permission_target_args(&opts.target_args).0);
+    } else {
+        cmd.args.extend(opts.target_args.iter().cloned());
+    }
     Ok(cmd)
 }
 
@@ -1347,33 +1604,94 @@ fn validate_session_controls(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The single permission mode a claude launch gets, plus warnings to print.
+/// Precedence: --dangerously-skip-permissions (and aliases), --permission-mode,
+/// a --target-arg --permission-mode/--dangerously-skip-permissions, the
+/// TMUXLET_CLAUDE_PERMISSION_MODE env var, then the bypassPermissions default.
+/// The result is clamped: only bypassPermissions or auto ever reach claude.
+fn resolve_claude_permission_mode(opts: &Options) -> (&'static str, Vec<String>) {
+    let (_, target_arg_mode) = split_claude_permission_target_args(&opts.target_args);
+    let env_mode = env::var("TMUXLET_CLAUDE_PERMISSION_MODE").ok();
+    let (requested, source) = if opts.dangerously_skip_permissions {
+        (
+            Some(CLAUDE_MODE_BYPASS.to_string()),
+            "--dangerously-skip-permissions",
+        )
+    } else if opts.permission_mode.is_some() {
+        (opts.permission_mode.clone(), "--permission-mode")
+    } else if target_arg_mode.is_some() {
+        (target_arg_mode, "--target-arg")
+    } else {
+        (env_mode, "TMUXLET_CLAUDE_PERMISSION_MODE")
+    };
+    let (mode, warning) = clamp_claude_permission_mode(requested.as_deref(), source);
+    (mode, warning.into_iter().collect())
+}
+
+/// Clamps a requested claude permission mode to bypassPermissions or auto.
+/// Unset/empty means the bypassPermissions default. Modes below auto
+/// (acceptEdits, plan, default, manual, dontAsk) are raised to auto; unknown
+/// values fall back to the bypassPermissions default. Both cases warn.
+fn clamp_claude_permission_mode(
+    requested: Option<&str>,
+    source: &str,
+) -> (&'static str, Option<String>) {
+    let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (CLAUDE_MODE_BYPASS, None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "bypasspermissions" | "bypass" | "yolo" | "dangerously-skip-permissions" => {
+            (CLAUDE_MODE_BYPASS, None)
+        }
+        "auto" => (CLAUDE_MODE_AUTO, None),
+        "acceptedits" | "plan" | "default" | "manual" | "dontask" => (
+            CLAUDE_MODE_AUTO,
+            Some(format!(
+                "claude permission mode {raw:?} from {source} is below the auto floor; using auto"
+            )),
+        ),
+        _ => (
+            CLAUDE_MODE_BYPASS,
+            Some(format!(
+                "unknown claude permission mode {raw:?} from {source}; using bypassPermissions (allowed: bypassPermissions, auto)"
+            )),
+        ),
+    }
+}
+
+/// Removes claude permission flags from --target-arg values so they cannot
+/// override the clamped mode, returning the kept args and the mode they asked for.
+fn split_claude_permission_target_args(target_args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut kept = Vec::new();
+    let mut mode = None;
+    let mut i = 0;
+    while i < target_args.len() {
+        let arg = &target_args[i];
+        if arg == "--permission-mode" {
+            mode = target_args.get(i + 1).cloned();
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--permission-mode=") {
+            mode = Some(value.to_string());
+        } else if arg == "--dangerously-skip-permissions" {
+            mode = Some(CLAUDE_MODE_BYPASS.to_string());
+        } else {
+            kept.push(arg.clone());
+        }
+        i += 1;
+    }
+    (kept, mode)
+}
+
 fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     let mut args = Vec::new();
     push_opt(&mut args, "--model", &opts.model);
-    // Default autonomous (tmux-driven, non-interactive) claude runs to the
-    // `auto` permission mode: it auto-approves safe operations (in-cwd edits,
-    // safe bash) and only escalates genuinely dangerous ones, so headless runs
-    // don't hang on permission prompts the way bare interactive claude does.
-    // An explicit --permission-mode overrides this; --dangerously-skip-permissions
-    // (full bypass) takes precedence and suppresses --permission-mode entirely.
-    // Override the default per-invocation with `--permission-mode default`, or
-    // globally via the TMUXLET_CLAUDE_PERMISSION_MODE env var.
-    let permission_mode = if opts.dangerously_skip_permissions {
-        None
-    } else if opts.permission_mode.is_some() {
-        opts.permission_mode.clone()
-    } else {
-        Some(
-            env::var("TMUXLET_CLAUDE_PERMISSION_MODE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "auto".to_string()),
-        )
-    };
-    push_opt(&mut args, "--permission-mode", &permission_mode);
-    if opts.dangerously_skip_permissions {
-        args.push("--dangerously-skip-permissions".into());
-    }
+    // Every claude launch gets an explicit --permission-mode, clamped to
+    // bypassPermissions (default) or auto. See resolve_claude_permission_mode.
+    let (mode, _) = resolve_claude_permission_mode(opts);
+    let bypass = mode == CLAUDE_MODE_BYPASS;
+    args.extend(["--permission-mode".into(), mode.to_string()]);
     push_opt(&mut args, "--system-prompt", &opts.system_prompt);
     for value in &opts.append_system_prompts {
         args.extend(["--append-system-prompt".into(), value.clone()]);
@@ -1415,10 +1733,8 @@ fn claude_command(opts: &Options) -> Result<TargetCommand, String> {
     // which lives outside cwd: --add-dir clears the directory-access gate while
     // the Write/Edit rules clear the tool-permission gate, and the bridge call
     // is allow-listed by command prefix. File-rule paths use the gitignore
-    // `//abs` form. Skipped under full bypass, which already permits everything.
-    if !opts.dangerously_skip_permissions
-        && let Some(grant) = &opts.contract_grant
-    {
+    // `//abs` form. Skipped under bypassPermissions, which already permits everything.
+    if !bypass && let Some(grant) = &opts.contract_grant {
         let root = grant.run_root.display().to_string();
         let abs = format!("//{}", root.trim_start_matches('/'));
         args.extend(["--add-dir".into(), root]);
@@ -2532,6 +2848,13 @@ fn paste_text(tmux_session: &str, text: &str) -> Result<(), String> {
         OsStr::new("Enter"),
     ])
     .map(|_| ())
+}
+
+fn send_keys(tmux_session: &str, keys: &[&str]) -> Result<(), String> {
+    let target = tmux_pane_target(tmux_session);
+    let mut args = vec!["send-keys", "-t", target.as_str()];
+    args.extend_from_slice(keys);
+    run_tmux(args).map(|_| ())
 }
 
 fn send_enter(tmux_session: &str) -> Result<(), String> {
@@ -4083,7 +4406,7 @@ Print-mode options:
       --append-system-prompt <text>        Append system prompt (repeatable) where supported
       --add-dir, --include-directories <p> Extra dirs (CSV ok; repeatable) where supported
       --dangerously-skip-permissions       Full bypass (aliases: --yolo, --force, --dangerously-bypass-approvals-and-sandbox)
-      --permission-mode <mode>             Permission mode where supported (Claude/Grok)
+      --permission-mode <mode>             Permission mode where supported (Claude/Grok; Claude: bypassPermissions or auto only)
       --allowed-tools, --allowedTools <r>  Allow rule/tool (repeatable) where supported
       --disallowed-tools, --disallowedTools <r> Deny rule/tool (repeatable) where supported
       --tools <tools>                      Tools list (repeatable) where supported
@@ -4137,7 +4460,7 @@ Environment:
   TMUXLET_ACQUIRE_TIMEOUT=<seconds>        Max wait for a free slot (0=forever; default 300)
   TMUXLET_MEMORY_GUARD=<truthy>            Enable memory-pressure guard
   TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
-  TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude default permission-mode (default: auto)
+  TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude permission-mode: bypassPermissions (default) or auto; lower modes clamp to auto
   TMUXLET_LLMCLI_BIN=<path>                llmcli program for chat backends muse/gweb/chatgpt (default: llmcli)
   TMUXLET_OLLAMA_HOST=<url>                Base URL --ollama gives claude (default: http://localhost:11434)
 
@@ -4334,44 +4657,199 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_to_a_permission_mode() {
-        // No explicit mode -> a --permission-mode flag is injected (auto by
-        // default; tunable via TMUXLET_CLAUDE_PERMISSION_MODE).
+    fn claude_defaults_to_bypass_permissions() {
+        // No explicit mode -> bypassPermissions, as a --permission-mode pair.
         let opts = parse(&["--target", "claude", "-p", "x"]);
         let cmd = target_command(&opts).unwrap();
-        assert!(cmd.args.contains(&"--permission-mode".to_string()));
-
-        // An explicit mode is respected verbatim.
-        let opts = parse(&[
-            "--target",
-            "claude",
+        assert!(has_pair(
+            &cmd.args,
             "--permission-mode",
-            "default",
-            "-p",
-            "x",
-        ]);
-        let cmd = target_command(&opts).unwrap();
-        assert!(has_pair(&cmd.args, "--permission-mode", "default"));
-
-        // Full bypass takes precedence and suppresses --permission-mode.
-        let opts = parse(&[
-            "--target",
-            "claude",
-            "--dangerously-skip-permissions",
-            "-p",
-            "x",
-        ]);
-        let cmd = target_command(&opts).unwrap();
-        assert!(!cmd.args.contains(&"--permission-mode".to_string()));
+            "bypassPermissions"
+        ));
         assert!(
-            cmd.args
+            !cmd.args
                 .contains(&"--dangerously-skip-permissions".to_string())
+        );
+
+        // auto is honored.
+        let opts = parse(&["--permission-mode", "auto", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--permission-mode", "auto"));
+
+        // Full bypass maps to the same single --permission-mode bypassPermissions.
+        let opts = parse(&["--dangerously-skip-permissions", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(
+            &cmd.args,
+            "--permission-mode",
+            "bypassPermissions"
+        ));
+        assert_eq!(
+            cmd.args
+                .iter()
+                .filter(|a| *a == "--permission-mode")
+                .count(),
+            1
         );
     }
 
     #[test]
+    fn claude_modes_below_auto_are_clamped() {
+        for mode in ["default", "acceptEdits", "plan", "manual", "dontAsk"] {
+            let opts = parse(&["--permission-mode", mode, "-p", "x"]);
+            let cmd = target_command(&opts).unwrap();
+            assert!(has_pair(&cmd.args, "--permission-mode", "auto"), "{mode}");
+            let (resolved, warnings) = resolve_claude_permission_mode(&opts);
+            assert_eq!(resolved, "auto");
+            assert_eq!(warnings.len(), 1);
+        }
+        assert_eq!(
+            clamp_claude_permission_mode(None, "x"),
+            ("bypassPermissions", None)
+        );
+        assert_eq!(
+            clamp_claude_permission_mode(Some(" "), "x").0,
+            "bypassPermissions"
+        );
+        assert_eq!(
+            clamp_claude_permission_mode(Some("AUTO"), "x"),
+            ("auto", None)
+        );
+        assert_eq!(
+            clamp_claude_permission_mode(Some("bypass"), "x").0,
+            "bypassPermissions"
+        );
+        let (mode, warning) = clamp_claude_permission_mode(Some("bogus"), "env");
+        assert_eq!(mode, "bypassPermissions");
+        assert!(warning.unwrap().contains("bogus"));
+    }
+
+    #[test]
+    fn claude_target_arg_permission_flags_are_clamped_not_passed_through() {
+        let opts = parse(&[
+            "--target-arg",
+            "--permission-mode",
+            "--target-arg",
+            "plan",
+            "--target-arg",
+            "--effort",
+            "--target-arg",
+            "max",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--permission-mode", "auto"));
+        assert!(!has_pair(&cmd.args, "--permission-mode", "plan"));
+        assert!(has_pair(&cmd.args, "--effort", "max"));
+        assert_eq!(
+            cmd.args
+                .iter()
+                .filter(|a| *a == "--permission-mode")
+                .count(),
+            1
+        );
+
+        let opts = parse(&["--target-arg", "--permission-mode=acceptEdits", "-p", "x"]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--permission-mode", "auto"));
+        assert!(!cmd.args.iter().any(|a| a.starts_with("--permission-mode=")));
+
+        // An explicit --permission-mode wins over a --target-arg one.
+        let opts = parse(&[
+            "--permission-mode",
+            "bypassPermissions",
+            "--target-arg",
+            "--permission-mode=plan",
+            "-p",
+            "x",
+        ]);
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(
+            &cmd.args,
+            "--permission-mode",
+            "bypassPermissions"
+        ));
+    }
+
+    #[test]
+    fn claude_session_paths_keep_the_permission_floor() {
+        for argv in [
+            &["--continue", "-p", "x"][..],
+            &["--resume", "abc", "-p", "x"][..],
+            &["--resume", "-p", "x"][..],
+            &["--session-id", "abc", "-p", "x"][..],
+            &["--ollama", "minimax-m3.1-flash:cloud", "-p", "x"][..],
+        ] {
+            let cmd = target_command(&parse(argv)).unwrap();
+            assert!(
+                has_pair(&cmd.args, "--permission-mode", "bypassPermissions"),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_yes_no_menus_select_yes_not_enter() {
+        let trust = "kk@Mac r % claude --permission-mode auto -- 'x'\n\
+                     Accessing workspace:\n /Users/kk/Sites/r\n\
+                     Quick safety check: Is this a project you created or one you trust?\n\
+                     ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel";
+        assert!(is_claude_trust_dialog(trust));
+        assert_eq!(
+            menu_keys_to_select(trust, "yes, i trust this folder"),
+            Some(vec!["Down", "Enter"])
+        );
+        let yes_first = "Quick safety check\n ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert_eq!(
+            menu_keys_to_select(yes_first, "yes, i trust this folder"),
+            Some(vec!["Enter"])
+        );
+        let bypass = "Bypass Permissions mode\n ❯ 1. No, exit\n   2. Yes, I accept";
+        assert!(is_claude_bypass_accept_dialog(bypass));
+        assert_eq!(
+            menu_keys_to_select(bypass, "yes, i accept"),
+            Some(vec!["Down", "Enter"])
+        );
+        assert!(!is_claude_trust_dialog(
+            "❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)"
+        ));
+        assert_eq!(menu_keys_to_select("no menu here", "yes"), None);
+    }
+
+    #[test]
+    fn claude_bypass_dialog_and_refusals_are_detected() {
+        let dialog = "WARNING: Claude Code running in Bypass Permissions mode\n\
+                      ❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm";
+        assert!(is_claude_bypass_accept_dialog(dialog));
+        assert!(!is_claude_bypass_accept_dialog(
+            "❯ 1. Yes, I trust this folder"
+        ));
+
+        let refused = "kk@Mac p % claude --permission-mode bypassPermissions -- 'x'\n\
+                       Error: bypassPermissions not supported in restricted mode\nkk@Mac p %";
+        assert!(claude_bypass_refusal(refused).is_some());
+        let plan = "❯ \n  ⏸ plan mode on (shift+tab to cycle)";
+        assert!(claude_bypass_refusal(plan).is_some());
+        // The echoed launch line (with the prompt) never counts as a refusal.
+        let echo = "kk@Mac p % claude --permission-mode bypassPermissions -- 'turn plan mode on'";
+        assert!(claude_bypass_refusal(echo).is_none());
+        let ok = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 14 agents";
+        assert!(claude_bypass_refusal(ok).is_none());
+        assert!(claude_mode_line(ok).contains("bypass permissions on"));
+        assert!(claude_mode_line(echo).is_empty());
+    }
+
+    #[test]
     fn claude_grant_injects_scoped_contract_permissions() {
-        let opts = with_grant(parse(&["--target", "claude", "-p", "x"]));
+        let opts = with_grant(parse(&[
+            "--target",
+            "claude",
+            "--permission-mode",
+            "auto",
+            "-p",
+            "x",
+        ]));
         let cmd = target_command(&opts).unwrap();
         assert!(has_pair(
             &cmd.args,
@@ -4395,26 +4873,30 @@ mod tests {
             "--allowed-tools",
             "Bash(/usr/local/bin/tmuxlet bridge complete:*)"
         ));
-        // The auto permission-mode default still applies underneath the grant.
-        assert!(cmd.args.contains(&"--permission-mode".to_string()));
+        // The grant rides under the auto floor (bypass already permits everything).
+        assert!(has_pair(&cmd.args, "--permission-mode", "auto"));
     }
 
     #[test]
     fn full_bypass_suppresses_scoped_grant() {
-        let opts = with_grant(parse(&[
-            "--target",
-            "claude",
-            "--dangerously-skip-permissions",
-            "-p",
-            "x",
-        ]));
-        let cmd = target_command(&opts).unwrap();
-        assert!(!cmd.args.contains(&"--add-dir".to_string()));
-        assert!(!cmd.args.contains(&"--permission-mode".to_string()));
-        assert!(
-            cmd.args
-                .contains(&"--dangerously-skip-permissions".to_string())
-        );
+        for argv in [
+            &[
+                "--target",
+                "claude",
+                "--dangerously-skip-permissions",
+                "-p",
+                "x",
+            ][..],
+            &["--target", "claude", "-p", "x"][..],
+        ] {
+            let cmd = target_command(&with_grant(parse(argv))).unwrap();
+            assert!(!cmd.args.contains(&"--add-dir".to_string()));
+            assert!(has_pair(
+                &cmd.args,
+                "--permission-mode",
+                "bypassPermissions"
+            ));
+        }
     }
 
     #[test]
@@ -5939,10 +6421,11 @@ quote> Do not wait for the user after the final response is written.'\n";
             "x",
         ]);
         let cmd = claude_command(&opts).unwrap();
-        assert!(
-            cmd.args
-                .contains(&"--dangerously-skip-permissions".to_string())
-        );
+        assert!(has_pair(
+            &cmd.args,
+            "--permission-mode",
+            "bypassPermissions"
+        ));
         assert!(cmd.args.contains(&"sonnet".to_string()));
     }
 
