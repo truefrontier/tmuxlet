@@ -17,7 +17,8 @@ the target CLI installed, e.g. `claude`).
 ## Launch a run
 
 ```bash
-# Simple prompt, text output
+# Simple prompt, text output. Always set an owner for your runs.
+export TMUXLET_OWNER=<your-agent-name>
 tmuxlet -p "say ready"
 
 # Programmatic: JSON result, explicit target, cwd, model, timeout
@@ -35,6 +36,9 @@ EOF
 Rules:
 
 - `-p` / `--print` is required for every run; non-print launches are unsupported.
+- Set `TMUXLET_OWNER` (or `--owner`). Without it the run still starts but is
+  recorded as `unset:<parent>@<cwd>` with `ownerExplicit=false` and a stderr
+  warning, and it can never be self-healed.
 - Prefer `--output-format json` whenever parsing the result.
 - Prefer stdin (`-` + heredoc) for any prompt with newlines, quotes, or `$`.
 - Common flags: `--target <name>`, `-C/--cwd <dir>`, `-m/--model <model>`,
@@ -46,8 +50,10 @@ Rules:
 
 ## Read the result
 
-Exit code 0 means status `completed`; anything else is a failure. JSON output
-is a single object:
+Exit code 0 means status `completed`; anything else is a failure. Exit **8**
+means the live-session pool stayed full until `TMUXLET_ACQUIRE_TIMEOUT`: the run
+never started and nothing was killed; check `tmuxlet status` /
+`tmuxlet reap --dry-run`, or retry later. JSON output is a single object:
 
 ```json
 {"id":"<run-id>","target":"claude","status":"completed","output":"...",
@@ -118,8 +124,12 @@ the `tmux ls` filter to see what's actually running.
 ## Fan out multiple runs
 
 Each run is a full interactive TUI (hundreds of MB). tmuxlet enforces a
-machine-wide live-session cap (default 24); launches at the cap queue until a
-slot frees (up to `TMUXLET_ACQUIRE_TIMEOUT`, default 300s), then exit non-zero.
+machine-wide live-session cap (default 24). At 80% of the cap a launch warns once
+(`tmuxlet: 20/24 slots in use`). Launches at the cap queue until a slot frees (up to
+`TMUXLET_ACQUIRE_TIMEOUT`, default 300s), then exit **8** (`pool full N/N; refusing
+to start; nothing was killed`). A full pool never kills sessions unless
+`TMUXLET_AUTO_REAP=1`, and even then only your own explicitly owned runs whose
+tmuxlet process is dead.
 
 ```bash
 # Deliberate fan-out: set a tight cap, launch in background, collect results
@@ -151,7 +161,9 @@ tmuxlet prune -y                   # delete all terminal run dirs + their leftov
 tmuxlet prune <id> -y              # specific runs (refuses non-terminal ids)
 ```
 
-`reap` kills live sessions; `prune` deletes finished run directories. A
+`reap` kills live sessions; `prune` deletes finished run directories. Manual
+`reap` also matches legacy ownerless sessions (other agents' old runs) without
+`--force-foreign`, so always `--dry-run` first and never `reap -y` blindly. A
 successful run auto-kills its session but leaves the run dir for inspection, so
 periodic `prune -y` is the normal hygiene step.
 
@@ -159,9 +171,11 @@ periodic `prune -y` is the normal hygiene step.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `TMUXLET_OWNER` | `unset:<parent>@<cwd>` | Run owner; set it (unset warns, `ownerExplicit=false`) |
+| `TMUXLET_AUTO_REAP` | off | `1` opts in to reaping only your explicitly owned runs whose tmuxlet process is dead, at a full pool |
 | `TMUXLET_HOME` | `~/.tmuxlet` | Runtime state root (`runs/`) |
 | `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap; `0` = unlimited |
-| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free slot; `0` = forever |
+| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free slot; `0` = forever; then exit 8 |
 | `TMUXLET_MEMORY_GUARD` | off | Queue launches under host memory pressure |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory % threshold for the guard |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `auto` | Default Claude `--permission-mode` |

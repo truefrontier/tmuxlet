@@ -136,9 +136,18 @@ when no prompt args are given. `--` ends option parsing so the rest is prompt.
 
 Print-mode runs record `owner` and `startedAt` (Unix epoch seconds) in `meta.json`.
 Identity resolves from `--owner <name>`, then `TMUXLET_OWNER`, then
-`<parent-process-name>@<caller-cwd>`. A print-mode `--cwd` does not change the
+`unset:<parent-process-name>@<caller-cwd>`. A print-mode `--cwd` does not change the
 caller identity. Set an explicit owner for automation that launches from different
-parent processes or directories. `tmuxlet status` includes the recorded owner.
+parent processes or directories. `tmuxlet status` includes the recorded owner and
+`ownerExplicit`.
+
+Since 0.14.0 every new run records an owner, so new runs never show up as
+`unknown owner`. Without `--owner` or `TMUXLET_OWNER` the run still starts, but
+`meta.json` records `"owner": "unset:<parent-process>@<cwd>"` with
+`"ownerExplicit": false`, and tmuxlet prints a one-line stderr warning asking you
+to set `TMUXLET_OWNER`. The `unset:` prefix is a marker, not part of the identity:
+a 0.13 run recorded as `zsh@/repo` still belongs to a caller resolved as
+`unset:zsh@/repo`. Runs without an explicit owner are never auto-reaped.
 
 `send`, `send-all`, `stop`, `prune`, and manual `reap` accept `--owner <name>`
 and `--force-foreign`. A foreign run is refused with its id and owner; `send-all`
@@ -193,8 +202,8 @@ for a given `--target` fail fast instead of being silently dropped. See
 | `--env` | `KEY=VALUE` (repeatable) | unset | Set an environment variable for the target CLI. It goes on the run's own tmux session (`tmux new-session -e`), never the tmux server's global env and never the typed launch line. `KEY=` sets an empty value. Values of keys containing `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, or `AUTH` show as `<redacted>` in `meta.json` / `status`. Any target. |
 | `--ollama` | `<model>` | unset | `claude` and `codex` only: run the CLI against a model served by local Ollama (sets `--model`; see [Local models through Ollama](#local-models-through-ollama)). Conflicts with a different `--model`. |
 | `--timeout` | `<seconds>` | `1800` | Max wait for the completion contract before `timeout` status. Chat backends also get it as the CLI's `--timeout` when given explicitly. |
-| `--owner` | `<name>` | `TMUXLET_OWNER` or parent-process-name@caller-cwd | Record the run's owner. |
-| `--reap-min-age` | `<minutes>` | `10` (or `TMUXLET_REAP_MIN_AGE_MIN`) | Minimum run age for automatic self-healing; non-negative integer. |
+| `--owner` | `<name>` | `TMUXLET_OWNER`, else `unset:parent-process-name@caller-cwd` (ownerExplicit=false, warns) | Record the run's owner. |
+| `--reap-min-age` | `<minutes>` | `10` (or `TMUXLET_REAP_MIN_AGE_MIN`) | Minimum run age for opt-in self-healing (`TMUXLET_AUTO_REAP=1`); non-negative integer. |
 | `--max-concurrency` | `<n>` | `24` (or `TMUXLET_MAX_CONCURRENCY`) | Machine-wide live-session cap; `0` = unlimited. |
 | `--memory-pressure-guard`, `--memory-guard` | flag | off | Queue launches under host memory pressure (also `TMUXLET_MEMORY_GUARD`). |
 
@@ -284,11 +293,12 @@ of a tight loop firing keystrokes at every session simultaneously.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `TMUXLET_OWNER` | parent-process-name@caller-cwd | Default identity for runs and management commands; `--owner` wins. |
-| `TMUXLET_REAP_MIN_AGE_MIN` | `10` | Minimum run age in minutes for automatic reap; `--reap-min-age` wins. |
+| `TMUXLET_OWNER` | `unset:`parent-process-name@caller-cwd | Default identity for runs and management commands; `--owner` wins. When unset, runs record the `unset:` owner with `ownerExplicit=false` and print a warning. Set it. |
+| `TMUXLET_AUTO_REAP` | off | `1`/`true`/`yes`/`on` opts in to self-heal at a full pool: only runs whose explicit owner equals your explicit `TMUXLET_OWNER` and whose launching tmuxlet process is dead. Never ownerless, `unknown owner`, or `unset:` runs. |
+| `TMUXLET_REAP_MIN_AGE_MIN` | `10` | Minimum run age in minutes for opt-in automatic reap; `--reap-min-age` wins. |
 | `TMUXLET_HOME` | `~/.tmuxlet` | Root directory for runtime state (`runs/`, etc.). |
 | `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap when `--max-concurrency` is omitted; `0` = unlimited. |
-| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free concurrency slot; `0` = wait forever. |
+| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a free concurrency slot; `0` = wait forever. A pool still full at the timeout exits **8**. |
 | `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `bypassPermissions` | Claude mode when neither `--permission-mode` nor full bypass is set. Only `bypassPermissions` or `auto`; lower modes clamp to `auto`, unknown values to `bypassPermissions`. |
@@ -677,16 +687,28 @@ counts what is actually alive, not how many launches a caller has fired.
   tighter value (e.g. `TMUXLET_MAX_CONCURRENCY=4`). Set `0` to disable entirely
   and restore the original unbounded behavior. A single run pays at most one
   cheap `tmux list-sessions` call; with the cap disabled there is zero overhead.
-- **Self-healing.** If a run waits past the 60s grace window while saturated, it
-  runs one conservative reap pass. Only owned sessions at least **10 minutes**
-  old whose panes are unchanged across two captures **2 seconds** apart qualify.
-  `--reap-min-age <minutes>` overrides `TMUXLET_REAP_MIN_AGE_MIN` (default 10).
-  Unknown ages, empty panes, and failed captures are skipped. Permission/trust prompts are
+- **Near-capacity warning (0.14.0).** The first time a launch sees the pool at
+  80% of the cap or more (rounded up: 20 of 24), it prints one stderr line, e.g.
+  `tmuxlet: 20/24 slots in use`.
+- **Full pool refuses; it never kills by default (0.14.0).** A full pool queues
+  until `TMUXLET_ACQUIRE_TIMEOUT`, then exits **8** with
+  `pool full N/N; refusing to start; nothing was killed; see \`tmuxlet status\` / \`tmuxlet reap --dry-run\``.
+  Before 0.14.0 a saturated launch auto-reaped after 60s, and it treated ownerless
+  runs as its own: on 2026-10-16 that killed 24 legacy `unknown owner` sessions
+  belonging to other agents in one pass.
+- **Self-healing (opt-in, `TMUXLET_AUTO_REAP=1`).** With the opt-in, a run that
+  waits past the 60s grace window at a full pool runs one reap pass. A session
+  qualifies only if all of these hold: you set an explicit owner (`--owner` or
+  `TMUXLET_OWNER`); the run's `meta.json` has the same owner with
+  `ownerExplicit: true`; the tmuxlet process that launched it (the second hex
+  field of the run id, `<nanos>-<pid>-<seq>`) is dead; it is at least
+  **10 minutes** old (`--reap-min-age` / `TMUXLET_REAP_MIN_AGE_MIN`); and its pane
+  is unchanged across two captures **2 seconds** apart. Runs with no owner,
+  `unknown owner`, or an `unset:` owner are never auto-reaped. Unknown ages, empty panes,
+  failed captures, and PIDs that can't be checked are skipped. Permission/trust prompts are
   always spared, including prompts appearing during the observation interval.
   Detection checks only the last 15 non-empty lines for prompt-shaped text;
   ordinary mentions of allow, confirm, or permission are insufficient.
-  At the acquire timeout it exits non-zero with `at capacity …; run \`tmuxlet reap\`` rather than
-  hanging forever.
 - **Memory backpressure (opt-in).** `--memory-pressure-guard` /
   `TMUXLET_MEMORY_GUARD` queues launches while host free memory is below
   `TMUXLET_MEMORY_MIN_FREE` percent (default 15). Off by default; on platforms
@@ -697,7 +719,8 @@ counts what is actually alive, not how many launches a caller has fired.
 | Knob | Default | Meaning |
 | --- | --- | --- |
 | `--max-concurrency <n>` / `TMUXLET_MAX_CONCURRENCY` | `24` | Live-session cap; `0` = unlimited |
-| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a slot; `0` = wait forever |
+| `TMUXLET_ACQUIRE_TIMEOUT` | `300` | Seconds to wait for a slot; `0` = wait forever; full at the timeout exits 8 |
+| `TMUXLET_AUTO_REAP` | off | Opt-in self-heal: only your explicitly owned runs whose tmuxlet process is dead |
 | `--memory-pressure-guard` / `--memory-guard` / `TMUXLET_MEMORY_GUARD` | off | Queue under host memory pressure |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory % threshold for the guard |
 
@@ -734,6 +757,9 @@ skips say `waiting on permission/trust prompt`. Foreign and unreadable metadata
 are also logged. Audit-log failures are reported; an unopenable log prevents
 reaping. Manual reap can intentionally kill permission-blocked sessions after
 confirmation; automatic reap always leaves those sessions for their owner.
+Manual `tmuxlet reap` is unchanged in 0.14.0: like other management commands it
+allows legacy runs without an owner (with a warning), so it can kill ownerless
+sessions that match its criteria without `--force-foreign`. Use `--dry-run` first.
 
 A successful print-mode run auto-kills its tmux session before returning, but
 the run directory itself is left on disk so callers can inspect `complete.txt`,
@@ -803,7 +829,9 @@ reason to stderr and exits 1 (see [Shell guard](#shell-guard-0120)).
 
 Exit codes: **0** completed; **1** an error, or a run that ended `blocked`,
 `timeout`, or `exited`; **6** gweb or chatgpt rate limited (`rate_limited`); **7** a
-`--file` the target can't take (see [Attachments](#attachments---file)).
+`--file` the target can't take (see [Attachments](#attachments---file)); **8** pool
+full: the live-session cap stayed full until `TMUXLET_ACQUIRE_TIMEOUT`, the run did
+not start, and nothing was killed (see [Concurrency & Throttling](#concurrency--throttling)).
 
 On `blocked` and `timeout`, tmuxlet writes `pane.log` and `error.txt` under the
 run directory for debugging.
