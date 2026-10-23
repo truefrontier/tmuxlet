@@ -39,6 +39,11 @@ const SNIFF_BYTES: u64 = 8 * 1024;
 // Exit code for a --file the target can't take: a non-text file it has no native way to attach, or inlined
 // text over the caps. 1 stays "error or run not completed", 6 "rate limited".
 const EXIT_ATTACHMENT_REFUSED: u8 = 7;
+// Exit code when the live-session pool stays full until the acquire timeout. Nothing
+// is killed to make room unless TMUXLET_AUTO_REAP=1 opts in to the narrow self-heal.
+const EXIT_POOL_FULL: u8 = 8;
+// Owner prefix recorded when neither --owner nor TMUXLET_OWNER is set.
+const UNSET_OWNER_PREFIX: &str = "unset:";
 // Characters an @-mention path may hold; other paths are inlined (text) or refused.
 const MENTION_SAFE: &str = "-_./+,@%~=";
 // The launch line is typed into the pane's shell, maybe before the shell reads it: the tty then keeps at most
@@ -162,6 +167,8 @@ struct Options {
     // Opt-in host-memory backpressure (also enabled by TMUXLET_MEMORY_GUARD).
     memory_guard: bool,
     owner: Option<String>,
+    // True when the owner came from --owner or TMUXLET_OWNER (set by run_print).
+    owner_explicit: bool,
     reap_min_age: Option<u64>,
     // --env KEY=VALUE pairs, set on the run's tmux session (never the server env).
     env: Vec<(String, String)>,
@@ -205,6 +212,7 @@ impl Default for Options {
             max_concurrency: None,
             memory_guard: false,
             owner: None,
+            owner_explicit: false,
             reap_min_age: None,
             env: Vec::new(),
             ollama: None,
@@ -293,6 +301,26 @@ struct TargetCommand {
     args: Vec<String>,
 }
 
+/// A print-mode failure with its process exit code. Plain string errors exit 1;
+/// a full pool exits EXIT_POOL_FULL.
+#[derive(Debug)]
+struct RunError {
+    code: u8,
+    message: String,
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        Self { code: 1, message }
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
@@ -340,7 +368,14 @@ fn run() -> Result<u8, String> {
                     }
                     Err((_, message)) => return Err(message),
                 }
-                let result = run_print(opts)?;
+                let result = match run_print(opts) {
+                    Ok(result) => result,
+                    Err(e) if e.code == 1 => return Err(e.message),
+                    Err(e) => {
+                        eprintln!("tmuxlet: {}", e.message);
+                        return Ok(e.code);
+                    }
+                };
                 if result.status == "rate_limited" {
                     emit_result(&result)?;
                     return Ok(6);
@@ -356,14 +391,35 @@ fn run() -> Result<u8, String> {
 }
 
 // Keep identity based on the caller's cwd, even when a run uses --cwd elsewhere.
-fn pick_owner(cli: Option<&str>, environment: Option<&str>, fallback: &str) -> String {
-    cli.or(environment).unwrap_or(fallback).to_string()
+// Returns (owner, explicit). Without --owner or TMUXLET_OWNER the owner is still
+// recorded, as `unset:<parent-process>@<caller-cwd>`, and marked not explicit, so
+// no new run ever lands as "unknown owner".
+fn pick_owner(cli: Option<&str>, environment: Option<&str>, fallback: &str) -> (String, bool) {
+    fn given(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|v| !v.is_empty())
+    }
+    match given(cli).or(given(environment)) {
+        Some(owner) => (owner.to_string(), true),
+        None => (format!("{UNSET_OWNER_PREFIX}{fallback}"), false),
+    }
 }
 
 fn caller_owner(cli: Option<&str>) -> String {
+    resolve_caller_owner(cli).0
+}
+
+/// One-line stderr warning for a run whose owner fell back to `unset:...`.
+fn unset_owner_warning(owner: &str) -> String {
+    format!(
+        "tmuxlet: warning: TMUXLET_OWNER is unset; recording owner {owner:?} (ownerExplicit=false); set TMUXLET_OWNER or pass --owner"
+    )
+}
+
+fn resolve_caller_owner(cli: Option<&str>) -> (String, bool) {
     let environment = env::var("TMUXLET_OWNER").ok();
-    if cli.is_some() || environment.is_some() {
-        return pick_owner(cli, environment.as_deref(), "");
+    let explicit = pick_owner(cli, environment.as_deref(), "");
+    if explicit.1 {
+        return explicit;
     }
     let parent = Command::new("ps")
         .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
@@ -390,8 +446,14 @@ fn caller_owner(cli: Option<&str>) -> String {
     )
 }
 
+// `unset:` is a marker, not part of the identity: a 0.13 run recorded as
+// `zsh@/repo` still belongs to a 0.14 caller resolved as `unset:zsh@/repo`.
+fn owner_identity(owner: &str) -> &str {
+    owner.strip_prefix(UNSET_OWNER_PREFIX).unwrap_or(owner)
+}
+
 fn is_foreign(recorded: Option<&str>, caller: &str, force: bool) -> bool {
-    !force && recorded.is_some_and(|owner| owner != caller)
+    !force && recorded.is_some_and(|owner| owner_identity(owner) != owner_identity(caller))
 }
 
 fn read_meta(id: &str) -> Result<serde_json::Value, String> {
@@ -866,9 +928,14 @@ fn prompt_from(opts: &Options) -> Result<String, String> {
     }
 }
 
-fn run_print(mut opts: Options) -> Result<RunResult, String> {
+fn run_print(mut opts: Options) -> Result<RunResult, RunError> {
     let _ = resolve_reap_min_age(opts.reap_min_age)?;
-    opts.owner = Some(caller_owner(opts.owner.as_deref()));
+    let (owner, owner_explicit) = resolve_caller_owner(opts.owner.as_deref());
+    if !owner_explicit {
+        eprintln!("{}", unset_owner_warning(&owner));
+    }
+    opts.owner = Some(owner);
+    opts.owner_explicit = owner_explicit;
     ensure_tmux()?;
     let started = Instant::now();
     let run_id = make_run_id();
@@ -938,7 +1005,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
             }
         });
         if let Err(err) = guard {
-            return Err(abort_run(&paths, &tmux_session, err));
+            return Err(abort_run(&paths, &tmux_session, err).into());
         }
         paste_text(&tmux_session, &text)?;
     }
@@ -1054,7 +1121,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                         foreground.as_deref(),
                         !target_seen,
                     );
-                    return Err(abort_run(&paths, &tmux_session, err));
+                    return Err(abort_run(&paths, &tmux_session, err).into());
                 }
             }
         }
@@ -1125,7 +1192,7 @@ fn run_print(mut opts: Options) -> Result<RunResult, String> {
                             fs::write(&paths.pane_log, &pane).ok();
                             fs::write(&paths.error, format!("{err}\n")).ok();
                             kill_session_exact(&tmux_session);
-                            return Err(err);
+                            return Err(err.into());
                         }
                     }
                 }
@@ -3396,10 +3463,46 @@ fn sample_free_pct() -> Option<u8> {
     }
 }
 
+/// Live count at which acquire_run_slot warns once: 80% of the cap, rounded up
+/// (20 of 24). None when unlimited.
+fn slot_warn_threshold(cap: usize) -> Option<usize> {
+    (cap != 0).then(|| (cap * 4).div_ceil(5))
+}
+
+/// The one-time near-capacity warning, e.g. "tmuxlet: 20/24 slots in use".
+fn slot_warning(live: usize, cap: usize) -> Option<String> {
+    slot_warn_threshold(cap)
+        .filter(|threshold| live >= *threshold)
+        .map(|_| format!("tmuxlet: {live}/{cap} slots in use"))
+}
+
+/// Self-heal runs at most once per acquire, only for a full pool, only after
+/// the grace window, and only with TMUXLET_AUTO_REAP=1. Off by default: a full
+/// pool queues and then refuses; it never kills anything on its own.
+fn should_self_heal(
+    cap_block: bool,
+    auto_reap: bool,
+    already_tried: bool,
+    waited: Duration,
+) -> bool {
+    cap_block && auto_reap && !already_tried && waited >= Duration::from_secs(REAP_GRACE_SECS)
+}
+
+fn pool_full_message(live: usize, cap: usize, killed: usize) -> String {
+    let killed = if killed == 0 {
+        "nothing was killed".to_string()
+    } else {
+        format!("TMUXLET_AUTO_REAP killed {killed} orphaned run(s) of yours")
+    };
+    format!(
+        "pool full {live}/{cap}; refusing to start; {killed}; see `tmuxlet status` / `tmuxlet reap --dry-run`"
+    )
+}
+
 /// Block until a concurrency slot is free (and, with the opt-in guard, until the
-/// host is not under memory pressure), or error at the acquire-timeout. Zero
-/// overhead when no throttling is configured.
-fn acquire_run_slot(opts: &Options) -> Result<(), String> {
+/// host is not under memory pressure), or refuse at the acquire-timeout. Zero
+/// overhead when no throttling is configured. A full pool exits EXIT_POOL_FULL.
+fn acquire_run_slot(opts: &Options) -> Result<(), RunError> {
     let cap = resolve_max_concurrency(opts.max_concurrency);
     let guard = memory_guard_enabled(opts);
     if cap == 0 && !guard {
@@ -3407,9 +3510,12 @@ fn acquire_run_slot(opts: &Options) -> Result<(), String> {
     }
     let min_free = memory_min_free_pct();
     let timeout = resolve_acquire_timeout(); // ZERO == wait forever
+    let auto_reap = env_flag("TMUXLET_AUTO_REAP");
     let start = Instant::now();
     let mut announced = false;
+    let mut warned = false;
     let mut self_reaped = false;
+    let mut killed_total = 0usize;
 
     loop {
         let mem_block = guard && under_memory_pressure(sample_free_pct(), min_free);
@@ -3418,6 +3524,10 @@ fn acquire_run_slot(opts: &Options) -> Result<(), String> {
         } else {
             live_run_session_count()
         };
+        if !warned && let Some(warning) = slot_warning(live, cap) {
+            eprintln!("{warning}");
+            warned = true;
+        }
         let cap_block = cap != 0 && live >= cap;
         if !mem_block && !cap_block {
             return Ok(());
@@ -3433,30 +3543,38 @@ fn acquire_run_slot(opts: &Options) -> Result<(), String> {
             announced = true;
         }
 
-        // Self-heal once: only owned runs old enough to qualify whose panes
-        // remain unchanged; permission/trust prompts are always spared.
-        if cap_block && !self_reaped && start.elapsed() >= Duration::from_secs(REAP_GRACE_SECS) {
+        // Opt-in self-heal (TMUXLET_AUTO_REAP=1): only this caller's explicitly
+        // owned runs whose tmuxlet process is dead; never ownerless/unset runs.
+        if should_self_heal(cap_block, auto_reap, self_reaped, start.elapsed()) {
             self_reaped = true;
+            let owner = opts
+                .owner
+                .clone()
+                .unwrap_or_else(|| caller_owner(opts.owner.as_deref()));
             let killed = auto_reap_sessions(
-                &caller_owner(opts.owner.as_deref()),
+                &owner,
+                opts.owner_explicit,
                 resolve_reap_min_age(opts.reap_min_age)?,
             )?;
             if killed > 0 {
-                eprintln!("tmuxlet: reaped {killed} stuck session(s)");
+                killed_total += killed;
+                eprintln!("tmuxlet: reaped {killed} orphaned session(s)");
                 continue;
             }
         }
 
         if !timeout.is_zero() && start.elapsed() >= timeout {
-            let why = if cap_block {
-                format!("{live}/{cap} live sessions")
-            } else {
-                "host memory pressure".to_string()
-            };
+            if cap_block {
+                return Err(RunError {
+                    code: EXIT_POOL_FULL,
+                    message: pool_full_message(live, cap, killed_total),
+                });
+            }
             return Err(format!(
-                "at capacity after {}s ({why}); run `tmuxlet reap` or raise TMUXLET_MAX_CONCURRENCY",
+                "at capacity after {}s (host memory pressure); nothing was killed",
                 start.elapsed().as_secs()
-            ));
+            )
+            .into());
         }
         thread::sleep(Duration::from_millis(ACQUIRE_POLL_MS));
     }
@@ -3542,6 +3660,73 @@ fn auto_reap_decision(
         return Err("pane changed or could not be captured");
     }
     Ok("old with unchanged pane")
+}
+
+/// The PID of the tmuxlet process that launched a run: the second hex field of
+/// the run id (`<nanos>-<pid>-<seq>`, see make_run_id).
+fn run_id_pid(id: &str) -> Option<u32> {
+    let id = id.strip_prefix("tmuxlet-").unwrap_or(id);
+    let mut fields = id.split('-');
+    let _nanos = fields.next()?;
+    u32::from_str_radix(fields.next()?, 16)
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+/// Some(true) alive, Some(false) gone, None when it can't be determined.
+fn pid_alive(pid: u32) -> Option<bool> {
+    let out = Command::new("ps")
+        .args(["-o", "pid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let listed = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+    match (out.status.success(), listed) {
+        (true, true) => Some(true),
+        (false, false) => Some(false),
+        _ => None,
+    }
+}
+
+/// Opt-in self-heal gate (TMUXLET_AUTO_REAP=1). A run may be auto-reaped only
+/// when the caller has an explicit owner, the run recorded that same owner
+/// explicitly, and the tmuxlet process that launched the run is dead. Runs with
+/// no owner, "unknown owner", or an `unset:` owner are never auto-reaped.
+fn self_heal_eligibility(
+    recorded: Option<&str>,
+    recorded_explicit: bool,
+    caller: &str,
+    caller_explicit: bool,
+    launcher_alive: Option<bool>,
+) -> Result<(), &'static str> {
+    if !caller_explicit || caller.starts_with(UNSET_OWNER_PREFIX) {
+        return Err("caller has no explicit TMUXLET_OWNER; auto-reap disabled");
+    }
+    let Some(recorded) = recorded.filter(|o| !o.is_empty() && *o != "unknown owner") else {
+        return Err("run has no owner; never auto-reaped");
+    };
+    if !recorded_explicit || recorded.starts_with(UNSET_OWNER_PREFIX) {
+        return Err("run owner is not explicit; never auto-reaped");
+    }
+    if recorded != caller {
+        return Err("run belongs to another owner");
+    }
+    match launcher_alive {
+        Some(false) => Ok(()),
+        Some(true) => Err("run's tmuxlet process is still alive"),
+        None => Err("cannot tell whether the run's tmuxlet process is alive"),
+    }
+}
+
+fn self_heal_check(id: &str, caller: &str, caller_explicit: bool) -> Result<(), String> {
+    let meta = read_meta(id)?;
+    self_heal_eligibility(
+        meta["owner"].as_str(),
+        meta["ownerExplicit"].as_bool() == Some(true),
+        caller,
+        caller_explicit,
+        run_id_pid(id).and_then(pid_alive),
+    )
+    .map_err(str::to_string)
 }
 
 fn iso_timestamp(epoch: u64) -> String {
@@ -3655,7 +3840,13 @@ fn select_reap_targets(
     Ok(targets)
 }
 
-fn auto_reap_sessions(owner: &str, min_age: u64) -> Result<usize, String> {
+fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result<usize, String> {
+    if !owner_explicit {
+        eprintln!(
+            "tmuxlet: TMUXLET_AUTO_REAP=1 ignored: set TMUXLET_OWNER so only your own orphaned runs can be reaped"
+        );
+        return Ok(0);
+    }
     let mut candidates = Vec::new();
     for session in list_run_sessions() {
         let id = session
@@ -3666,9 +3857,9 @@ fn auto_reap_sessions(owner: &str, min_age: u64) -> Result<usize, String> {
             age_secs: run_age_secs(&id),
             id,
             session,
-            reason: "old with unchanged pane",
+            reason: "orphaned: owner matches and its tmuxlet process is dead",
         };
-        if let Err(e) = check_owner(&target.id, owner, false) {
+        if let Err(e) = self_heal_check(&target.id, owner, owner_explicit) {
             log_reap("skipped", &target, &e)?;
             continue;
         }
@@ -3705,8 +3896,8 @@ fn auto_reap_sessions(owner: &str, min_age: u64) -> Result<usize, String> {
         );
         match decision {
             Ok(_) => {
-                // Recheck ownership at the point of mutation as well.
-                if let Err(e) = check_owner(&target.id, owner, false) {
+                // Recheck ownership and the dead launcher at the point of mutation.
+                if let Err(e) = self_heal_check(&target.id, owner, owner_explicit) {
                     log_reap("skipped", &target, &e)?;
                     continue;
                 }
@@ -3934,6 +4125,21 @@ fn handle_bridge(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A run's meta.json as `tmuxlet status` prints it. Legacy runs without an
+/// owner show "unknown owner"; ownerExplicit is false unless meta.json says true
+/// (0.14.0+ runs record it; `unset:` owners are never explicit).
+fn status_view(mut value: serde_json::Value) -> serde_json::Value {
+    let explicit = value["ownerExplicit"].as_bool() == Some(true)
+        && value["owner"]
+            .as_str()
+            .is_some_and(|o| !o.starts_with(UNSET_OWNER_PREFIX));
+    if value.get("owner").is_none() {
+        value["owner"] = serde_json::json!("unknown owner");
+    }
+    value["ownerExplicit"] = serde_json::json!(explicit);
+    value
+}
+
 fn handle_status() -> Result<(), String> {
     let root = state_dir().join("runs");
     if !root.exists() {
@@ -3946,12 +4152,9 @@ fn handle_status() -> Result<(), String> {
         if meta.exists() {
             let text =
                 fs::read_to_string(meta).map_err(|e| format!("failed to read metadata: {e}"))?;
-            let mut value: serde_json::Value =
+            let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|e| format!("invalid metadata: {e}"))?;
-            if value.get("owner").is_none() {
-                value["owner"] = serde_json::json!("unknown owner");
-            }
-            println!("{value}");
+            println!("{}", status_view(value));
         }
     }
     Ok(())
@@ -4226,6 +4429,7 @@ fn write_meta(
     );
     let mut meta: serde_json::Value = serde_json::from_str(&meta).expect("valid metadata JSON");
     meta["owner"] = serde_json::json!(caller_owner(opts.owner.as_deref()));
+    meta["ownerExplicit"] = serde_json::json!(opts.owner_explicit);
     meta["startedAt"] = serde_json::json!(epoch_secs());
     if !env.is_empty() {
         meta["env"] = redacted_env_json(env);
@@ -4418,7 +4622,8 @@ Print-mode options:
       --ollama <model>                     claude, codex: use a model served by local Ollama (sets --model;
                                            claude gets ANTHROPIC_BASE_URL etc., codex gets --oss)
       --timeout <seconds>                  Print-mode timeout (default: 1800)
-      --owner <name>                       Run owner (flag > TMUXLET_OWNER > parent-process-name@caller-cwd)
+      --owner <name>                       Run owner (flag > TMUXLET_OWNER > unset:parent-process-name@caller-cwd,
+                                           recorded with ownerExplicit=false and a stderr warning)
       --reap-min-age <minutes>             Auto-reap minimum run age (default 10; env TMUXLET_REAP_MIN_AGE_MIN)
       --max-concurrency <n>                Live-session cap (0=unlimited; default 24; env TMUXLET_MAX_CONCURRENCY)
       --memory-pressure-guard, --memory-guard  Queue under host memory pressure (env TMUXLET_MEMORY_GUARD)
@@ -4429,7 +4634,13 @@ The prompt is never typed into a bare shell: if the target CLI fails to start or
 before completing, the run aborts with exit 1 and pane.log keeps the reason.
 
 Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, chatgpt),
-7 --file refused (a file the target can't take, or inlined text over the caps).
+7 --file refused (a file the target can't take, or inlined text over the caps),
+8 pool full: the live-session cap stayed full until TMUXLET_ACQUIRE_TIMEOUT; nothing was killed.
+
+Slot guard: warns once at 80% of the cap (tmuxlet: 20/24 slots in use). A full pool
+queues, then exits 8; it never reaps on its own. TMUXLET_AUTO_REAP=1 opts in to reaping
+only your own orphaned runs (explicit owner == your TMUXLET_OWNER, launching tmuxlet
+process dead, pane unchanged, past --reap-min-age). Ownerless/unset runs are never auto-reaped.
 
 Subcommands:
   status                                   List run meta.json lines
@@ -6926,6 +7137,24 @@ quote> Do not wait for the user after the final response is written.'\n";
     }
 
     #[test]
+    fn slot_warning_fires_once_at_eighty_percent_of_cap() {
+        assert_eq!(slot_warn_threshold(24), Some(20));
+        assert_eq!(slot_warn_threshold(10), Some(8));
+        assert_eq!(slot_warn_threshold(1), Some(1));
+        assert_eq!(slot_warn_threshold(0), None);
+        assert_eq!(slot_warning(19, 24), None);
+        assert_eq!(
+            slot_warning(20, 24).as_deref(),
+            Some("tmuxlet: 20/24 slots in use")
+        );
+        assert_eq!(
+            slot_warning(24, 24).as_deref(),
+            Some("tmuxlet: 24/24 slots in use")
+        );
+        assert_eq!(slot_warning(500, 0), None); // unlimited never warns
+    }
+
+    #[test]
     fn pick_acquire_timeout_parses_env_or_default() {
         assert_eq!(pick_acquire_timeout(Some("45")), Duration::from_secs(45));
         assert_eq!(pick_acquire_timeout(Some("0")), Duration::from_secs(0)); // forever
@@ -7069,9 +7298,18 @@ quote> Do not wait for the user after the final response is written.'\n";
     }
     #[test]
     fn owner_precedence_and_foreign_access() {
-        assert_eq!(pick_owner(Some("flag"), Some("env"), "parent@cwd"), "flag");
-        assert_eq!(pick_owner(None, Some("env"), "parent@cwd"), "env");
-        assert_eq!(pick_owner(None, None, "parent@cwd"), "parent@cwd");
+        assert_eq!(
+            pick_owner(Some("flag"), Some("env"), "parent@cwd"),
+            ("flag".to_string(), true)
+        );
+        assert_eq!(
+            pick_owner(None, Some("env"), "parent@cwd"),
+            ("env".to_string(), true)
+        );
+        assert_eq!(
+            pick_owner(None, None, "parent@cwd"),
+            ("unset:parent@cwd".to_string(), false)
+        );
         assert!(!is_foreign(Some("mine"), "mine", false));
         assert!(is_foreign(Some("theirs"), "mine", false));
         assert!(!is_foreign(Some("theirs"), "mine", true));
@@ -7133,6 +7371,131 @@ quote> Do not wait for the user after the final response is written.'\n";
                 Err("waiting on permission/trust prompt")
             );
         }
+    }
+
+    #[test]
+    fn full_pool_never_reaps_by_default_and_refuses_with_its_own_exit_code() {
+        let waited = Duration::from_secs(REAP_GRACE_SECS * 10);
+        // Default (TMUXLET_AUTO_REAP unset): a full pool never self-heals.
+        assert!(!should_self_heal(true, false, false, waited));
+        // Opt-in: once, only after the grace window, only for a full pool.
+        assert!(should_self_heal(true, true, false, waited));
+        assert!(!should_self_heal(true, true, true, waited));
+        assert!(!should_self_heal(true, true, false, Duration::from_secs(1)));
+        assert!(!should_self_heal(false, true, false, waited));
+        assert_eq!(
+            pool_full_message(24, 24, 0),
+            "pool full 24/24; refusing to start; nothing was killed; see `tmuxlet status` / `tmuxlet reap --dry-run`"
+        );
+        assert!(pool_full_message(24, 24, 2).contains("killed 2 orphaned"));
+        assert_eq!(EXIT_POOL_FULL, 8);
+        assert!(![0, 1, 6, EXIT_ATTACHMENT_REFUSED].contains(&EXIT_POOL_FULL));
+        let refused: RunError = "boom".into();
+        assert_eq!(refused.code, 1);
+    }
+
+    #[test]
+    fn opt_in_self_heal_requires_matching_explicit_owner_and_dead_launcher() {
+        assert_eq!(
+            self_heal_eligibility(Some("Press"), true, "Press", true, Some(false)),
+            Ok(())
+        );
+        // Launcher alive or unknown: spared.
+        assert!(self_heal_eligibility(Some("Press"), true, "Press", true, Some(true)).is_err());
+        assert!(self_heal_eligibility(Some("Press"), true, "Press", true, None).is_err());
+        // Another owner: spared even when its launcher is dead.
+        assert!(self_heal_eligibility(Some("Other"), true, "Press", true, Some(false)).is_err());
+        // Caller without explicit TMUXLET_OWNER: never reaps.
+        assert!(
+            self_heal_eligibility(
+                Some("unset:zsh@/r"),
+                false,
+                "unset:zsh@/r",
+                false,
+                Some(false)
+            )
+            .is_err()
+        );
+        assert!(self_heal_eligibility(Some("Press"), true, "Press", false, Some(false)).is_err());
+        // Run recorded an implicit owner (0.13 fallback or unset:): spared.
+        assert!(self_heal_eligibility(Some("Press"), false, "Press", true, Some(false)).is_err());
+        assert_eq!(run_id_pid("18df0bbaa69f4890-51d5-0"), Some(0x51d5));
+        assert_eq!(run_id_pid("tmuxlet-18df0bbaa69f4890-51d5-0"), Some(0x51d5));
+        assert_eq!(run_id_pid("18df0bbaa69f4890"), None);
+        assert_eq!(run_id_pid("18df0bbaa69f4890-zz-0"), None);
+        let own = make_run_id();
+        assert_eq!(run_id_pid(&own), Some(std::process::id()));
+        assert_eq!(pid_alive(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn ownerless_runs_are_never_auto_reaped() {
+        for recorded in [None, Some(""), Some("unknown owner")] {
+            for explicit in [true, false] {
+                assert_eq!(
+                    self_heal_eligibility(recorded, explicit, "Press", true, Some(false)),
+                    Err("run has no owner; never auto-reaped"),
+                    "{recorded:?}"
+                );
+            }
+        }
+        assert_eq!(
+            self_heal_eligibility(Some("unset:zsh@/r"), true, "Press", true, Some(false)),
+            Err("run owner is not explicit; never auto-reaped")
+        );
+    }
+
+    #[test]
+    fn unset_owner_falls_back_to_explicit_unset_marker_without_failing() {
+        let (owner, explicit) = pick_owner(None, None, "zsh@/Users/kk/repo");
+        assert_eq!(owner, "unset:zsh@/Users/kk/repo");
+        assert!(!explicit);
+        // Empty values count as unset.
+        assert_eq!(pick_owner(Some(" "), Some(""), "p@c").0, "unset:p@c");
+        let warning = unset_owner_warning(&owner);
+        assert_eq!(warning.lines().count(), 1);
+        assert!(warning.contains("TMUXLET_OWNER is unset"));
+        assert!(warning.contains("unset:zsh@/Users/kk/repo"));
+        // The marker is not identity: 0.13 fallback runs stay manageable.
+        assert!(!is_foreign(Some("zsh@/r"), "unset:zsh@/r", false));
+        assert!(!is_foreign(Some("unset:zsh@/r"), "unset:zsh@/r", false));
+        assert!(is_foreign(Some("unset:zsh@/r"), "Press", false));
+        // status shows the marker and ownerExplicit for every run.
+        let view = status_view(serde_json::json!({"owner": owner, "ownerExplicit": false}));
+        assert_eq!(view["owner"], "unset:zsh@/Users/kk/repo");
+        assert_eq!(view["ownerExplicit"], false);
+        let view = status_view(serde_json::json!({"owner": "Press", "ownerExplicit": true}));
+        assert_eq!(view["ownerExplicit"], true);
+        let legacy = status_view(serde_json::json!({"id": "x"}));
+        assert_eq!(legacy["owner"], "unknown owner");
+        assert_eq!(legacy["ownerExplicit"], false);
+        // write_meta records the marker in meta.json.
+        let root = env::temp_dir().join(make_run_id());
+        fs::create_dir_all(&root).unwrap();
+        let paths = RunPaths {
+            root: root.clone(),
+            meta: root.join("meta.json"),
+            prompt: root.join("prompt.txt"),
+            answer: root.join("answer.txt"),
+            complete: root.join("complete.txt"),
+            pane_log: root.join("pane.log"),
+            error: root.join("error.txt"),
+        };
+        let opts = Options {
+            owner: Some("unset:zsh@/Users/kk/repo".into()),
+            owner_explicit: false,
+            ..Options::default()
+        };
+        let command = TargetCommand {
+            program: "codex".into(),
+            args: vec![],
+        };
+        write_meta(&paths, "id", "session", &opts, &command, &[]).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(meta["owner"], "unset:zsh@/Users/kk/repo");
+        assert_eq!(meta["ownerExplicit"], false);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7215,6 +7578,7 @@ quote> Do not wait for the user after the final response is written.'\n";
         };
         let opts = Options {
             owner: Some("worker".into()),
+            owner_explicit: true,
             ..Options::default()
         };
         let before = epoch_secs();
@@ -7233,6 +7597,7 @@ quote> Do not wait for the user after the final response is written.'\n";
         let meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&paths.meta).unwrap()).unwrap();
         assert_eq!(meta["owner"], "worker");
+        assert_eq!(meta["ownerExplicit"], true);
         assert!(meta["startedAt"].as_u64().unwrap() >= before);
         assert!(meta["startedAt"].as_u64().unwrap() <= epoch_secs());
         fs::remove_dir_all(root).unwrap();

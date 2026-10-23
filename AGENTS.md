@@ -53,6 +53,24 @@ CLI flags, output status, runtime files, or target-specific mappings.
 
 ## Change Notes
 
+- 0.14.0, slot guard. Before: a launch that found the pool full (24 live
+  sessions) waited 60s and then auto-reaped any run 10+ minutes old with an
+  unchanged pane, and `check_owner` let ownerless runs through as the caller's
+  own. On 2026-10-16 at 16:05 CT, three minutes after 0.8.0 added auto-reaping,
+  one pass killed 24 legacy `unknown owner` codex sessions belonging to other
+  agents. A full pool then exited 1 with `at capacity`. After: `acquire_run_slot`
+  warns once at 80% of the cap (`tmuxlet: 20/24 slots in use`); a full pool queues
+  until `TMUXLET_ACQUIRE_TIMEOUT`, then exits 8 (`EXIT_POOL_FULL`) with `pool full
+  N/N; refusing to start; nothing was killed; ...`. Self-heal runs only with
+  `TMUXLET_AUTO_REAP=1`, and then only for runs whose `meta.json` owner equals the
+  caller's explicit owner with `ownerExplicit: true` and whose launching tmuxlet
+  PID (second run-id field) is dead (`self_heal_eligibility`). Ownerless, `unknown owner`, and
+  `unset:` runs are never auto-reaped. Every new run records an owner; with no
+  `--owner`/`TMUXLET_OWNER` it is `unset:<parent>@<cwd>` with `ownerExplicit:
+  false` plus a stderr warning, and `status` shows `ownerExplicit` for every run.
+  `is_foreign` ignores the `unset:` prefix so 0.13 fallback-owned runs stay
+  manageable. Manual `tmuxlet reap` is unchanged and still matches ownerless
+  sessions without `--force-foreign`. Keep a full pool non-destructive by default.
 - 0.13.0, Claude permission floor. Before: claude launches defaulted to
   `--permission-mode auto` but passed any caller mode through verbatim
   (`acceptEdits`, `plan`, `default`, or extra `--target-arg` flags), and
