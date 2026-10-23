@@ -872,6 +872,22 @@ fn execute_prune(selected: &[RunRecord], runs_root: &Path, dry_run: bool) -> Pru
     PruneOutcome { deleted, failures }
 }
 
+/// prune spares a run whose launching tmuxlet process (the second hex field of
+/// `<nanos>-<pid>-<seq>`, as auto-reap reads it) is still alive: a run that
+/// looks exited may be queued waiting for a slot. Some(reason) means skip.
+fn prune_launcher_skip(id: &str, alive: impl Fn(u32) -> Option<bool>) -> Option<String> {
+    let pid = run_id_pid(id)?;
+    match alive(pid) {
+        Some(false) => None,
+        Some(true) => Some(format!(
+            "run {id}: its tmuxlet process (pid {pid}) is still alive"
+        )),
+        None => Some(format!(
+            "run {id}: cannot tell whether its tmuxlet process (pid {pid}) is alive"
+        )),
+    }
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -3469,11 +3485,28 @@ fn slot_warn_threshold(cap: usize) -> Option<usize> {
     (cap != 0).then(|| (cap * 4).div_ceil(5))
 }
 
-/// The one-time near-capacity warning, e.g. "tmuxlet: 20/24 slots in use".
+/// Live count against the cap: "20/24" at or under the cap, "24 live, cap 22"
+/// over it (a cap lowered below the sessions already running), never "24/22".
+fn slot_usage(live: usize, cap: usize) -> String {
+    if live > cap {
+        format!("{live} live, cap {cap}")
+    } else {
+        format!("{live}/{cap}")
+    }
+}
+
+/// The one-time near-capacity warning: "tmuxlet: 20/24 slots in use" at or
+/// under the cap, "tmuxlet: 24 live, cap 22" over it.
 fn slot_warning(live: usize, cap: usize) -> Option<String> {
     slot_warn_threshold(cap)
         .filter(|threshold| live >= *threshold)
-        .map(|_| format!("tmuxlet: {live}/{cap} slots in use"))
+        .map(|_| {
+            if live > cap {
+                format!("tmuxlet: {}", slot_usage(live, cap))
+            } else {
+                format!("tmuxlet: {} slots in use", slot_usage(live, cap))
+            }
+        })
 }
 
 /// Self-heal runs at most once per acquire, only for a full pool, only after
@@ -3494,8 +3527,10 @@ fn pool_full_message(live: usize, cap: usize, killed: usize) -> String {
     } else {
         format!("TMUXLET_AUTO_REAP killed {killed} orphaned run(s) of yours")
     };
+    let sep = if live > cap { ": " } else { " " };
     format!(
-        "pool full {live}/{cap}; refusing to start; {killed}; see `tmuxlet status` / `tmuxlet reap --dry-run`"
+        "pool full{sep}{}; refusing to start; {killed}; see `tmuxlet status` / `tmuxlet reap --dry-run`",
+        slot_usage(live, cap)
     )
 }
 
@@ -3535,7 +3570,11 @@ fn acquire_run_slot(opts: &Options) -> Result<(), RunError> {
 
         if !announced {
             let why = if cap_block {
-                format!("{live}/{cap} live sessions")
+                if live > cap {
+                    slot_usage(live, cap)
+                } else {
+                    format!("{} live sessions", slot_usage(live, cap))
+                }
             } else {
                 "host under memory pressure".to_string()
             };
@@ -3770,24 +3809,108 @@ fn reap_log_line(
     )
 }
 
-fn log_reap(action: &str, target: &ReapTarget, reason: &str) -> Result<(), String> {
-    let meta = read_meta(&target.id).unwrap_or_else(|_| serde_json::json!({}));
-    fs::create_dir_all(state_dir())
-        .map_err(|e| format!("cannot create reap log directory: {e}"))?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_dir().join("reap.log"))
-        .map_err(|e| format!("cannot open reap.log: {e}"))?;
-    file.write_all(reap_log_line(epoch_secs(), action, target, &meta, reason).as_bytes())
-        .map_err(|e| format!("cannot write reap.log: {e}"))
+/// The reap audit log, `<dir>/reap.log`. A `--dry-run` log has no path, so a
+/// preview never creates or appends to reap.log.
+struct ReapLog {
+    path: Option<PathBuf>,
+}
+
+impl ReapLog {
+    fn new(dry_run: bool, dir: &Path) -> Self {
+        Self {
+            path: (!dry_run).then(|| dir.join("reap.log")),
+        }
+    }
+
+    /// Open for append (creating the directory); None for a dry-run log.
+    fn open(&self) -> Result<Option<fs::File>, String> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create reap log directory: {e}"))?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(Some)
+            .map_err(|e| format!("cannot open reap.log: {e}"))
+    }
+
+    fn record(&self, action: &str, target: &ReapTarget, reason: &str) -> Result<(), String> {
+        let Some(mut file) = self.open()? else {
+            return Ok(());
+        };
+        let meta = read_meta(&target.id).unwrap_or_else(|_| serde_json::json!({}));
+        file.write_all(reap_log_line(epoch_secs(), action, target, &meta, reason).as_bytes())
+            .map_err(|e| format!("cannot write reap.log: {e}"))
+    }
+}
+
+/// Manual reap kills only runs with an explicit recorded owner unless
+/// --force-foreign: no owner, "unknown owner", an `unset:` owner, or
+/// ownerExplicit=false are skipped and listed instead.
+fn manual_reap_owner_gate(
+    recorded: Option<&str>,
+    recorded_explicit: bool,
+    force_foreign: bool,
+) -> Result<(), &'static str> {
+    if force_foreign {
+        return Ok(());
+    }
+    let Some(recorded) = recorded.filter(|o| !o.is_empty() && *o != "unknown owner") else {
+        return Err("run has no owner; pass --force-foreign to reap it");
+    };
+    if recorded.starts_with(UNSET_OWNER_PREFIX) {
+        return Err("run has an unset: owner; pass --force-foreign to reap it");
+    }
+    if !recorded_explicit {
+        return Err(
+            "run owner is not explicit (ownerExplicit=false); pass --force-foreign to reap it",
+        );
+    }
+    Ok(())
+}
+
+/// Ok(Some(reason)) means skip-and-list; Err means meta.json is unreadable.
+fn manual_reap_owner_check(id: &str, force_foreign: bool) -> Result<Option<&'static str>, String> {
+    let meta = read_meta(id)?;
+    Ok(manual_reap_owner_gate(
+        meta["owner"].as_str(),
+        meta["ownerExplicit"].as_bool() == Some(true),
+        force_foreign,
+    )
+    .err())
+}
+
+struct ReapSelection {
+    targets: Vec<ReapTarget>,
+    /// Matching runs left alone for lack of an explicit owner: (id, reason).
+    unowned: Vec<(String, &'static str)>,
+}
+
+fn print_unowned_skips(unowned: &[(String, &'static str)]) {
+    if unowned.is_empty() {
+        return;
+    }
+    println!(
+        "Skipped {} run(s) without an explicit owner (use --force-foreign to include them):",
+        unowned.len()
+    );
+    for (id, reason) in unowned {
+        println!("  {id}  {reason}");
+    }
 }
 
 fn select_reap_targets(
     criteria: &ReapCriteria,
     access: &ManagementAccess,
-) -> Result<Vec<ReapTarget>, String> {
+    log: &ReapLog,
+) -> Result<ReapSelection, String> {
     let mut targets = Vec::new();
+    let mut unowned = Vec::new();
     let mut refusals = Vec::new();
     for session in list_run_sessions() {
         let id = session
@@ -3803,7 +3926,7 @@ fn select_reap_targets(
         let pane = match capture_pane(&target.session, 200) {
             Ok(pane) => pane,
             Err(e) => {
-                log_reap("skipped", &target, &format!("cannot capture pane: {e}"))?;
+                log.record("skipped", &target, &format!("cannot capture pane: {e}"))?;
                 continue;
             }
         };
@@ -3814,21 +3937,39 @@ fn select_reap_targets(
             REAP_GRACE_SECS,
         ) {
             Some(reason) => {
-                if let Err(e) = check_owner(&target.id, &access.owner, access.force_foreign) {
-                    eprintln!("tmuxlet: skipped: {e}");
-                    log_reap("skipped", &target, &e)?;
-                    refusals.push(e);
-                    continue;
+                let ownership =
+                    manual_reap_owner_check(&target.id, access.force_foreign).and_then(|skip| {
+                        match skip {
+                            Some(skip) => Ok(Some(skip)),
+                            None => check_owner(&target.id, &access.owner, access.force_foreign)
+                                .map(|()| None),
+                        }
+                    });
+                match ownership {
+                    Ok(Some(skip)) => {
+                        log.record("skipped", &target, skip)?;
+                        unowned.push((target.id, skip));
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("tmuxlet: skipped: {e}");
+                        log.record("skipped", &target, &e)?;
+                        refusals.push(e);
+                        continue;
+                    }
+                    Ok(None) => {}
                 }
                 target.reason = reason;
                 targets.push(target);
             }
-            None => log_reap("skipped", &target, "does not match manual reap criteria")?,
+            None => log.record("skipped", &target, "does not match manual reap criteria")?,
         }
     }
+    unowned.sort();
+    print_unowned_skips(&unowned);
     if !refusals.is_empty() {
         for target in &targets {
-            log_reap(
+            log.record(
                 "skipped",
                 target,
                 "manual reap refused due to foreign or unreadable runs",
@@ -3837,7 +3978,7 @@ fn select_reap_targets(
         return Err(refusals.join("; "));
     }
     targets.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(targets)
+    Ok(ReapSelection { targets, unowned })
 }
 
 fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result<usize, String> {
@@ -3847,6 +3988,7 @@ fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result
         );
         return Ok(0);
     }
+    let log = ReapLog::new(false, &state_dir());
     let mut candidates = Vec::new();
     for session in list_run_sessions() {
         let id = session
@@ -3860,7 +4002,7 @@ fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result
             reason: "orphaned: owner matches and its tmuxlet process is dead",
         };
         if let Err(e) = self_heal_check(&target.id, owner, owner_explicit) {
-            log_reap("skipped", &target, &e)?;
+            log.record("skipped", &target, &e)?;
             continue;
         }
         let pane = capture_pane(&target.session, 200)
@@ -3870,7 +4012,7 @@ fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result
             .as_ref()
             .is_some_and(|p| is_execution_confirmation_blocker(p));
         if let Err(reason) = auto_reap_decision(target.age_secs, min_age, prompt, pane.is_some()) {
-            log_reap("skipped", &target, reason)?;
+            log.record("skipped", &target, reason)?;
         } else {
             candidates.push((target, pane.unwrap()));
         }
@@ -3898,14 +4040,14 @@ fn auto_reap_sessions(owner: &str, owner_explicit: bool, min_age: u64) -> Result
             Ok(_) => {
                 // Recheck ownership and the dead launcher at the point of mutation.
                 if let Err(e) = self_heal_check(&target.id, owner, owner_explicit) {
-                    log_reap("skipped", &target, &e)?;
+                    log.record("skipped", &target, &e)?;
                     continue;
                 }
-                if reap_target(&target)? {
+                if reap_target(&target, &log)? {
                     killed += 1;
                 }
             }
-            Err(reason) => log_reap("skipped", &target, reason)?,
+            Err(reason) => log.record("skipped", &target, reason)?,
         }
     }
     Ok(killed)
@@ -3920,17 +4062,13 @@ fn kill_session_exact(session: &str) -> bool {
     .is_ok()
 }
 
-fn reap_target(target: &ReapTarget) -> Result<bool, String> {
+fn reap_target(target: &ReapTarget, log: &ReapLog) -> Result<bool, String> {
     // Ensure the audit destination can be opened before killing anything.
-    fs::create_dir_all(state_dir())
-        .map_err(|e| format!("cannot create reap log directory: {e}"))?;
-    let _log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_dir().join("reap.log"))
-        .map_err(|e| format!("cannot open reap.log: {e}"))?;
+    if log.open()?.is_none() {
+        return Err("refusing to reap without a reap.log (dry run)".into());
+    }
     let killed = kill_session_exact(&target.session);
-    log_reap(
+    log.record(
         if killed { "reaped" } else { "skipped" },
         target,
         if killed {
@@ -3971,9 +4109,15 @@ fn parse_reap_args(args: &[String]) -> Result<(ReapCriteria, bool, bool), String
 fn handle_reap(args: &[String]) -> Result<(), String> {
     let (args, access) = management_args(args)?;
     let (criteria, yes, dry_run) = parse_reap_args(&args)?;
-    let targets = select_reap_targets(&criteria, &access)?;
+    // A dry run is a pure preview: it never writes reap.log.
+    let log = ReapLog::new(dry_run, &state_dir());
+    let ReapSelection { targets, unowned } = select_reap_targets(&criteria, &access, &log)?;
     if targets.is_empty() {
-        println!("Nothing to reap.");
+        if unowned.is_empty() {
+            println!("Nothing to reap.");
+        } else {
+            println!("Nothing to reap without --force-foreign.");
+        }
         return Ok(());
     }
     let verb = if dry_run { "Would reap" } else { "Found" };
@@ -3986,9 +4130,6 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
         println!("  {:<10} {:<8} {}", short_id(&t.id), t.reason, age);
     }
     if dry_run {
-        for t in &targets {
-            log_reap("skipped", t, "dry run")?;
-        }
         return Ok(());
     }
     if !yes {
@@ -4000,7 +4141,7 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("failed to read confirmation: {e}"))?;
         if !matches!(response.trim().to_lowercase().as_str(), "y" | "yes") {
             for t in &targets {
-                log_reap("skipped", t, "confirmation declined")?;
+                log.record("skipped", t, "confirmation declined")?;
             }
             println!("Aborted.");
             return Ok(());
@@ -4008,11 +4149,17 @@ fn handle_reap(args: &[String]) -> Result<(), String> {
     }
     let mut killed = 0;
     for t in &targets {
-        if let Err(e) = check_owner(&t.id, &access.owner, access.force_foreign) {
-            log_reap("skipped", t, &e)?;
+        // Recheck ownership at the point of mutation.
+        let ownership = match manual_reap_owner_check(&t.id, access.force_foreign) {
+            Ok(Some(skip)) => Err(skip.to_string()),
+            Ok(None) => check_owner(&t.id, &access.owner, access.force_foreign),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = ownership {
+            log.record("skipped", t, &e)?;
             continue;
         }
-        if reap_target(t)? {
+        if reap_target(t, &log)? {
             killed += 1;
         }
     }
@@ -4255,18 +4402,27 @@ fn handle_prune(args: &[String]) -> Result<(), String> {
     let parsed = parse_prune_args(&args)?;
     let mut runs = Vec::new();
     let mut skipped_ids = Vec::new();
+    let mut launcher_alive_ids = Vec::new();
     for rec in discover_runs() {
         if !parsed.ids.is_empty() && !parsed.ids.contains(&rec.id) {
             runs.push(rec);
             continue;
         }
-        match check_owner(&rec.id, &access.owner, access.force_foreign) {
-            Ok(()) => runs.push(rec),
-            Err(e) => {
-                eprintln!("tmuxlet: skipped: {e}");
-                skipped_ids.push(rec.id);
-            }
+        if let Err(e) = check_owner(&rec.id, &access.owner, access.force_foreign) {
+            eprintln!("tmuxlet: skipped: {e}");
+            skipped_ids.push(rec.id);
+            continue;
         }
+        // Only terminal runs can be pruned; explicit in-progress ids still
+        // get the "use tmuxlet stop" error from prune_selection.
+        if rec.classification.is_terminal()
+            && let Some(e) = prune_launcher_skip(&rec.id, pid_alive)
+        {
+            eprintln!("tmuxlet: skipped: {e}");
+            launcher_alive_ids.push(rec.id);
+            continue;
+        }
+        runs.push(rec);
     }
     if !skipped_ids.is_empty() {
         println!(
@@ -4274,6 +4430,13 @@ fn handle_prune(args: &[String]) -> Result<(), String> {
             skipped_ids.len()
         );
     }
+    if !launcher_alive_ids.is_empty() {
+        println!(
+            "Skipped {} run(s) whose tmuxlet process is still running.",
+            launcher_alive_ids.len()
+        );
+    }
+    skipped_ids.extend(launcher_alive_ids);
     // Explicit foreign ids were already reported; do not turn skips into unknown ids.
     let ids: Vec<_> = parsed
         .ids
@@ -4637,7 +4800,8 @@ Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, cha
 7 --file refused (a file the target can't take, or inlined text over the caps),
 8 pool full: the live-session cap stayed full until TMUXLET_ACQUIRE_TIMEOUT; nothing was killed.
 
-Slot guard: warns once at 80% of the cap (tmuxlet: 20/24 slots in use). A full pool
+Slot guard: warns once at 80% of the cap (tmuxlet: 20/24 slots in use; over a lowered
+cap: tmuxlet: 24 live, cap 22). A full pool
 queues, then exits 8; it never reaps on its own. TMUXLET_AUTO_REAP=1 opts in to reaping
 only your own orphaned runs (explicit owner == your TMUXLET_OWNER, launching tmuxlet
 process dead, pane unchanged, past --reap-min-age). Ownerless/unset runs are never auto-reaped.
@@ -4659,9 +4823,12 @@ Management ownership (send, send-all, stop, prune, reap):
   --force-foreign                          Allow management of another owner's runs
   Legacy runs without owner are allowed with a warning. send-all and prune skip
   foreign runs and report a count; send, stop, and manual reap refuse them.
+  Manual reap skips and lists runs with no owner, unknown owner, an unset: owner,
+  or ownerExplicit=false unless --force-foreign.
+  prune skips runs whose launching tmuxlet process is still alive (e.g. queued).
   status includes owner. Use -- before literal message flags.
   Auto-reap only kills old, unchanged panes and never permission/trust prompts.
-  All reap actions/skips append JSON lines to <state-dir>/reap.log.
+  Reap actions/skips append JSON lines to <state-dir>/reap.log (not --dry-run).
 
 Environment:
   TMUXLET_OWNER=<name>                     Default caller/run identity
@@ -7155,6 +7322,27 @@ quote> Do not wait for the user after the final response is written.'\n";
     }
 
     #[test]
+    fn slot_wording_over_a_lowered_cap_says_live_and_cap() {
+        assert_eq!(slot_usage(20, 24), "20/24");
+        assert_eq!(slot_usage(22, 22), "22/22");
+        assert_eq!(slot_usage(24, 22), "24 live, cap 22");
+        assert_eq!(
+            slot_warning(24, 22).as_deref(),
+            Some("tmuxlet: 24 live, cap 22")
+        );
+        assert_eq!(
+            slot_warning(22, 22).as_deref(),
+            Some("tmuxlet: 22/22 slots in use")
+        );
+        assert!(!slot_warning(24, 22).unwrap().contains("24/22"));
+        assert_eq!(
+            pool_full_message(24, 22, 0),
+            "pool full: 24 live, cap 22; refusing to start; nothing was killed; see `tmuxlet status` / `tmuxlet reap --dry-run`"
+        );
+        assert!(pool_full_message(24, 24, 0).starts_with("pool full 24/24;"));
+    }
+
+    #[test]
     fn pick_acquire_timeout_parses_env_or_default() {
         assert_eq!(pick_acquire_timeout(Some("45")), Duration::from_secs(45));
         assert_eq!(pick_acquire_timeout(Some("0")), Duration::from_secs(0)); // forever
@@ -7426,6 +7614,96 @@ quote> Do not wait for the user after the final response is written.'\n";
         let own = make_run_id();
         assert_eq!(run_id_pid(&own), Some(std::process::id()));
         assert_eq!(pid_alive(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn manual_reap_requires_force_foreign_for_runs_without_explicit_owner() {
+        // Explicit owner: allowed (foreign-owner checks happen in check_owner).
+        assert_eq!(manual_reap_owner_gate(Some("Press"), true, false), Ok(()));
+        // No owner, unknown owner, unset:, or ownerExplicit=false: skipped.
+        for recorded in [None, Some(""), Some("unknown owner")] {
+            assert!(
+                manual_reap_owner_gate(recorded, true, false)
+                    .unwrap_err()
+                    .contains("no owner")
+            );
+        }
+        assert!(
+            manual_reap_owner_gate(Some("unset:zsh@/r"), true, false)
+                .unwrap_err()
+                .contains("unset:")
+        );
+        assert!(
+            manual_reap_owner_gate(Some("zsh@/r"), false, false)
+                .unwrap_err()
+                .contains("ownerExplicit=false")
+        );
+        // --force-foreign lets every one of them through (M4 Admin prunes this way).
+        for (recorded, explicit) in [
+            (None, false),
+            (Some("unknown owner"), false),
+            (Some("unset:zsh@/r"), false),
+            (Some("zsh@/r"), false),
+        ] {
+            assert_eq!(manual_reap_owner_gate(recorded, explicit, true), Ok(()));
+        }
+        // A run dir with no meta.json is ownerless.
+        let id = format!("no-such-run-{}", make_run_id());
+        assert!(manual_reap_owner_check(&id, false).unwrap().is_some());
+        assert_eq!(manual_reap_owner_check(&id, true).unwrap(), None);
+    }
+
+    #[test]
+    fn reap_dry_run_log_never_writes_reap_log() {
+        let dir = env::temp_dir().join(format!("tmuxlet-reaplog-{}", make_run_id()));
+        let target = ReapTarget {
+            id: "run-1".into(),
+            session: "tmuxlet-run-1".into(),
+            reason: "old",
+            age_secs: Some(600),
+        };
+        let dry = ReapLog::new(true, &dir);
+        assert!(dry.open().unwrap().is_none());
+        dry.record("skipped", &target, "dry run").unwrap();
+        assert!(
+            !dir.join("reap.log").exists(),
+            "dry run must not write reap.log"
+        );
+        assert!(!dir.exists(), "dry run must not even create the state dir");
+        // A dry-run log can never back a kill.
+        assert!(reap_target(&target, &dry).is_err());
+
+        let real = ReapLog::new(false, &dir);
+        real.record("skipped", &target, "confirmation declined")
+            .unwrap();
+        let text = fs::read_to_string(dir.join("reap.log")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("confirmation declined"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_skips_runs_whose_launching_tmuxlet_is_alive() {
+        let id = "18df0bbaa69f4890-51d5-0";
+        let alive = |pid: u32| {
+            assert_eq!(pid, 0x51d5, "pid comes from the second hex field");
+            Some(true)
+        };
+        assert!(
+            prune_launcher_skip(id, alive)
+                .unwrap()
+                .contains("pid 20949")
+        );
+        assert_eq!(prune_launcher_skip(id, |_| Some(false)), None);
+        // Unknown liveness is spared too.
+        assert!(prune_launcher_skip(id, |_| None).is_some());
+        // Ids without a parseable pid fall back to the old behavior.
+        assert_eq!(
+            prune_launcher_skip("18df0bbaa69f4890", |_| Some(true)),
+            None
+        );
+        // Real check: this test process is alive, so its own run ids are spared.
+        assert!(prune_launcher_skip(&make_run_id(), pid_alive).is_some());
     }
 
     #[test]

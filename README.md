@@ -154,7 +154,9 @@ and `--force-foreign`. A foreign run is refused with its id and owner; `send-all
 and `prune` instead skip foreign runs and report the count. Manual `reap` refuses
 the pass if any selected runs are foreign. `--force-foreign` explicitly overrides
 these checks. Legacy runs without an owner remain accessible with a warning
-and appear as `unknown owner` in status. `read` and `attach` remain read/interactive
+and appear as `unknown owner` in status, except for manual `reap`: since 0.14.1
+it skips runs with no owner, `unknown owner`, an `unset:` owner, or
+`ownerExplicit=false` unless you pass `--force-foreign`. `read` and `attach` remain read/interactive
 inspection commands without an ownership restriction.
 
 ```bash
@@ -271,7 +273,11 @@ session file; `ollama ps` lists the model as recently used.
 
 `tmuxlet prune` deletes terminal runs (`completed`, `timeout`, `blocked`,
 `exited`) and any leftover tmux sessions they own. With no ids it sweeps every
-terminal run; with explicit ids it refuses non-terminal ones. Use `--dry-run`
+terminal run; with explicit ids it refuses non-terminal ones. Since 0.14.1 it
+also skips any run whose launching tmuxlet process is still alive, even if the
+run looks `exited` (for example a launch queued waiting for a slot). The PID is
+the second hex field of the run id (`<nanos>-<pid>-<seq>`), the same one
+auto-reap checks; a PID that can't be checked is also skipped. Use `--dry-run`
 to preview and `-y` / `--yes` to skip the confirmation prompt.
 
 `tmuxlet reap` kills stuck/leaked live sessions so their concurrency slot frees
@@ -283,6 +289,10 @@ When both filters are set they are ORed. Age uses `startedAt` or legacy
 `meta.json` creation time, never directory modification time. Like
 `prune`, it lists candidates and asks before killing; pass `-y` / `--yes` for
 cron, `--dry-run` to preview. It only kills sessions — `prune` cleans the dirs.
+Since 0.14.1 it only kills runs with an explicit owner: matching runs with no
+owner, `unknown owner`, an `unset:` owner, or `ownerExplicit=false` are skipped
+and listed (`Skipped N run(s) without an explicit owner ...`) unless you pass
+`--force-foreign`.
 
 `tmuxlet send-all` walks every live tmuxlet session and delivers a message (or
 just Enter, with `--enter` or an empty message) with a pause between sessions
@@ -689,10 +699,13 @@ counts what is actually alive, not how many launches a caller has fired.
   cheap `tmux list-sessions` call; with the cap disabled there is zero overhead.
 - **Near-capacity warning (0.14.0).** The first time a launch sees the pool at
   80% of the cap or more (rounded up: 20 of 24), it prints one stderr line, e.g.
-  `tmuxlet: 20/24 slots in use`.
+  `tmuxlet: 20/24 slots in use`. If the live count is over the cap (the cap was
+  lowered below what is already running), it reads `tmuxlet: 24 live, cap 22`
+  instead of `24/22` (0.14.1).
 - **Full pool refuses; it never kills by default (0.14.0).** A full pool queues
   until `TMUXLET_ACQUIRE_TIMEOUT`, then exits **8** with
   `pool full N/N; refusing to start; nothing was killed; see \`tmuxlet status\` / \`tmuxlet reap --dry-run\``.
+  Over the cap it reads `pool full: 24 live, cap 22; refusing to start; ...`.
   Before 0.14.0 a saturated launch auto-reaped after 60s, and it treated ownerless
   runs as its own: on 2026-10-16 that killed 24 legacy `unknown owner` sessions
   belonging to other agents in one pass.
@@ -750,16 +763,18 @@ Runtime files live in:
 Set `TMUXLET_HOME` to override the state directory.
 
 Every automatic/manual reap and every skip appends a JSON line to
-`<state-dir>/reap.log`, including dry runs and declined confirmations. Each line
+`<state-dir>/reap.log`, including declined confirmations. `reap --dry-run` never
+writes reap.log (since 0.14.1; before, it logged every line as skipped). Each line
 records an ISO UTC timestamp, `action` (`reaped` or `skipped`), full run id,
 owner, cwd, target, age in seconds (null if unknown), and reason. Permission
 skips say `waiting on permission/trust prompt`. Foreign and unreadable metadata
 are also logged. Audit-log failures are reported; an unopenable log prevents
 reaping. Manual reap can intentionally kill permission-blocked sessions after
 confirmation; automatic reap always leaves those sessions for their owner.
-Manual `tmuxlet reap` is unchanged in 0.14.0: like other management commands it
-allows legacy runs without an owner (with a warning), so it can kill ownerless
-sessions that match its criteria without `--force-foreign`. Use `--dry-run` first.
+Since 0.14.1 manual `tmuxlet reap` needs `--force-foreign` for runs with no
+owner, `unknown owner`, an `unset:` owner, or `ownerExplicit=false`; without it
+those runs are skipped, listed, and logged as skipped. In 0.14.0 and earlier it
+let ownerless runs through with only a warning. Use `--dry-run` first.
 
 A successful print-mode run auto-kills its tmux session before returning, but
 the run directory itself is left on disk so callers can inspect `complete.txt`,

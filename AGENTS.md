@@ -53,6 +53,22 @@ CLI flags, output status, runtime files, or target-specific mappings.
 
 ## Change Notes
 
+- 0.14.1, reap/prune safety follow-ups. Before: manual `tmuxlet reap -y` let
+  runs with no owner through as "legacy" with only a warning; `reap --dry-run`
+  appended a `skipped`/`dry run` line to reap.log for every candidate; `prune`
+  deleted any terminal-looking run, including an `exited`-looking run whose
+  launching tmuxlet was still alive (queued for a slot); and over a lowered cap
+  the warning read `24/22 slots in use`. After: `select_reap_targets` runs
+  `manual_reap_owner_gate` first and skips and lists (stdout) runs with no owner,
+  `unknown owner`, an `unset:` owner, or `ownerExplicit=false` unless
+  `--force-foreign`; the gate is rechecked before each kill. Reap logging goes
+  through `ReapLog`, which has no path for `--dry-run`, so a preview never writes
+  reap.log, and `reap_target` refuses to kill without a writable log. `prune`
+  skips terminal runs whose launcher PID (`run_id_pid`, second run-id field) is
+  alive or can't be checked (`prune_launcher_skip`). `slot_usage` prints
+  `20/24` at or under the cap and `24 live, cap 22` over it, so the warning is
+  `tmuxlet: 24 live, cap 22` and the exit-8 message is `pool full: 24 live, cap
+  22; ...`. M4 Admin's `--force-foreign` prune by explicit id is unchanged.
 - 0.14.0, slot guard. Before: a launch that found the pool full (24 live
   sessions) waited 60s and then auto-reaped any run 10+ minutes old with an
   unchanged pane, and `check_owner` let ownerless runs through as the caller's
@@ -69,8 +85,8 @@ CLI flags, output status, runtime files, or target-specific mappings.
   `--owner`/`TMUXLET_OWNER` it is `unset:<parent>@<cwd>` with `ownerExplicit:
   false` plus a stderr warning, and `status` shows `ownerExplicit` for every run.
   `is_foreign` ignores the `unset:` prefix so 0.13 fallback-owned runs stay
-  manageable. Manual `tmuxlet reap` is unchanged and still matches ownerless
-  sessions without `--force-foreign`. Keep a full pool non-destructive by default.
+  manageable. Manual `tmuxlet reap` was unchanged in 0.14.0 and still matched ownerless
+  sessions without `--force-foreign` (fixed in 0.14.1). Keep a full pool non-destructive by default.
 - 0.13.0, Claude permission floor. Before: claude launches defaulted to
   `--permission-mode auto` but passed any caller mode through verbatim
   (`acceptEdits`, `plan`, `default`, or extra `--target-arg` flags), and

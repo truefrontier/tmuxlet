@@ -125,9 +125,10 @@ the `tmux ls` filter to see what's actually running.
 
 Each run is a full interactive TUI (hundreds of MB). tmuxlet enforces a
 machine-wide live-session cap (default 24). At 80% of the cap a launch warns once
-(`tmuxlet: 20/24 slots in use`). Launches at the cap queue until a slot frees (up to
+(`tmuxlet: 20/24 slots in use`; over a lowered cap, `tmuxlet: 24 live, cap 22`).
+Launches at the cap queue until a slot frees (up to
 `TMUXLET_ACQUIRE_TIMEOUT`, default 300s), then exit **8** (`pool full N/N; refusing
-to start; nothing was killed`). A full pool never kills sessions unless
+to start; nothing was killed`; over the cap, `pool full: 24 live, cap 22; ...`). A full pool never kills sessions unless
 `TMUXLET_AUTO_REAP=1`, and even then only your own explicitly owned runs whose
 tmuxlet process is dead.
 
@@ -161,9 +162,12 @@ tmuxlet prune -y                   # delete all terminal run dirs + their leftov
 tmuxlet prune <id> -y              # specific runs (refuses non-terminal ids)
 ```
 
-`reap` kills live sessions; `prune` deletes finished run directories. Manual
-`reap` also matches legacy ownerless sessions (other agents' old runs) without
-`--force-foreign`, so always `--dry-run` first and never `reap -y` blindly. A
+`reap` kills live sessions; `prune` deletes finished run directories. Since
+0.14.1 manual `reap` skips and lists runs with no owner, `unknown owner`, an
+`unset:` owner, or `ownerExplicit=false`; it only kills them with
+`--force-foreign`, which you should not pass unless the user asks. `reap --dry-run`
+never writes reap.log. `prune` skips runs whose launching tmuxlet process is still
+alive (e.g. queued for a slot), even if they look exited. Still `--dry-run` first. A
 successful run auto-kills its session but leaves the run dir for inspection, so
 periodic `prune -y` is the normal hygiene step.
 
