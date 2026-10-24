@@ -107,6 +107,7 @@ Initial adapters:
 - `muse` / `musecli` / `llmcli:muse` (Meta Muse via [llmcli](https://github.com/truefrontier/webcli) `llmcli muse`; a chat backend, see [Chat backends](#chat-backends-muse-gweb-chatgpt))
 - `gweb` / `gemini-web` / `llmcli:gemini` (Gemini on the web via `llmcli gemini`; a chat backend)
 - `chatgpt` / `cgpt` / `llmcli:chatgpt` (ChatGPT on the web via `llmcli chatgpt`; a chat backend)
+- `notebooklm` / `nblm` / `llmcli:notebooklm` (one NotebookLM notebook via `llmcli notebooklm`, picked with `--notebook`; a chat backend)
 
 Unsupported normalized flags fail fast instead of being ignored. Use
 `--target-arg <arg>` for rare target-specific escape hatches.
@@ -177,7 +178,7 @@ for a given `--target` fail fast instead of being silently dropped. See
 | Flag / aliases | Value | Default | Purpose |
 | --- | --- | --- | --- |
 | `-p`, `--print` | flag | off | Blocking programmatic mode (required for runs). |
-| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli` / `llmcli:muse`, `gweb` / `gemini-web` / `llmcli:gemini`, `chatgpt` / `cgpt` / `llmcli:chatgpt`. |
+| `--target` | `<name>` | `claude` | Target CLI: `claude`, `agy` / `gemini`, `codex`, `opencode`, `pi`, `cursor` / `cursor-agent`, `grok`, `hermes` / `hermes-agent`, `muse` / `musecli` / `llmcli:muse`, `gweb` / `gemini-web` / `llmcli:gemini`, `chatgpt` / `cgpt` / `llmcli:chatgpt`, `notebooklm` / `nblm` / `llmcli:notebooklm`. |
 | `--output-format` | `text` \| `json` | `text` | Shape of tmuxlet’s result. `stream-json` is not supported. |
 | `-C`, `--cwd`, `--cd`, `--dir` | `<dir>` | process cwd | Working directory for the run (`~` expanded). |
 | `-m`, `--model` | `<model>` | unset | Model pass-through where the target supports it. |
@@ -312,7 +313,7 @@ of a tight loop firing keystrokes at every session simultaneously.
 | `TMUXLET_MEMORY_GUARD` | off | Truthy values enable the memory-pressure guard (same as `--memory-pressure-guard` / `--memory-guard`). |
 | `TMUXLET_MEMORY_MIN_FREE` | `15` | Free-memory percent threshold for the memory guard. |
 | `TMUXLET_CLAUDE_PERMISSION_MODE` | `bypassPermissions` | Claude mode when neither `--permission-mode` nor full bypass is set. Only `bypassPermissions` or `auto`; lower modes clamp to `auto`, unknown values to `bypassPermissions`. |
-| `TMUXLET_LLMCLI_BIN` | `llmcli` | Program run for the chat backends `muse` / `gweb` / `chatgpt` (as `llmcli <site>`). |
+| `TMUXLET_LLMCLI_BIN` | `llmcli` | Program run for the chat backends `muse` / `gweb` / `chatgpt` / `notebooklm` (as `llmcli <site>`). |
 | `TMUXLET_OLLAMA_HOST` | `http://localhost:11434` | `ANTHROPIC_BASE_URL` that `--ollama` gives claude. |
 
 ## Resuming Target Sessions
@@ -592,9 +593,27 @@ up to its run timeout instead of failing after the CLI's 30s default. The CLI's
 answer timeout starts only after it gets the lock, so a long queue can still end
 in tmuxlet's own `timeout`.
 
+### notebooklm
+
+`notebooklm` asks one NotebookLM notebook (`llmcli notebooklm`, llmcli 0.6.0 /
+webcli with `llmcli notebooklm`): the answer comes from that notebook's sources.
+`--notebook <id|url|title>` is required and becomes `-n`; an exact title works.
+`--resume <conversationId>` / `--continue` map to `--chat` / `-c` like the other
+chat backends (the conversation id is the run's chat id). There is no model
+picker (`-m` fails fast). With `--output-format json` the run result carries
+NotebookLM's `citations` (`number`, `title`, `source_id`, `source_title`,
+`excerpt`). Text `--file`s are inlined into the question; other files are
+refused. A usage limit ends the run `rate_limited` (exit 6).
+
+```bash
+tmuxlet -p --target notebooklm --notebook "Research notes" "What do my sources say about X?"
+tmuxlet -p --target nblm --notebook <notebookId> --output-format json "Summarize"
+```
+
 You need `llmcli` with print mode (`-p`) on the `PATH` of your login shell, with
 each backend's identity already signed in (`llmcli muse login` /
-`llmcli gemini login` / `llmcli chatgpt login`). Point `TMUXLET_LLMCLI_BIN`
+`llmcli gemini login` / `llmcli chatgpt login`; notebooklm signs in with `llmcli notebooklm login`, the shared
+Google identity `google:default`). Point `TMUXLET_LLMCLI_BIN`
 at another program to override.
 
 ## Permissions
