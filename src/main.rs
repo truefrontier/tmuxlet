@@ -139,6 +139,8 @@ struct Options {
     // gweb only: turn on Gemini's Canvas tool, and where to save the doc's markdown.
     canvas: bool,
     canvas_out: Option<String>,
+    // notebooklm only: the notebook to ask (id, URL, or exact title), passed as `-n`.
+    notebook: Option<String>,
     // --file/--attach values as given, and what plan_attachments made of them.
     files: Vec<String>,
     attachments: Vec<Attachment>,
@@ -189,6 +191,7 @@ impl Default for Options {
             image_out: None,
             canvas: false,
             canvas_out: None,
+            notebook: None,
             files: Vec::new(),
             attachments: Vec::new(),
             resume: None,
@@ -563,6 +566,7 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
             "--image-out" => opts.image_out = Some(take_value(args, &mut i, arg)?),
             "--canvas" => opts.canvas = true,
             "--canvas-out" => opts.canvas_out = Some(take_value(args, &mut i, arg)?),
+            "--notebook" => opts.notebook = Some(take_value(args, &mut i, arg)?),
             "--file" | "--attach" => opts.files.push(take_value(args, &mut i, arg)?),
             "-c" | "--continue" => opts.continue_latest = true,
             "-r" | "--resume" => {
@@ -637,6 +641,7 @@ fn parse_options(args: &mut [String]) -> Result<Options, String> {
         "llmcli:gemini" => Some("gweb"),
         "llmcli:chatgpt" => Some("chatgpt"),
         "llmcli:muse" => Some("muse"),
+        "llmcli:notebooklm" => Some("notebooklm"),
         _ => None,
     } {
         opts.target = canon.into();
@@ -1476,15 +1481,16 @@ fn launch_plan(
 fn is_chat_target(target: &str) -> bool {
     matches!(
         target,
-        "muse" | "musecli" | "gweb" | "gemini-web" | "chatgpt" | "cgpt"
+        "muse" | "musecli" | "gweb" | "gemini-web" | "chatgpt" | "cgpt" | "notebooklm" | "nblm"
     )
 }
 
-/// The env var that makes a chat CLI print JSON errors (gweb, cgpt); muse has none.
+/// The env var that makes a chat CLI print JSON errors (gweb, cgpt, notebooklm); muse has none.
 fn chat_format_env(target: &str) -> Option<&'static str> {
     match target {
         "gweb" | "gemini-web" => Some("GWEB_FORMAT"),
         "chatgpt" | "cgpt" => Some("CGPT_FORMAT"),
+        "notebooklm" | "nblm" => Some("LLMCLI_FORMAT"),
         _ => None,
     }
 }
@@ -1527,11 +1533,13 @@ fn chat_launch_command(
 }
 
 fn chat_failure_status(target: &str, root: &Path) -> &'static str {
-    if matches!(target, "gweb" | "gemini-web" | "chatgpt" | "cgpt")
-        && fs::read_to_string(root.join("exit-code.txt"))
-            .unwrap_or_default()
-            .trim()
-            == "6"
+    if matches!(
+        target,
+        "gweb" | "gemini-web" | "chatgpt" | "cgpt" | "notebooklm" | "nblm"
+    ) && fs::read_to_string(root.join("exit-code.txt"))
+        .unwrap_or_default()
+        .trim()
+        == "6"
     {
         "rate_limited"
     } else {
@@ -1629,6 +1637,9 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
             unsupported(target, "--canvas-out", "only gweb has Gemini's Canvas")?;
         }
     }
+    if opts.notebook.is_some() && !matches!(target, "notebooklm" | "nblm") {
+        unsupported(target, "--notebook", "only notebooklm asks a notebook")?;
+    }
     if opts.ollama.is_some() && !matches!(target, "claude" | "codex") {
         unsupported(
             target,
@@ -1648,6 +1659,7 @@ fn target_command(opts: &Options) -> Result<TargetCommand, String> {
         "muse" | "musecli" => muse_command(opts)?,
         "gweb" | "gemini-web" => gweb_command(opts)?,
         "chatgpt" | "cgpt" => chatgpt_command(opts)?,
+        "notebooklm" | "nblm" => notebooklm_command(opts)?,
         other => return Err(format!("unsupported target: {other}")),
     };
     if matches!(target, "claude") {
@@ -2322,6 +2334,30 @@ fn chatgpt_command(opts: &Options) -> Result<TargetCommand, String> {
     Ok(cmd)
 }
 
+/// NotebookLM via `llmcli notebooklm`: one notebook's chat, answered from its
+/// sources with citations. `--notebook` (id, URL, or exact title) is required and
+/// becomes `-n`; sessions are NotebookLM conversation ids (`--chat` / `-c`, as
+/// for the other chat backends). No model picker. A JSON run asks for llmcli's
+/// JSON so the run result carries `citations`.
+fn notebooklm_command(opts: &Options) -> Result<TargetCommand, String> {
+    if opts.model.is_some() {
+        unsupported("notebooklm", "--model", "NotebookLM has no model picker")?;
+    }
+    let notebook = match opts.notebook.as_deref().map(str::trim) {
+        Some(nb) if !nb.is_empty() => nb.to_string(),
+        _ => return Err(
+            "notebooklm needs --notebook <id|url|title> (list them: llmcli notebooklm notebooks)"
+                .into(),
+        ),
+    };
+    let mut cmd = chat_command(opts, "notebooklm")?;
+    cmd.args.extend(["-n".into(), notebook]);
+    if opts.output_format == OutputFormat::Json {
+        cmd.args.extend(["--output-format".into(), "json".into()]);
+    }
+    Ok(cmd)
+}
+
 /// cgpt runs whose JSON result tmuxlet reads back: --image-out, and any run whose
 /// own result is JSON (for `citations` and the model fields).
 fn chatgpt_json(opts: &Options) -> bool {
@@ -2333,6 +2369,7 @@ fn chat_json(opts: &Options) -> bool {
     match opts.target.as_str() {
         "gweb" | "gemini-web" => gweb_json(opts),
         "chatgpt" | "cgpt" => chatgpt_json(opts),
+        "notebooklm" | "nblm" => opts.output_format == OutputFormat::Json,
         _ => false,
     }
 }
@@ -2376,8 +2413,18 @@ fn delivery_for(target: &str, kind: FileKind) -> Option<Delivery> {
 }
 
 const ATTACH_TARGETS: &[&str] = &[
-    "claude", "codex", "cursor", "agy", "opencode", "grok", "hermes", "pi", "muse", "gweb",
+    "claude",
+    "codex",
+    "cursor",
+    "agy",
+    "opencode",
+    "grok",
+    "hermes",
+    "pi",
+    "muse",
+    "gweb",
     "chatgpt",
+    "notebooklm",
 ];
 
 /// Resolve each --file against `cwd`, classify it, and pick its delivery for
@@ -2655,6 +2702,7 @@ fn chat_command(opts: &Options, target: &str) -> Result<TargetCommand, String> {
         "muse" | "musecli" => "muse",
         "gweb" | "gemini-web" => "gemini",
         "chatgpt" | "cgpt" => "chatgpt",
+        "notebooklm" | "nblm" => "notebooklm",
         _ => target,
     };
     let mut args = vec![
@@ -4755,7 +4803,7 @@ Usage:
 Print-mode options:
   -p, --print                              Blocking programmatic mode (required for runs)
       --target <name>                      Target CLI: claude, agy, codex, opencode, pi, cursor, grok, hermes,
-                                           or chat backends muse, gweb, chatgpt (default: claude)
+                                           or chat backends muse, gweb, chatgpt, notebooklm (default: claude)
       --output-format <text|json>          Result format (default: text; stream-json unsupported)
   -C, --cwd, --cd, --dir <dir>             Working directory
   -m, --model <model>                      Model pass-through where supported
@@ -4763,6 +4811,7 @@ Print-mode options:
       --image-out <dir|path>               gweb, chatgpt: save the reply's images there; JSON result gets `images`
       --canvas                             gweb: turn on Gemini's Canvas; JSON result gets `canvas`
       --canvas-out <path>                  gweb: also save the Canvas doc's markdown there (implies --canvas)
+      --notebook <id|url|title>            notebooklm (required): the NotebookLM notebook to ask
       --file, --attach <path>              Attach a file (repeatable) by the target's native mechanism, else
                                            inline text (256 KiB each, 768 KiB total); exit 7 if refused
   -c, --continue                           Continue latest target session where supported
@@ -4796,7 +4845,7 @@ Unsupported target combinations fail fast. See README for per-target mapping.
 The prompt is never typed into a bare shell: if the target CLI fails to start or exits
 before completing, the run aborts with exit 1 and pane.log keeps the reason.
 
-Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, chatgpt),
+Exit codes: 0 completed, 1 error or run not completed, 6 rate limited (gweb, chatgpt, notebooklm),
 7 --file refused (a file the target can't take, or inlined text over the caps),
 8 pool full: the live-session cap stayed full until TMUXLET_ACQUIRE_TIMEOUT; nothing was killed.
 
@@ -4839,7 +4888,7 @@ Environment:
   TMUXLET_MEMORY_GUARD=<truthy>            Enable memory-pressure guard
   TMUXLET_MEMORY_MIN_FREE=<percent>        Memory-guard free% threshold (default 15)
   TMUXLET_CLAUDE_PERMISSION_MODE=<mode>    Claude permission-mode: bypassPermissions (default) or auto; lower modes clamp to auto
-  TMUXLET_LLMCLI_BIN=<path>                llmcli program for chat backends muse/gweb/chatgpt (default: llmcli)
+  TMUXLET_LLMCLI_BIN=<path>                llmcli program for chat backends muse/gweb/chatgpt/notebooklm (default: llmcli)
   TMUXLET_OLLAMA_HOST=<url>                Base URL --ollama gives claude (default: http://localhost:11434)
 
 Examples:
@@ -4965,6 +5014,8 @@ mod tests {
             "TMUXLET_LLMCLI_BIN",
             "muse",
             "gweb",
+            "notebooklm",
+            "--notebook",
         ];
         for needle in required {
             assert!(
@@ -5964,6 +6015,90 @@ mod tests {
     }
 
     #[test]
+    fn notebooklm_asks_one_notebook_through_llmcli() {
+        // `--target notebooklm` (aliases nblm, llmcli:notebooklm) launches
+        // `llmcli notebooklm --lock-wait N -p --quiet -n <notebook>`.
+        for target in ["notebooklm", "nblm", "llmcli:notebooklm"] {
+            let argv = chat_argv(target, &["--notebook", "Research notes"]);
+            let opts = parse(&argv);
+            assert!(is_chat_target(&opts.target), "{target}");
+            let cmd = target_command(&opts).unwrap();
+            assert_eq!(
+                cmd.args,
+                [
+                    "notebooklm",
+                    "--lock-wait",
+                    "1800",
+                    "-p",
+                    "--quiet",
+                    "-n",
+                    "Research notes"
+                ],
+                "{target}"
+            );
+            if env::var_os("TMUXLET_LLMCLI_BIN").is_none() {
+                assert_eq!(cmd.program, "llmcli", "{target}");
+            }
+            assert_eq!(chat_format_env(&opts.target), Some("LLMCLI_FORMAT"));
+        }
+        // Sessions are NotebookLM conversation ids, the same mapping as the other chat backends.
+        let cmd = target_command(&parse(&chat_argv(
+            "notebooklm",
+            &["--notebook", "nb", "--resume", "c1"],
+        )))
+        .unwrap();
+        assert!(has_pair(&cmd.args, "--chat", "c1"));
+        let cmd = target_command(&parse(&chat_argv(
+            "notebooklm",
+            &["--notebook", "nb", "-c"],
+        )))
+        .unwrap();
+        assert!(cmd.args.contains(&"-c".to_string()));
+        // A JSON run asks llmcli for its JSON (citations) and reads it back.
+        let opts = parse(&chat_argv(
+            "notebooklm",
+            &["--notebook", "nb", "--output-format", "json"],
+        ));
+        let cmd = target_command(&opts).unwrap();
+        assert!(has_pair(&cmd.args, "--output-format", "json"));
+        assert!(chat_json(&opts));
+        assert!(!chat_json(&parse(&chat_argv(
+            "notebooklm",
+            &["--notebook", "nb"]
+        ))));
+    }
+
+    #[test]
+    fn notebooklm_needs_a_notebook_and_has_no_models_and_others_refuse_notebook() {
+        for flags in [&[][..], &["--notebook", "  "][..]] {
+            let err = target_command(&parse(&chat_argv("notebooklm", flags))).unwrap_err();
+            assert!(err.contains("needs --notebook"), "{err}");
+        }
+        let err = target_command(&parse(&chat_argv(
+            "notebooklm",
+            &["--notebook", "nb", "-m", "x"],
+        )))
+        .unwrap_err();
+        assert!(err.contains("no model picker"), "{err}");
+        for target in ["claude", "muse", "gweb", "chatgpt"] {
+            let err =
+                target_command(&parse(&chat_argv(target, &["--notebook", "nb"]))).unwrap_err();
+            assert!(err.contains("--notebook"), "{target}: {err}");
+        }
+    }
+
+    #[test]
+    fn notebooklm_json_result_keeps_its_citations() {
+        let out = serde_json::json!({"answer": "Yes [1].", "chatId": "conv", "requestedModel": null,
+            "servedModel": null, "servedModelDisplay": null, "fallback": false, "images": [], "canvas": null,
+            "citations": [{"number": 1, "title": "Doc one", "url": null, "source_id": "s1",
+                "source_title": "Doc one", "excerpt": "First para."}], "notebook_id": "nb"})
+        .to_string();
+        assert_eq!(gweb_citations(&out).unwrap()[0]["source_id"], "s1");
+        assert_eq!(gweb_result(&out, false, false).0, "Yes [1].\n");
+    }
+
+    #[test]
     fn chat_targets_map_session_controls_to_chat() {
         for target in ["muse", "gweb", "chatgpt", "cgpt"] {
             for flags in [
@@ -6234,7 +6369,14 @@ mod tests {
                 fs::read_to_string(root.join("pane.log")).unwrap().trim(),
                 payload
             );
-            for target in ["gweb", "gemini-web", "chatgpt", "cgpt"] {
+            for target in [
+                "gweb",
+                "gemini-web",
+                "chatgpt",
+                "cgpt",
+                "notebooklm",
+                "nblm",
+            ] {
                 assert_eq!(
                     chat_failure_status(target, &root),
                     if code == 6 { "rate_limited" } else { "exited" }
@@ -7977,6 +8119,7 @@ quote> Do not wait for the user after the final response is written.'\n";
             ("opencode", [Some(Inline), None, None, None]),
             ("grok", [Some(Inline), None, None, None]),
             ("muse", [Some(Inline), None, None, None]),
+            ("notebooklm", [Some(Inline), None, None, None]),
         ];
         for (target, want) in cases {
             assert_eq!(routes(target, &dir), want.to_vec(), "{target}");

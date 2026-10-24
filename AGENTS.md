@@ -53,6 +53,17 @@ CLI flags, output status, runtime files, or target-specific mappings.
 
 ## Change Notes
 
+- 0.15.0, notebooklm chat backend. Before: tmuxlet's chat backends were `muse`,
+  `gweb`, and `chatgpt` (`llmcli <site>`); NotebookLM's ask lived only in
+  `webcli notebooklm ask`. After: `--target notebooklm` (aliases `nblm`,
+  `llmcli:notebooklm`) runs `llmcli notebooklm --lock-wait N -p --quiet -n
+  <notebook>` through the same chat wrapper (`is_chat_target`,
+  `chat_launch_command`). New `--notebook <id|url|title>` is required for it and
+  refused by every other target; `-m` fails fast (no model picker); sessions map
+  to `--chat` / `-c` as for the other backends. `--output-format json` adds
+  `--output-format json` so the run result carries `citations` (`chat_json`).
+  Errors are forced to JSON with `LLMCLI_FORMAT=json` and exit 6 ends the run
+  `rate_limited`. Text `--file`s inline like muse.
 - 0.14.1, reap/prune safety follow-ups. Before: manual `tmuxlet reap -y` let
   runs with no owner through as "legacy" with only a warning; `reap --dry-run`
   appended a `skipped`/`dry run` line to reap.log for every candidate; `prune`
