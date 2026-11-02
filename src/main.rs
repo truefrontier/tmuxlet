@@ -2543,7 +2543,7 @@ fn is_text(bytes: &[u8], complete: bool) -> bool {
     };
     utf8 && !bytes
         .iter()
-        .any(|b| matches!(b, 0..=8 | 0x0e..=0x1a | 0x1c..=0x1f))
+        .any(|b| matches!(b, 0..=8 | 0x0b | 0x0e..=0x1a | 0x1c..=0x1f))
 }
 
 fn mention_safe(path: &str) -> bool {
@@ -8088,6 +8088,7 @@ quote> Do not wait for the user after the final response is written.'\n";
         assert_eq!(file_kind(b"", true), FileKind::Text);
         assert_eq!(file_kind(b"text\0nul", true), FileKind::Binary);
         assert_eq!(file_kind(b"text\x01ctl", true), FileKind::Binary);
+        assert_eq!(file_kind(b"a\x0bb", true), FileKind::Binary); // vertical tab
         assert_eq!(file_kind(b"\xff\xfe latin junk", true), FileKind::Binary);
         let cut = &"caf\u{e9}".as_bytes()[..4]; // a UTF-8 sequence cut off by the sniff window
         assert_eq!(file_kind(cut, false), FileKind::Text);
